@@ -8,6 +8,9 @@ on:
         required: true
         default: '1.0.0'
 
+permissions:
+  contents: write
+
 jobs:
   build-and-upload:
     name: Build for ${{ matrix.os }}
@@ -37,7 +40,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Install Linux dependencies required by egui/eframe
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update; sudo apt-get install -y libxkbcommon-dev libvulkan-dev libwayland-dev xorg-dev
