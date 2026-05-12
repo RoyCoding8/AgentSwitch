@@ -22,7 +22,7 @@ pub fn provider_exists(id: ProviderId, root: &Path, scope: Scope) -> bool {
     }
 }
 
-fn provider_dir(id: ProviderId, root: &Path, scope: Scope) -> PathBuf {
+pub fn provider_dir(id: ProviderId, root: &Path, scope: Scope) -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     match (id, scope) {
         (ProviderId::Claude, Scope::Project) => root.join(".claude"),

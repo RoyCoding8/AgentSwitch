@@ -108,12 +108,33 @@ impl eframe::App for App {
         ).show(ctx, |ui_panel| {
             if self.editor.is_open() {
                 ui::editor_panel::show(ui_panel, &mut self.editor);
-            } else if self.selected_provider.is_some() {
+            } else if let Some(provider) = self.selected_provider {
+                let root = self.scan_root();
+                let dir = scanner::provider_dir(provider, &root, self.scope);
+                ui_panel.horizontal(|ui| {
+                    ui.label(egui::RichText::new(provider.label()).font(ui::theme::heading_font()).color(ui::theme::TEXT_PRIMARY));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Open folder").clicked() { open_path(&dir); }
+                        for md in instruction_files(provider, &root, &dir, self.scope) {
+                            let label = md.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            let exists = md.exists();
+                            let btn_text = if exists { label.clone() } else { format!("+ {}", label) };
+                            let color = if exists { ui::theme::TEXT_ACCENT } else { ui::theme::TEXT_DIM };
+                            if ui.button(egui::RichText::new(btn_text).color(color).font(ui::theme::small_font())).clicked() {
+                                if !exists {
+                                    if let Some(p) = md.parent() { let _ = std::fs::create_dir_all(p); }
+                                    let _ = std::fs::write(&md, format!("# {} instructions\n", provider.label()));
+                                }
+                                self.editor.open(md);
+                            }
+                        }
+                    });
+                });
+                ui_panel.add_space(4.0);
                 let kinds = self.available_kinds();
                 ui::item_list::filter_tabs(ui_panel, &mut self.filter, &kinds);
                 ui_panel.add_space(8.0);
                 let result = ui::item_list::show(ui_panel, &self.items, self.filter);
-                // handle toggle
                 if let Some(idx) = result.index {
                     if idx < self.items.len() {
                         match toggler::toggle_item(&mut self.items[idx]) {
@@ -122,7 +143,6 @@ impl eframe::App for App {
                         }
                     }
                 }
-                // handle edit
                 if let Some(idx) = result.edit {
                     if idx < self.items.len() && self.items[idx].editable {
                         self.editor.open(self.items[idx].path.clone());
@@ -145,5 +165,30 @@ impl eframe::App for App {
             self.rescan_items();
             self.filter = FilterKind::All;
         }
+    }
+}
+
+fn open_path(path: &std::path::Path) {
+    let _ = if cfg!(windows) {
+        std::process::Command::new("explorer").arg(path).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(path).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(path).spawn()
+    };
+}
+
+fn instruction_files(provider: ProviderId, root: &PathBuf, dir: &PathBuf, scope: Scope) -> Vec<PathBuf> {
+    match (provider, scope) {
+        (ProviderId::Claude, Scope::Project) => vec![root.join("CLAUDE.md")],
+        (ProviderId::Claude, Scope::Global) => vec![dir.join("CLAUDE.md")],
+        (ProviderId::Codex, Scope::Project) => vec![root.join("AGENTS.md")],
+        (ProviderId::Codex, Scope::Global) => vec![dir.join("AGENTS.md")],
+        (ProviderId::Gemini, Scope::Project) => vec![root.join("GEMINI.md"), root.join("AGENTS.md")],
+        (ProviderId::Gemini, Scope::Global) => vec![dir.join("GEMINI.md")],
+        (ProviderId::Kiro, Scope::Project) => vec![root.join(".kiro").join("steering").join("instructions.md")],
+        (ProviderId::Kiro, Scope::Global) => vec![dir.join("steering").join("instructions.md")],
+        (ProviderId::OpenCode, Scope::Project) => vec![root.join("AGENTS.md")],
+        (ProviderId::OpenCode, Scope::Global) => vec![dir.join("AGENTS.md")],
     }
 }
