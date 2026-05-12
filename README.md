@@ -1,41 +1,71 @@
 # AgentSwitch
 
-AgentSwitch is a fast, native GUI application built in Rust for managing AI coding agent configurations. It allows developers to easily toggle skills, hooks, rules, and configurations across multiple AI coding assistants, avoiding the need to manually move or edit configuration files.
+Native GUI for managing AI coding agent configurations across providers. Toggle skills, hooks, rules, and MCP servers without manual file editing.
+
+## Supported Providers
+
+| Provider | Instruction File | Skills | Hooks | MCP | Other |
+|---|---|---|---|---|---|
+| Claude Code | `CLAUDE.md` | `.claude/skills/` | `settings.json` | `settings.json` | Rules |
+| Codex CLI | `AGENTS.md` | `.codex/skills/` | `hooks.json` | `.mcp.json` | — |
+| Gemini CLI | `GEMINI.md` | `.gemini/skills/` | `settings.json` | `settings.json` | Rules |
+| Kiro | — | — | Agent JSON | `mcp.json` | Steering, Specs |
+| OpenCode | `AGENTS.md` | `.opencode/skills/` | Plugins | `opencode.json` | Agents |
 
 ## Features
 
-- **Multi-Provider Support**: Seamlessly integrates with AI coding agents including:
-  - Claude Code
-  - Codex CLI
-  - Gemini CLI/Antigravity 
-  - Kiro
-  - OpenCode
-- **Native GUI**: Built using `egui` for a lightweight, GPU-accelerated, native Windows experience (only ~3.5MB for the release build).
-- **Scope Management**: Switch between managing configurations globally (in your User directory) or locally (per Project workspace).
-- **One-Click Toggles**: Quickly enable or disable tools, hooks, and MCP servers without manual JSON editing.
-- **Inline Editor**: Edit markdown-based instruction files (like `CLAUDE.md`, `GEMINI.md`) directly within the application.
-- **Clean Theme**: A professional, high-contrast dark mode tailored for developers.
+- **Per-hook toggle** — disable individual hooks without removing them from config
+  - Gemini: native `hooks.disabled` array
+  - Claude/Kiro/Codex: reversible stash to `_agentswitch_disabled`
+- **Project + Global scope** — switch between workspace configs and user-level (`~/`) configs
+- **Auto-detection** — only shows providers that are installed
+- **Inline editor** — edit `CLAUDE.md`, `GEMINI.md`, rules, steering directly
+- **Backup** — creates `.json.bak` before any JSON mutation
 
-## Installation
+## Install
 
-### Prerequisites
-You need the [Rust Toolchain](https://rustup.rs/) installed to build from source.
+### From release
+
+Download from [Releases](https://github.com/AshishRogannagar/AgentSwitch/releases). Single executable, no dependencies.
 
 ### Build from source
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/AgentSwitch.git
-   cd AgentSwitch
-   ```
-2. Build the optimized release executable:
-   ```bash
-   cargo build --release
-   ```
-3. The standalone `.exe` will be located at `target/release/agent-switch.exe`. You can move this file anywhere or create a shortcut to it.
+
+```bash
+git clone https://github.com/AshishRogannagar/AgentSwitch.git
+cd AgentSwitch
+cargo build --release
+# binary at target/release/agent-switch.exe
+```
+
+Requires [Rust toolchain](https://rustup.rs/).
 
 ## Usage
-Simply launch the `agent-switch.exe` file. The application will automatically scan your current directory for AI agent configuration files. You can browse to other workspaces using the folder icon in the sidebar.
+
+Launch `agent-switch.exe`. It scans the current directory for provider configs. Use the sidebar to:
+- Switch providers
+- Toggle Project/Global scope
+- Browse to a different workspace
+
+Click any item to toggle enabled/disabled. Click "edit" on instruction files to open the inline editor.
+
+## Architecture
+
+```
+src/
+├── main.rs          # eframe entry point
+├── app.rs           # state + UI orchestration
+├── types.rs         # ConfigItem, HookLoc, enums
+├── scanner.rs       # per-provider filesystem discovery
+├── toggler.rs       # rename + JSON mutation logic
+├── editor.rs        # markdown editor state
+└── ui/
+    ├── theme.rs     # dark theme constants
+    ├── sidebar.rs   # provider list + scope tabs
+    ├── item_list.rs # toggleable items
+    ├── editor_panel.rs
+    └── status_bar.rs
+```
 
 ## License
 
-This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
+Apache 2.0 — see [LICENSE](LICENSE).

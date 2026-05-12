@@ -10,7 +10,6 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(0x80, 0x80, 0x88);
 pub const TEXT_ACCENT: Color32 = Color32::from_rgb(0xA0, 0xD0, 0xFF);
 pub const BORDER: Color32 = Color32::from_rgb(0x3A, 0x3A, 0x44);
 pub const GREEN: Color32 = Color32::from_rgb(0x50, 0xC8, 0x78);
-pub const RED: Color32 = Color32::from_rgb(0xE0, 0x55, 0x55);
 pub const YELLOW: Color32 = Color32::from_rgb(0xE8, 0xC0, 0x40);
 
 const BTN_BG: Color32 = Color32::from_rgb(0x34, 0x34, 0x3E);

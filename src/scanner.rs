@@ -1,23 +1,43 @@
 use crate::types::*;
 use std::path::{Path, PathBuf};
 
-pub fn scan_provider(id: ProviderId, root: &Path) -> Vec<ConfigItem> {
+pub fn scan_provider(id: ProviderId, root: &Path, scope: Scope) -> Vec<ConfigItem> {
     match id {
-        ProviderId::Claude => scan_claude(root),
-        ProviderId::Codex => scan_codex(root),
-        ProviderId::Gemini => scan_gemini(root),
-        ProviderId::Kiro => scan_kiro(root),
-        ProviderId::OpenCode => scan_opencode(root),
+        ProviderId::Claude => scan_claude(root, scope),
+        ProviderId::Codex => scan_codex(root, scope),
+        ProviderId::Gemini => scan_gemini(root, scope),
+        ProviderId::Kiro => scan_kiro(root, scope),
+        ProviderId::OpenCode => scan_opencode(root, scope),
     }
 }
 
-pub fn provider_exists(id: ProviderId, root: &Path) -> bool {
-    match id {
-        ProviderId::Claude => root.join(".claude").is_dir() || has_cmd("claude"),
-        ProviderId::Codex => root.join(".codex").is_dir() || root.join(".agents").is_dir() || has_cmd("codex"),
-        ProviderId::Gemini => root.join(".gemini").is_dir() || has_cmd("gemini"),
-        ProviderId::Kiro => root.join(".kiro").is_dir() || has_cmd("kiro") || has_cmd("kiro-cli"),
-        ProviderId::OpenCode => root.join(".opencode").is_dir() || has_cmd("opencode"),
+pub fn provider_exists(id: ProviderId, root: &Path, scope: Scope) -> bool {
+    match (id, scope) {
+        (ProviderId::Claude, _) => provider_dir(id, root, scope).is_dir() || has_cmd("claude"),
+        (ProviderId::Codex, Scope::Project) => root.join(".codex").is_dir() || root.join(".agents").is_dir() || has_cmd("codex"),
+        (ProviderId::Codex, Scope::Global) => provider_dir(id, root, scope).is_dir() || has_cmd("codex"),
+        (ProviderId::Gemini, _) => provider_dir(id, root, scope).is_dir() || has_cmd("gemini"),
+        (ProviderId::Kiro, _) => provider_dir(id, root, scope).is_dir() || has_cmd("kiro") || has_cmd("kiro-cli"),
+        (ProviderId::OpenCode, _) => provider_dir(id, root, scope).is_dir() || has_cmd("opencode"),
+    }
+}
+
+fn provider_dir(id: ProviderId, root: &Path, scope: Scope) -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    match (id, scope) {
+        (ProviderId::Claude, Scope::Project) => root.join(".claude"),
+        (ProviderId::Claude, Scope::Global) => home.join(".claude"),
+        (ProviderId::Codex, Scope::Project) => root.join(".codex"),
+        (ProviderId::Codex, Scope::Global) => home.join(".codex"),
+        (ProviderId::Gemini, Scope::Project) => root.join(".gemini"),
+        (ProviderId::Gemini, Scope::Global) => home.join(".gemini"),
+        (ProviderId::Kiro, Scope::Project) => root.join(".kiro"),
+        (ProviderId::Kiro, Scope::Global) => home.join(".kiro"),
+        (ProviderId::OpenCode, Scope::Project) => root.join(".opencode"),
+        (ProviderId::OpenCode, Scope::Global) => {
+            if cfg!(windows) { home.join(".config").join("opencode") }
+            else { home.join(".config").join("opencode") }
+        }
     }
 }
 
@@ -32,8 +52,7 @@ fn collect_md(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<ConfigIte
         for e in rd.flatten() {
             let p = e.path();
             let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let is_md = name.ends_with(".md") || name.ends_with(".md.disabled");
-            if p.is_file() && is_md {
+            if p.is_file() && (name.ends_with(".md") || name.ends_with(".md.disabled")) {
                 out.push(ConfigItem::new(name, kind, p, provider));
             }
         }
@@ -61,7 +80,6 @@ fn check_file(path: PathBuf, kind: ItemKind, provider: ProviderId) -> Vec<Config
         let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
         out.push(ConfigItem::new(name, kind, path.clone(), provider));
     }
-    // also check .disabled variant
     let dis = PathBuf::from(format!("{}.disabled", path.display()));
     if dis.exists() {
         let name = dis.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -72,87 +90,170 @@ fn check_file(path: PathBuf, kind: ItemKind, provider: ProviderId) -> Vec<Config
 
 fn scan_json_keys(path: &Path, key: &str, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
     let mut out = vec![];
-    if let Ok(text) = std::fs::read_to_string(path) {
-        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
-            for (check_key, state) in [(key, ItemState::Enabled), (&format!("_disabled_{}", key), ItemState::Disabled)] {
-                if let Some(obj) = doc.get(check_key).and_then(|v| v.as_object()) {
-                    for name in obj.keys() {
-                        let mut item = ConfigItem::new(name.clone(), kind, path.to_owned(), provider);
-                        item.state = state;
-                        item.editable = false;
-                        out.push(item);
-                    }
-                }
+    let text = match std::fs::read_to_string(path) { Ok(t) => t, _ => return out };
+    let doc: serde_json::Value = match serde_json::from_str(&text) { Ok(d) => d, _ => return out };
+    for (check_key, state) in [(key, ItemState::Enabled), (&format!("_disabled_{}", key), ItemState::Disabled)] {
+        if let Some(obj) = doc.get(check_key).and_then(|v| v.as_object()) {
+            for name in obj.keys() {
+                let mut item = ConfigItem::new(name.clone(), kind, path.to_owned(), provider);
+                item.state = state;
+                item.editable = false;
+                out.push(item);
             }
         }
     }
     out
 }
 
-fn scan_claude(root: &Path) -> Vec<ConfigItem> {
-    let d = root.join(".claude");
+fn scan_hook_entries(path: &Path, provider: ProviderId, disabled_names: &[String]) -> Vec<ConfigItem> {
+    let mut out = vec![];
+    let text = match std::fs::read_to_string(path) { Ok(t) => t, _ => return out };
+    let doc: serde_json::Value = match serde_json::from_str(&text) { Ok(d) => d, _ => return out };
+    let hooks_obj = match doc.get("hooks").and_then(|v| v.as_object()) { Some(o) => o, _ => return out };
+
+    for (event, entries) in hooks_obj {
+        if event == "disabled" || event.starts_with("_agentswitch") { continue; }
+        let arr = match entries.as_array() { Some(a) => a, _ => continue };
+        for (i, entry) in arr.iter().enumerate() {
+            let matcher = entry.get("matcher").and_then(|v| v.as_str()).unwrap_or("*");
+            let hook_name = entry.get("hooks").and_then(|h| h.as_array()).and_then(|a| a.first())
+                .and_then(|h| h.get("name").and_then(|n| n.as_str())).map(String::from);
+            let display = hook_name.clone().unwrap_or_else(|| format!("{}: {}", event, matcher));
+            let is_disabled = hook_name.as_ref().map_or(false, |n| disabled_names.contains(n));
+            let loc = HookLoc { event: event.clone(), index: i, hook_name: hook_name.unwrap_or_else(|| matcher.to_string()) };
+            let mut item = ConfigItem::new(display, ItemKind::Hook, path.to_owned(), provider);
+            item.hook_loc = Some(loc);
+            item.editable = false;
+            if is_disabled { item.state = ItemState::Disabled; }
+            out.push(item);
+        }
+    }
+    if let Some(stashed) = doc.get("_agentswitch_disabled").and_then(|v| v.as_object()) {
+        for (event, entries) in stashed {
+            let arr = match entries.as_array() { Some(a) => a, _ => continue };
+            for (i, entry) in arr.iter().enumerate() {
+                let matcher = entry.get("matcher").and_then(|v| v.as_str()).unwrap_or("*");
+                let hook_name = entry.get("hooks").and_then(|h| h.as_array()).and_then(|a| a.first())
+                    .and_then(|h| h.get("name").and_then(|n| n.as_str())).map(String::from);
+                let display = hook_name.clone().unwrap_or_else(|| format!("{}: {}", event, matcher));
+                let loc = HookLoc { event: format!("_stashed_{}", event), index: i, hook_name: hook_name.unwrap_or_else(|| matcher.to_string()) };
+                let mut item = ConfigItem::new(display, ItemKind::Hook, path.to_owned(), provider);
+                item.hook_loc = Some(loc);
+                item.state = ItemState::Disabled;
+                item.editable = false;
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+fn gemini_disabled_names(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path).ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|d| d.get("hooks")?.get("disabled")?.as_array().cloned())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
+    let d = provider_dir(ProviderId::Claude, root, scope);
     let mut items = vec![];
-    items.extend(check_file(root.join("CLAUDE.md"), ItemKind::InstructionFile, ProviderId::Claude));
+    match scope {
+        Scope::Project => items.extend(check_file(root.join("CLAUDE.md"), ItemKind::InstructionFile, ProviderId::Claude)),
+        Scope::Global => items.extend(check_file(d.join("CLAUDE.md"), ItemKind::InstructionFile, ProviderId::Claude)),
+    }
     items.extend(collect_subdirs(&d.join("skills"), ItemKind::Skill, ProviderId::Claude));
     items.extend(collect_md(&d.join("rules"), ItemKind::Rule, ProviderId::Claude));
     let settings = d.join("settings.json");
-    items.extend(scan_json_keys(&settings, "hooks", ItemKind::Hook, ProviderId::Claude));
+    items.extend(scan_hook_entries(&settings, ProviderId::Claude, &[]));
     items.extend(scan_json_keys(&settings, "mcpServers", ItemKind::Mcp, ProviderId::Claude));
     items
 }
 
-fn scan_codex(root: &Path) -> Vec<ConfigItem> {
+fn scan_codex(root: &Path, scope: Scope) -> Vec<ConfigItem> {
+    let d = provider_dir(ProviderId::Codex, root, scope);
     let mut items = vec![];
-    items.extend(check_file(root.join("AGENTS.md"), ItemKind::InstructionFile, ProviderId::Codex));
-    for base in [".agents", ".codex"] {
-        items.extend(collect_subdirs(&root.join(base).join("skills"), ItemKind::Skill, ProviderId::Codex));
+    if scope == Scope::Project {
+        items.extend(check_file(root.join("AGENTS.md"), ItemKind::InstructionFile, ProviderId::Codex));
+        items.extend(collect_subdirs(&root.join(".agents").join("skills"), ItemKind::Skill, ProviderId::Codex));
     }
-    let mcp = root.join(".mcp.json");
-    items.extend(scan_json_keys(&mcp, "mcpServers", ItemKind::Mcp, ProviderId::Codex));
-    // hooks.json
-    let hooks = root.join(".codex").join("hooks.json");
-    if hooks.exists() || hooks.with_extension("json.disabled").exists() {
-        items.push(ConfigItem::new("hooks.json", ItemKind::Hook, hooks, ProviderId::Codex));
+    items.extend(collect_subdirs(&d.join("skills"), ItemKind::Skill, ProviderId::Codex));
+    if scope == Scope::Project {
+        items.extend(scan_json_keys(&root.join(".mcp.json"), "mcpServers", ItemKind::Mcp, ProviderId::Codex));
     }
+    let hooks = d.join("hooks.json");
+    if hooks.exists() { items.extend(scan_hook_entries(&hooks, ProviderId::Codex, &[])); }
+    let hooks_dis = PathBuf::from(format!("{}.disabled", hooks.display()));
+    if hooks_dis.exists() { items.push(ConfigItem::new("hooks.json (disabled)", ItemKind::Hook, hooks_dis, ProviderId::Codex)); }
     items
 }
 
-fn scan_gemini(root: &Path) -> Vec<ConfigItem> {
-    let d = root.join(".gemini");
+fn scan_gemini(root: &Path, scope: Scope) -> Vec<ConfigItem> {
+    let d = provider_dir(ProviderId::Gemini, root, scope);
     let mut items = vec![];
-    items.extend(check_file(root.join("GEMINI.md"), ItemKind::InstructionFile, ProviderId::Gemini));
-    items.extend(check_file(root.join("AGENTS.md"), ItemKind::InstructionFile, ProviderId::Gemini));
+    if scope == Scope::Project {
+        items.extend(check_file(root.join("GEMINI.md"), ItemKind::InstructionFile, ProviderId::Gemini));
+        items.extend(check_file(root.join("AGENTS.md"), ItemKind::InstructionFile, ProviderId::Gemini));
+    }
     items.extend(collect_subdirs(&d.join("skills"), ItemKind::Skill, ProviderId::Gemini));
     items.extend(collect_md(&d.join("rules"), ItemKind::Rule, ProviderId::Gemini));
-    let hooks = d.join("hooks").join("hooks.json");
-    if hooks.exists() {
-        items.push(ConfigItem::new("hooks.json", ItemKind::Hook, hooks.clone(), ProviderId::Gemini));
-    }
-    let hd = hooks.with_extension("json.disabled");
-    if hd.exists() {
-        items.push(ConfigItem::new("hooks.json.disabled", ItemKind::Hook, hd, ProviderId::Gemini));
-    }
     let settings = d.join("settings.json");
+    let disabled = gemini_disabled_names(&settings);
+    items.extend(scan_hook_entries(&settings, ProviderId::Gemini, &disabled));
     items.extend(scan_json_keys(&settings, "mcpServers", ItemKind::Mcp, ProviderId::Gemini));
     items
 }
 
-fn scan_kiro(root: &Path) -> Vec<ConfigItem> {
-    let d = root.join(".kiro");
+fn scan_kiro(root: &Path, scope: Scope) -> Vec<ConfigItem> {
+    let d = provider_dir(ProviderId::Kiro, root, scope);
     let mut items = vec![];
     items.extend(collect_md(&d.join("steering"), ItemKind::SteeringRule, ProviderId::Kiro));
     items.extend(collect_subdirs(&d.join("specs"), ItemKind::Spec, ProviderId::Kiro));
-    let mcp = d.join("settings").join("mcp.json");
-    items.extend(scan_json_keys(&mcp, "mcpServers", ItemKind::Mcp, ProviderId::Kiro));
+    items.extend(collect_subdirs(&d.join("agents"), ItemKind::Agent, ProviderId::Kiro));
+    let agents_dir = d.join("agents");
+    if agents_dir.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(&agents_dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                    items.extend(scan_hook_entries(&p, ProviderId::Kiro, &[]));
+                }
+            }
+        }
+    }
+    items.extend(scan_json_keys(&d.join("settings").join("mcp.json"), "mcpServers", ItemKind::Mcp, ProviderId::Kiro));
     items
 }
 
-fn scan_opencode(root: &Path) -> Vec<ConfigItem> {
+fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
+    let d = provider_dir(ProviderId::OpenCode, root, scope);
     let mut items = vec![];
-    items.extend(check_file(root.join("AGENTS.md"), ItemKind::InstructionFile, ProviderId::OpenCode));
-    items.extend(collect_subdirs(&root.join(".opencode").join("skills"), ItemKind::Skill, ProviderId::OpenCode));
-    let cfg = root.join("opencode.json");
-    items.extend(scan_json_keys(&cfg, "agent", ItemKind::Agent, ProviderId::OpenCode));
-    items.extend(scan_json_keys(&cfg, "mcp", ItemKind::Mcp, ProviderId::OpenCode));
+    if scope == Scope::Project {
+        items.extend(check_file(root.join("AGENTS.md"), ItemKind::InstructionFile, ProviderId::OpenCode));
+    }
+    items.extend(collect_subdirs(&d.join("skills"), ItemKind::Skill, ProviderId::OpenCode));
+    let cfg = if scope == Scope::Global { d.join("opencode.json") } else { root.join("opencode.json") };
+    let cfg_jsonc = cfg.with_extension("jsonc");
+    let actual_cfg = if cfg_jsonc.exists() { cfg_jsonc } else { cfg };
+    items.extend(scan_json_keys(&actual_cfg, "agent", ItemKind::Agent, ProviderId::OpenCode));
+    items.extend(scan_json_keys(&actual_cfg, "mcp", ItemKind::Mcp, ProviderId::OpenCode));
+    if let Ok(text) = std::fs::read_to_string(&actual_cfg) {
+        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(plugins) = doc.get("plugin").and_then(|v| v.as_array()) {
+                for (i, p) in plugins.iter().enumerate() {
+                    let name = match p {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Array(a) => a.first().and_then(|v| v.as_str()).unwrap_or("plugin").to_string(),
+                        _ => continue,
+                    };
+                    let mut item = ConfigItem::new(name, ItemKind::Hook, actual_cfg.clone(), ProviderId::OpenCode);
+                    item.hook_loc = Some(HookLoc { event: "plugin".into(), index: i, hook_name: String::new() });
+                    item.editable = false;
+                    items.push(item);
+                }
+            }
+        }
+    }
     items
 }

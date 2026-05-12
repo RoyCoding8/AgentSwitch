@@ -1,7 +1,8 @@
-debug/
 target/
 **/*.rs.bk
 *.pdb
+*.bak
+*.json.bak
 .idea/
 .vscode/
 *.swp

@@ -42,7 +42,7 @@ impl App {
     fn refresh(&mut self) {
         let root = self.scan_root();
         self.providers = ProviderId::ALL.iter()
-            .map(|&id| (id, scanner::provider_exists(id, &root)))
+            .map(|&id| (id, scanner::provider_exists(id, &root, self.scope)))
             .collect();
         // auto-select first detected
         if self.selected_provider.is_none() || !self.providers.iter().any(|(id, d)| *d && Some(*id) == self.selected_provider) {
@@ -54,7 +54,7 @@ impl App {
     fn rescan_items(&mut self) {
         let root = self.scan_root();
         self.items = match self.selected_provider {
-            Some(id) => scanner::scan_provider(id, &root),
+            Some(id) => scanner::scan_provider(id, &root, self.scope),
             None => vec![],
         };
     }
