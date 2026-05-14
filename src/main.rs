@@ -1,10 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-mod types;
-mod toggler;
-mod scanner;
-mod editor;
-mod ui;
 mod app;
+mod diagnostics;
+mod editor;
+mod hook_diag;
+mod scanner;
+mod toggler;
+mod types;
+mod ui;
 
 fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
@@ -14,5 +16,9 @@ fn main() -> eframe::Result {
             .with_title("AgentSwitch"),
         ..Default::default()
     };
-    eframe::run_native("AgentSwitch", opts, Box::new(|_cc| Ok(Box::new(app::App::new()))))
+    eframe::run_native(
+        "AgentSwitch",
+        opts,
+        Box::new(|_cc| Ok(Box::new(app::App::new()))),
+    )
 }

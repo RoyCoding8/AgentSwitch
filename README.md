@@ -1,71 +1,95 @@
 # AgentSwitch
 
-Native GUI for managing AI coding agent configurations across providers. Toggle skills, hooks, rules, and MCP servers without manual file editing.
+Native GUI for managing AI coding-agent configuration across providers. Toggle skills, hooks, rules, and MCP servers without hand-editing provider files.
+
+## Features
+
+- Per-hook toggle with reversible disable behavior.
+- Project/global scope switching.
+- Diff Workbench for project vs global config comparison.
+- Hook Cockpit for static hook inventory, conflicts, and risk warnings.
+- Inline editor for instruction files and rules.
+- JSON backups before config mutation.
+- Windows, Linux, and macOS builds.
 
 ## Supported Providers
 
 | Provider | Instruction File | Skills | Hooks | MCP | Other |
 |---|---|---|---|---|---|
 | Claude Code | `CLAUDE.md` | `.claude/skills/` | `settings.json` | `settings.json` | Rules |
-| Codex CLI | `AGENTS.md` | `.codex/skills/` | `hooks.json` | `.mcp.json` | — |
-| Gemini CLI | `GEMINI.md` | `.gemini/skills/` | `settings.json` | `settings.json` | Rules |
-| Kiro | — | — | Agent JSON | `mcp.json` | Steering, Specs |
+| Codex CLI | `AGENTS.md` | `.codex/skills/`, `.agents/skills/` | `config.toml`, `hooks.json` | `config.toml`, `.mcp.json` | - |
+| Gemini CLI | `GEMINI.md`, `AGENTS.md` | `.gemini/skills/` | `settings.json` | `settings.json` | Rules |
+| Kiro | - | - | Agent JSON | `settings/mcp.json` | Steering, Specs |
 | OpenCode | `AGENTS.md` | `.opencode/skills/` | Plugins | `opencode.json` | Agents |
-
-## Features
-
-- **Per-hook toggle** — disable individual hooks without removing them from config
-  - Gemini: native `hooks.disabled` array
-  - Claude/Kiro/Codex: reversible stash to `_agentswitch_disabled`
-- **Project + Global scope** — switch between workspace configs and user-level (`~/`) configs
-- **Auto-detection** — only shows providers that are installed
-- **Inline editor** — edit `CLAUDE.md`, `GEMINI.md`, rules, steering directly
-- **Backup** — creates `.json.bak` before any JSON mutation
 
 ## Install
 
-### From release
+Download the matching binary from [Releases](https://github.com/AshishRogannagar/AgentSwitch/releases):
 
-Download from [Releases](https://github.com/AshishRogannagar/AgentSwitch/releases). Single executable, no dependencies.
+- `agent-switch-windows-x86_64.exe`
+- `agent-switch-linux-x86_64`
+- `agent-switch-macos-x86_64`
+- `agent-switch-macos-aarch64`
 
-### Build from source
+## Build
+
+Requires the [Rust toolchain](https://rustup.rs/).
 
 ```bash
 git clone https://github.com/AshishRogannagar/AgentSwitch.git
 cd AgentSwitch
 cargo build --release
-# binary at target/release/agent-switch.exe
 ```
 
-Requires [Rust toolchain](https://rustup.rs/).
+Output:
+
+- Windows: `target/release/agent-switch.exe`
+- Linux/macOS: `target/release/agent-switch`
+
+Linux builds may need native GUI dependencies:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y pkg-config libgtk-3-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev
+```
 
 ## Usage
 
-Launch `agent-switch.exe`. It scans the current directory for provider configs. Use the sidebar to:
-- Switch providers
-- Toggle Project/Global scope
-- Browse to a different workspace
+Launch AgentSwitch from the workspace you want to inspect, or use Browse to pick a workspace.
 
-Click any item to toggle enabled/disabled. Click "edit" on instruction files to open the inline editor.
+- `Items`: toggle discovered provider config items.
+- `Hooks`: inspect hook order, scope, matcher, handler, blocking risk, duplicates, and project/global overlaps.
+- `Diff`: compare project and global config with stable, secret-safe fingerprints.
+
+Diff Workbench and Hook Cockpit are read-only. Toggle actions remain in `Items`.
+
+## Releases
+
+CI runs on Windows, Linux, and macOS for pushes, pull requests, and manual dispatch.
+
+Manual release workflow:
+
+1. Open GitHub Actions.
+2. Run `Release`.
+3. Enter the version without `v`, for example `1.0.0`.
+4. The workflow builds release binaries for Windows, Linux, macOS Intel, and macOS Apple Silicon.
+5. The workflow publishes all artifacts plus `SHA256SUMS.txt` to GitHub Releases.
 
 ## Architecture
 
-```
+```text
 src/
-├── main.rs          # eframe entry point
-├── app.rs           # state + UI orchestration
-├── types.rs         # ConfigItem, HookLoc, enums
-├── scanner.rs       # per-provider filesystem discovery
-├── toggler.rs       # rename + JSON mutation logic
-├── editor.rs        # markdown editor state
-└── ui/
-    ├── theme.rs     # dark theme constants
-    ├── sidebar.rs   # provider list + scope tabs
-    ├── item_list.rs # toggleable items
-    ├── editor_panel.rs
-    └── status_bar.rs
+  main.rs          eframe entry point
+  app.rs           state and UI orchestration
+  types.rs         shared item/provider types
+  scanner.rs       provider filesystem discovery
+  toggler.rs       rename and JSON mutation logic
+  diagnostics.rs   project/global diff workbench logic
+  hook_diag.rs     static hook cockpit logic
+  editor.rs        markdown editor state
+  ui/              egui panels and theme
 ```
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0. See [LICENSE](LICENSE).

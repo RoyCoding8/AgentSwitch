@@ -1,4 +1,4 @@
-use egui::{Color32, FontId, Visuals, Style, CornerRadius, Stroke};
+use egui::{Color32, CornerRadius, FontId, Stroke, Style, Visuals};
 
 pub const BG_DARK: Color32 = Color32::from_rgb(0x18, 0x18, 0x1B);
 pub const BG_PANEL: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x22);
@@ -47,12 +47,21 @@ pub fn apply(ctx: &egui::Context) {
     // override text color globally for visibility
     vis.override_text_color = Some(TEXT_PRIMARY);
 
-    let mut style = Style { visuals: vis, ..Style::default() };
+    let mut style = Style {
+        visuals: vis,
+        ..Style::default()
+    };
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(10.0, 4.0);
     ctx.set_style(style);
 }
 
-pub fn heading_font() -> FontId { FontId::proportional(18.0) }
-pub fn body_font() -> FontId { FontId::proportional(14.0) }
-pub fn small_font() -> FontId { FontId::proportional(12.0) }
+pub fn heading_font() -> FontId {
+    FontId::proportional(18.0)
+}
+pub fn body_font() -> FontId {
+    FontId::proportional(14.0)
+}
+pub fn small_font() -> FontId {
+    FontId::proportional(12.0)
+}

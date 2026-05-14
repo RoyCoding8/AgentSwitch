@@ -4,58 +4,95 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version number (e.g., 1.0.0)'
+        description: Version without leading v, for example 1.0.0
         required: true
-        default: '1.0.0'
+      draft:
+        description: Create release as draft
+        type: boolean
+        default: false
+      prerelease:
+        description: Mark release as prerelease
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 jobs:
-  build-and-upload:
-    name: Build for ${{ matrix.os }}
+  build:
+    name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - name: windows-x86_64
+            os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: agent-switch.exe
-            asset_name: agent-switch-windows-x86_64.exe
-          - os: ubuntu-latest
+            bin: agent-switch.exe
+            asset: agent-switch-windows-x86_64.exe
+          - name: linux-x86_64
+            os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: agent-switch
-            asset_name: agent-switch-linux-x86_64
-          - os: macos-latest
+            bin: agent-switch
+            asset: agent-switch-linux-x86_64
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bin: agent-switch
+            asset: agent-switch-macos-x86_64
+          - name: macos-aarch64
+            os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: agent-switch
-            asset_name: agent-switch-macos-arm64
+            bin: agent-switch
+            asset: agent-switch-macos-aarch64
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Linux dependencies
+      - name: Install Linux deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update; sudo apt-get install -y libxkbcommon-dev libvulkan-dev libwayland-dev xorg-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libgtk-3-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev
 
-      - name: Build Release
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Test
+        run: cargo test --locked
 
-      - name: Rename Artifact
+      - name: Build release
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Stage asset
         shell: bash
-        run: mv target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ./${{ matrix.asset_name }}
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
 
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          name: Release v${{ github.event.inputs.version }}
-          tag_name: v${{ github.event.inputs.version }}
-          files: ./${{ matrix.asset_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: AgentSwitch v${{ inputs.version }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          files: dist/*
