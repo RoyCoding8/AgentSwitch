@@ -11,8 +11,8 @@ pub struct EditorState {
 impl EditorState {
     pub fn open(&mut self, path: PathBuf) {
         if let Ok(text) = std::fs::read_to_string(&path) {
-            self.content = text.clone();
-            self.original = text;
+            self.original = text.clone();
+            self.content = text;
             self.path = Some(path);
             self.dirty = false;
         }

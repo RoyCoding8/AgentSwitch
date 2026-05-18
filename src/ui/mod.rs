@@ -1,3 +1,4 @@
+pub mod chat_panel;
 pub mod diff_panel;
 pub mod editor_panel;
 pub mod hooks_panel;

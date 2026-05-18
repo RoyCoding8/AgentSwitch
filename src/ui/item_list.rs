@@ -108,7 +108,13 @@ pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResu
                 // path (right side)
                 let path_str = item.path.to_string_lossy();
                 let short = if path_str.len() > 35 {
-                    format!("...{}", &path_str[path_str.len() - 32..])
+                    let start = path_str
+                        .char_indices()
+                        .rev()
+                        .nth(31)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    format!("...{}", &path_str[start..])
                 } else {
                     path_str.to_string()
                 };

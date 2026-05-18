@@ -355,7 +355,13 @@ fn sanitize_text(text: &str) -> String {
         return text.split('?').next().unwrap_or(text).to_string() + "?<redacted>";
     }
     if text.len() > 56 {
-        format!("{}...", &text[..53])
+        let end = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= 53)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &text[..end])
     } else {
         text.into()
     }

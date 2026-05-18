@@ -1,3 +1,4 @@
+use crate::chat::{self, ChatSession};
 use crate::diagnostics;
 use crate::editor::EditorState;
 use crate::hook_diag;
@@ -13,6 +14,7 @@ enum View {
     Items,
     Hooks,
     Diff,
+    Chats,
 }
 
 pub struct App {
@@ -25,6 +27,11 @@ pub struct App {
     diff_filter: diagnostics::DiffFilter,
     hook_rows: Vec<hook_diag::HookRow>,
     hook_filter: hook_diag::HookFilter,
+    chat_sessions: Vec<ChatSession>,
+    chat_trash: Vec<ChatSession>,
+    chat_selection: HashSet<String>,
+    chat_search: String,
+    chat_trash_mode: bool,
     filter: FilterKind,
     view: View,
     editor: EditorState,
@@ -46,6 +53,11 @@ impl App {
             diff_filter: diagnostics::DiffFilter::All,
             hook_rows: vec![],
             hook_filter: hook_diag::HookFilter::All,
+            chat_sessions: vec![],
+            chat_trash: vec![],
+            chat_selection: HashSet::new(),
+            chat_search: String::new(),
+            chat_trash_mode: false,
             filter: FilterKind::All,
             view: View::Items,
             editor: EditorState::default(),
@@ -54,6 +66,7 @@ impl App {
             first_frame: true,
         };
         app.refresh();
+        app.rescan_chats();
         app
     }
 
@@ -100,6 +113,18 @@ impl App {
         self.hook_filter = hook_diag::default_filter(&self.hook_rows);
     }
 
+    fn rescan_chats(&mut self) {
+        self.chat_sessions = chat::scan_all(&self.workspace);
+        self.chat_trash = chat::scan_trash();
+        let keys: HashSet<_> = self
+            .chat_sessions
+            .iter()
+            .chain(self.chat_trash.iter())
+            .map(chat::session_key)
+            .collect();
+        self.chat_selection.retain(|key| keys.contains(key));
+    }
+
     fn available_kinds(&self) -> Vec<ItemKind> {
         let mut seen = HashSet::new();
         self.items
@@ -128,6 +153,7 @@ impl eframe::App for App {
             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                 self.workspace = path;
                 self.refresh();
+                self.rescan_chats();
             }
         }
 
@@ -182,6 +208,8 @@ impl eframe::App for App {
             .show(ctx, |ui_panel| {
                 if self.editor.is_open() {
                     ui::editor_panel::show(ui_panel, &mut self.editor);
+                } else if self.view == View::Chats {
+                    self.show_chats(ui_panel);
                 } else if let Some(provider) = self.selected_provider {
                     let root = self.scan_root();
                     let dir = scanner::provider_dir(provider, &root, self.scope);
@@ -239,6 +267,7 @@ impl eframe::App for App {
                         view_tab(ui, &mut self.view, View::Items, "Items");
                         view_tab(ui, &mut self.view, View::Hooks, "Hooks");
                         view_tab(ui, &mut self.view, View::Diff, "Diff");
+                        view_tab(ui, &mut self.view, View::Chats, "Chats");
                         if self.view == View::Items {
                             let kinds = self.available_kinds();
                             ui::item_list::filter_tabs(ui, &mut self.filter, &kinds);
@@ -266,6 +295,10 @@ impl eframe::App for App {
                             if let Some(path) = action.open {
                                 open_path(&path);
                             }
+                            return;
+                        }
+                        View::Chats => {
+                            self.show_chats(ui_panel);
                             return;
                         }
                         View::Items => {}
@@ -344,6 +377,172 @@ impl eframe::App for App {
         } else if self.selected_provider != old_provider {
             self.rescan_items();
             self.filter = FilterKind::All;
+        }
+        // Prevent being stuck in a view with no way to navigate away
+        if self.selected_provider.is_none()
+            && matches!(self.view, View::Items | View::Hooks | View::Diff)
+        {
+            self.view = View::Chats;
+        }
+    }
+}
+
+impl App {
+    fn show_chats(&mut self, ui_panel: &mut egui::Ui) {
+        ui_panel.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(if self.chat_trash_mode {
+                    "Chats Trash"
+                } else {
+                    "Chats"
+                })
+                .font(ui::theme::heading_font())
+                .color(ui::theme::TEXT_PRIMARY),
+            );
+        });
+        ui_panel.add_space(4.0);
+        let action = if self.chat_trash_mode {
+            ui::chat_panel::show(
+                ui_panel,
+                &self.chat_trash,
+                &mut self.chat_selection,
+                &mut self.chat_search,
+                true,
+            )
+        } else {
+            ui::chat_panel::show(
+                ui_panel,
+                &self.chat_sessions,
+                &mut self.chat_selection,
+                &mut self.chat_search,
+                false,
+            )
+        };
+        if action.refresh {
+            self.rescan_chats();
+            self.status_msg = Some("Chats refreshed".into());
+        }
+        if action.toggle_trash {
+            self.chat_trash_mode = !self.chat_trash_mode;
+            self.chat_selection.clear();
+        }
+        if action.import {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("AgentSwitch chat", &["json"])
+                .pick_file()
+            {
+                match chat::import_archive(&path) {
+                    Ok(_) => {
+                        self.rescan_chats();
+                        self.status_msg = Some("Chat imported".into());
+                    }
+                    Err(e) => self.status_msg = Some(format!("Import error: {e}")),
+                }
+            }
+        }
+        if !action.export.is_empty() {
+            let sessions: Vec<_> = action
+                .export
+                .iter()
+                .filter_map(|idx| self.chat_sessions.get(*idx).cloned())
+                .collect();
+            if sessions.len() == 1 {
+                let session = &sessions[0];
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("AgentSwitch chat", &["json"])
+                    .set_file_name(chat::suggested_export_name(session))
+                    .save_file()
+                {
+                    match chat::export_session(session, &path) {
+                        Ok(()) => self.status_msg = Some("Chat exported".into()),
+                        Err(e) => self.status_msg = Some(format!("Export error: {e}")),
+                    }
+                }
+            } else if !sessions.is_empty() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("AgentSwitch chats", &["zip"])
+                    .set_file_name(chat::suggested_zip_export_name())
+                    .save_file()
+                {
+                    match chat::export_sessions_zip(&sessions, &path) {
+                        Ok(report) => {
+                            self.status_msg = Some(format!(
+                                "{} chats exported, {} failed",
+                                report.ok, report.failed
+                            ));
+                        }
+                        Err(e) => self.status_msg = Some(format!("Export error: {e}")),
+                    }
+                }
+            }
+        }
+        if !action.trash.is_empty() {
+            let mut ok = 0usize;
+            let mut failed = 0usize;
+            for idx in action.trash {
+                match self
+                    .chat_sessions
+                    .get(idx)
+                    .map(|session| chat::soft_delete(session, &self.workspace))
+                {
+                    Some(Ok(())) => ok += 1,
+                    _ => failed += 1,
+                }
+            }
+            self.chat_selection.clear();
+            self.rescan_chats();
+            self.status_msg = Some(format!("{ok} chats moved to Trash, {failed} failed"));
+        }
+        if !action.restore.is_empty() {
+            let mut ok = 0usize;
+            let mut failed = 0usize;
+            let mut alternates = 0usize;
+            for idx in action.restore {
+                if let Some(session) = self.chat_trash.get(idx) {
+                    let original = session
+                        .trash_manifest
+                        .as_ref()
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .and_then(|v| {
+                            v.get("original_path")
+                                .and_then(|p| p.as_str())
+                                .map(PathBuf::from)
+                        });
+                    match chat::restore_from_trash(session) {
+                        Ok(path) => {
+                            ok += 1;
+                            if original.as_ref().is_some_and(|p| p != &path) {
+                                alternates += 1;
+                            }
+                        }
+                        Err(_) => failed += 1,
+                    }
+                }
+            }
+            self.chat_selection.clear();
+            self.rescan_chats();
+            self.status_msg = Some(format!(
+                "{ok} chats restored, {failed} failed, {alternates} renamed"
+            ));
+        }
+        if !action.delete_forever.is_empty() || !action.empty_visible.is_empty() {
+            let indices = if action.delete_forever.is_empty() {
+                action.empty_visible
+            } else {
+                action.delete_forever
+            };
+            let mut ok = 0usize;
+            let mut failed = 0usize;
+            for idx in indices {
+                match self.chat_trash.get(idx).map(chat::delete_trash_forever) {
+                    Some(Ok(())) => ok += 1,
+                    _ => failed += 1,
+                }
+            }
+            self.chat_selection.clear();
+            self.rescan_chats();
+            self.status_msg = Some(format!("{ok} trash chats deleted forever, {failed} failed"));
         }
     }
 }

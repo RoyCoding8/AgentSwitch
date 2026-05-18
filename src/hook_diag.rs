@@ -270,7 +270,13 @@ fn num_field(v: &Value, keys: &[&str]) -> Option<u64> {
 }
 fn clean(s: &str) -> String {
     if s.len() > 70 {
-        format!("{}...", &s[..67])
+        let end = s
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= 67)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &s[..end])
     } else {
         s.into()
     }

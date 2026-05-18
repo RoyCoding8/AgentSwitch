@@ -42,7 +42,13 @@ pub fn show(
         // workspace path
         ui.horizontal(|ui| {
             let path_text = if workspace.len() > 28 {
-                format!("...{}", &workspace[workspace.len() - 25..])
+                let start = workspace
+                    .char_indices()
+                    .rev()
+                    .nth(24)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                format!("...{}", &workspace[start..])
             } else {
                 workspace.to_string()
             };
