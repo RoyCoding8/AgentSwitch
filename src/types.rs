@@ -109,6 +109,7 @@ impl ConfigItem {
         path: PathBuf,
         provider: ProviderId,
     ) -> Self {
+        let mut n: String = name.into();
         let editable = matches!(
             kind,
             ItemKind::InstructionFile | ItemKind::Rule | ItemKind::SteeringRule
@@ -116,12 +117,17 @@ impl ConfigItem {
         let state = if path.extension().and_then(|e| e.to_str()) == Some("disabled")
             || path.to_string_lossy().contains(".disabled")
         {
+            if n.starts_with('.') && n.ends_with(".disabled") {
+                n = n[1..n.len() - 9].to_string();
+            } else if n.ends_with(".disabled") {
+                n = n[..n.len() - 9].to_string();
+            }
             ItemState::Disabled
         } else {
             ItemState::Enabled
         };
         Self {
-            name: name.into(),
+            name: n,
             kind,
             state,
             path,
@@ -132,9 +138,30 @@ impl ConfigItem {
         }
     }
     pub fn disabled_path(&self) -> PathBuf {
+        if let Some(parent) = self.path.parent() {
+            let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if matches!(
+                parent_name,
+                "skills" | "agents" | "specs" | "rules" | "steering"
+            ) {
+                let mut p = parent.to_path_buf();
+                p.set_file_name(format!("{}.disabled", parent_name));
+                return p.join(self.path.file_name().unwrap());
+            }
+        }
         PathBuf::from(format!("{}.disabled", self.path.display()))
     }
     pub fn enabled_path(&self) -> PathBuf {
+        if let Some(parent) = self.path.parent() {
+            let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if let Some(base) = parent_name.strip_suffix(".disabled") {
+                if matches!(base, "skills" | "agents" | "specs" | "rules" | "steering") {
+                    let mut p = parent.to_path_buf();
+                    p.set_file_name(base);
+                    return p.join(self.path.file_name().unwrap());
+                }
+            }
+        }
         let s = self.path.to_string_lossy();
         if let Some(base) = s.strip_suffix(".disabled") {
             PathBuf::from(base)

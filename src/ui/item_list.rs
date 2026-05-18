@@ -5,12 +5,16 @@ use egui::{CornerRadius, RichText, Sense, Stroke, Ui, Vec2};
 pub struct ToggleResult {
     pub index: Option<usize>,
     pub edit: Option<usize>,
+    pub enable_all: bool,
+    pub disable_all: bool,
 }
 
 pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResult {
     let mut result = ToggleResult {
         index: None,
         edit: None,
+        enable_all: false,
+        disable_all: false,
     };
     let filtered: Vec<(usize, &ConfigItem)> = items
         .iter()
@@ -33,6 +37,23 @@ pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResu
         return result;
     }
 
+    let has_disabled = filtered.iter().any(|(_, it)| !it.state.is_enabled());
+    let has_enabled = filtered.iter().any(|(_, it)| it.state.is_enabled());
+    ui.horizontal(|ui| {
+        let enable_txt = RichText::new("⏼ Enable All")
+            .font(theme::small_font())
+            .color(theme::GREEN);
+        if has_disabled && ui.button(enable_txt).clicked() {
+            result.enable_all = true;
+        }
+        let disable_txt = RichText::new("⏻ Disable All")
+            .font(theme::small_font())
+            .color(theme::TEXT_DIM);
+        if has_enabled && ui.button(disable_txt).clicked() {
+            result.disable_all = true;
+        }
+    });
+    ui.add_space(4.0);
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {

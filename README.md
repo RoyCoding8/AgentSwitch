@@ -5,6 +5,7 @@ Native GUI for managing AI coding-agent configuration across providers. Toggle s
 ## Features
 
 - Per-hook toggle with reversible disable behavior.
+- Bulk toggle (Enable All / Disable All) for filtered items.
 - Project/global scope switching.
 - Diff Workbench for project vs global config comparison.
 - Hook Cockpit for static hook inventory, conflicts, and risk warnings.

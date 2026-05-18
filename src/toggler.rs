@@ -6,15 +6,30 @@ pub fn toggle_item(item: &mut ConfigItem) -> Result<()> {
     if let Some(loc) = item.hook_loc.clone() {
         return toggle_hook(item, &loc);
     }
+
+    if item.kind == ItemKind::Mcp || item.kind == ItemKind::Agent {
+        if item.path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            return toggle_toml_mcp(item);
+        } else {
+            return toggle_json_item(item);
+        }
+    }
+
     match item.state {
         ItemState::Enabled => {
             let dst = item.disabled_path();
+            if let Some(p) = dst.parent() {
+                std::fs::create_dir_all(p)?;
+            }
             std::fs::rename(&item.path, &dst)?;
             item.path = dst;
             item.state = ItemState::Disabled;
         }
         ItemState::Disabled => {
             let dst = item.enabled_path();
+            if let Some(p) = dst.parent() {
+                std::fs::create_dir_all(p)?;
+            }
             std::fs::rename(&item.path, &dst)?;
             item.path = dst;
             item.state = ItemState::Enabled;
@@ -114,6 +129,114 @@ fn ensure_array<'a>(
 }
 
 fn backup(path: &Path) -> Result<()> {
-    std::fs::copy(path, path.with_extension("json.bak"))?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
+    std::fs::copy(path, path.with_extension(format!("{ext}.bak")))?;
+    Ok(())
+}
+
+fn toggle_toml_mcp(item: &mut ConfigItem) -> Result<()> {
+    backup(&item.path)?;
+    let text = std::fs::read_to_string(&item.path)?;
+    let mut doc: toml::Value = toml::from_str(&text)?;
+    let servers = doc
+        .get_mut("mcp_servers")
+        .and_then(|v| v.as_table_mut())
+        .ok_or_else(|| anyhow::anyhow!("no mcp_servers table"))?;
+
+    let server = servers
+        .get_mut(&item.name)
+        .and_then(|v| v.as_table_mut())
+        .ok_or_else(|| anyhow::anyhow!("server {} not found", item.name))?;
+
+    if item.state.is_enabled() {
+        server.insert("enabled".to_string(), toml::Value::Boolean(false));
+        item.state = ItemState::Disabled;
+    } else {
+        server.insert("enabled".to_string(), toml::Value::Boolean(true));
+        item.state = ItemState::Enabled;
+    }
+
+    std::fs::write(&item.path, toml::to_string_pretty(&doc)?)?;
+    Ok(())
+}
+
+fn toggle_json_item(item: &mut ConfigItem) -> Result<()> {
+    backup(&item.path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&item.path)?)?;
+
+    let candidates = ["mcpServers", "mcp", "agent"];
+    let mut found = false;
+    for key in candidates {
+        if let Some(obj) = doc.get_mut(key).and_then(|v| v.as_object_mut()) {
+            if let Some(val) = obj.get_mut(&item.name) {
+                if let Some(o) = val.as_object_mut() {
+                    if item.state.is_enabled() {
+                        if key == "mcp" || key == "agent" {
+                            o.insert("enabled".to_string(), serde_json::Value::Bool(false));
+                        } else {
+                            o.insert("disabled".to_string(), serde_json::Value::Bool(true));
+                        }
+                        item.state = ItemState::Disabled;
+                    } else {
+                        if key == "mcp" || key == "agent" {
+                            o.insert("enabled".to_string(), serde_json::Value::Bool(true));
+                        } else {
+                            o.remove("disabled");
+                        }
+                        item.state = ItemState::Enabled;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        let disabled_key = format!("_disabled_{}", key);
+        if let Some(obj) = doc.get_mut(&disabled_key).and_then(|v| v.as_object_mut()) {
+            if let Some(mut val) = obj.remove(&item.name) {
+                if let Some(o) = val.as_object_mut() {
+                    if item.state.is_enabled() {
+                        if key == "mcp" || key == "agent" {
+                            o.insert("enabled".to_string(), serde_json::Value::Bool(false));
+                        } else {
+                            o.insert("disabled".to_string(), serde_json::Value::Bool(true));
+                        }
+                        item.state = ItemState::Disabled;
+                    } else {
+                        if key == "mcp" || key == "agent" {
+                            o.insert("enabled".to_string(), serde_json::Value::Bool(true));
+                        } else {
+                            o.remove("disabled");
+                        }
+                        item.state = ItemState::Enabled;
+                    }
+                }
+                let main_obj = doc
+                    .as_object_mut()
+                    .unwrap()
+                    .entry(key)
+                    .or_insert_with(|| serde_json::json!({}));
+                main_obj
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(item.name.clone(), val);
+
+                if doc
+                    .get(&disabled_key)
+                    .and_then(|v| v.as_object())
+                    .is_some_and(|o| o.is_empty())
+                {
+                    doc.as_object_mut().unwrap().remove(&disabled_key);
+                }
+
+                found = true;
+                break;
+            }
+        }
+    }
+    if !found {
+        anyhow::bail!("Item '{}' not found in JSON", item.name);
+    }
+    std::fs::write(&item.path, serde_json::to_string_pretty(&doc)?)?;
     Ok(())
 }

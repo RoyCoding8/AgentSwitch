@@ -271,7 +271,37 @@ impl eframe::App for App {
                         View::Items => {}
                     }
                     let result = ui::item_list::show(ui_panel, &self.items, self.filter);
-                    if let Some(idx) = result.index {
+                    if result.enable_all || result.disable_all {
+                        let want_enabled = result.enable_all;
+                        let indices: Vec<usize> = self
+                            .items
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, it)| match self.filter {
+                                FilterKind::All => true,
+                                FilterKind::Specific(k) => it.kind == k,
+                            })
+                            .filter(|(_, it)| it.state.is_enabled() != want_enabled)
+                            .map(|(i, _)| i)
+                            .collect();
+                        let (mut ok, mut errs) = (0usize, vec![]);
+                        for idx in indices {
+                            match toggler::toggle_item(&mut self.items[idx]) {
+                                Ok(()) => ok += 1,
+                                Err(e) => errs.push(format!("{}: {e}", self.items[idx].name)),
+                            }
+                        }
+                        self.status_msg = Some(if errs.is_empty() {
+                            format!(
+                                "{} items {}",
+                                ok,
+                                if want_enabled { "enabled" } else { "disabled" }
+                            )
+                        } else {
+                            format!("{ok} ok, {} errors: {}", errs.len(), errs.join("; "))
+                        });
+                        self.rescan_items();
+                    } else if let Some(idx) = result.index {
                         if idx < self.items.len() {
                             match toggler::toggle_item(&mut self.items[idx]) {
                                 Ok(()) => {

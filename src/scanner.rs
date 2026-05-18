@@ -99,6 +99,26 @@ fn collect_subdirs(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<Conf
     out
 }
 
+fn collect_md_both(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
+    let mut out = collect_md(dir, kind, provider);
+    let mut dis_dir = dir.to_path_buf();
+    if let Some(name) = dir.file_name() {
+        dis_dir.set_file_name(format!("{}.disabled", name.to_string_lossy()));
+        out.extend(collect_md(&dis_dir, kind, provider));
+    }
+    out
+}
+
+fn collect_subdirs_both(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
+    let mut out = collect_subdirs(dir, kind, provider);
+    let mut dis_dir = dir.to_path_buf();
+    if let Some(name) = dir.file_name() {
+        dis_dir.set_file_name(format!("{}.disabled", name.to_string_lossy()));
+        out.extend(collect_subdirs(&dis_dir, kind, provider));
+    }
+    out
+}
+
 fn check_file(path: PathBuf, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
     let mut out = vec![];
     if path.exists() {
@@ -116,12 +136,7 @@ fn check_file(path: PathBuf, kind: ItemKind, provider: ProviderId) -> Vec<Config
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        out.push(ConfigItem::new(
-            name,
-            ItemKind::InstructionFile,
-            dis,
-            provider,
-        ));
+        out.push(ConfigItem::new(name, kind, dis, provider));
     }
     out
 }
@@ -136,14 +151,21 @@ fn scan_json_keys(path: &Path, key: &str, kind: ItemKind, provider: ProviderId) 
         Ok(d) => d,
         _ => return out,
     };
-    for (check_key, state) in [
+    for (check_key, base_state) in [
         (key, ItemState::Enabled),
         (&format!("_disabled_{}", key), ItemState::Disabled),
     ] {
         if let Some(obj) = doc.get(check_key).and_then(|v| v.as_object()) {
             for (name, value) in obj {
                 let mut item = ConfigItem::new(name.clone(), kind, path.to_owned(), provider);
-                item.state = state;
+                item.state = if base_state == ItemState::Disabled
+                    || value.get("disabled").and_then(|v| v.as_bool()) == Some(true)
+                    || value.get("enabled").and_then(|v| v.as_bool()) == Some(false)
+                {
+                    ItemState::Disabled
+                } else {
+                    ItemState::Enabled
+                };
                 item.editable = false;
                 item.detail = Some(json_detail(value));
                 out.push(item);
@@ -392,12 +414,12 @@ fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
             ProviderId::Claude,
         )),
     }
-    items.extend(collect_subdirs(
+    items.extend(collect_subdirs_both(
         &d.join("skills"),
         ItemKind::Skill,
         ProviderId::Claude,
     ));
-    items.extend(collect_md(
+    items.extend(collect_md_both(
         &d.join("rules"),
         ItemKind::Rule,
         ProviderId::Claude,
@@ -422,13 +444,13 @@ fn scan_codex(root: &Path, scope: Scope) -> Vec<ConfigItem> {
             ItemKind::InstructionFile,
             ProviderId::Codex,
         ));
-        items.extend(collect_subdirs(
+        items.extend(collect_subdirs_both(
             &root.join(".agents").join("skills"),
             ItemKind::Skill,
             ProviderId::Codex,
         ));
     }
-    items.extend(collect_subdirs(
+    items.extend(collect_subdirs_both(
         &d.join("skills"),
         ItemKind::Skill,
         ProviderId::Codex,
@@ -475,12 +497,12 @@ fn scan_gemini(root: &Path, scope: Scope) -> Vec<ConfigItem> {
             ProviderId::Gemini,
         ));
     }
-    items.extend(collect_subdirs(
+    items.extend(collect_subdirs_both(
         &d.join("skills"),
         ItemKind::Skill,
         ProviderId::Gemini,
     ));
-    items.extend(collect_md(
+    items.extend(collect_md_both(
         &d.join("rules"),
         ItemKind::Rule,
         ProviderId::Gemini,
@@ -500,32 +522,36 @@ fn scan_gemini(root: &Path, scope: Scope) -> Vec<ConfigItem> {
 fn scan_kiro(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     let d = provider_dir(ProviderId::Kiro, root, scope);
     let mut items = vec![];
-    items.extend(collect_md(
+    items.extend(collect_md_both(
         &d.join("steering"),
         ItemKind::SteeringRule,
         ProviderId::Kiro,
     ));
-    items.extend(collect_subdirs(
+    items.extend(collect_subdirs_both(
         &d.join("specs"),
         ItemKind::Spec,
         ProviderId::Kiro,
     ));
-    items.extend(collect_subdirs(
+    items.extend(collect_subdirs_both(
         &d.join("agents"),
         ItemKind::Agent,
         ProviderId::Kiro,
     ));
-    let agents_dir = d.join("agents");
-    if agents_dir.is_dir() {
-        if let Ok(rd) = std::fs::read_dir(&agents_dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                    items.extend(scan_hook_entries(&p, ProviderId::Kiro, &[]));
+
+    let mut scan_kiro_agents_dir = |agents_dir: &Path| {
+        if agents_dir.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(agents_dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                        items.extend(scan_hook_entries(&p, ProviderId::Kiro, &[]));
+                    }
                 }
             }
         }
-    }
+    };
+    scan_kiro_agents_dir(&d.join("agents"));
+    scan_kiro_agents_dir(&d.join("agents.disabled"));
     items.extend(scan_json_keys(
         &d.join("settings").join("mcp.json"),
         "mcpServers",
@@ -545,7 +571,7 @@ fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
             ProviderId::OpenCode,
         ));
     }
-    items.extend(collect_subdirs(
+    items.extend(collect_subdirs_both(
         &d.join("skills"),
         ItemKind::Skill,
         ProviderId::OpenCode,
