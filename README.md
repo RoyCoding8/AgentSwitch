@@ -9,7 +9,7 @@ Native desktop GUI for managing AI coding-agent configuration across providers. 
 - **Scope Switching** — project-level vs global configuration, with workspace browser.
 - **Diff Workbench** — compare project and global configs with stable, secret-safe fingerprints. Detects duplicates, missing targets, and scope conflicts.
 - **Hook Cockpit** — static hook inventory showing event, matcher, handler, blocking risk, timeout, duplicates, and project/global overlaps.
-- **Chat Manager** — unified chat history browser across Claude Code, Codex CLI, Gemini CLI, and Kiro. Search, export (single JSON or multi-chat ZIP), soft-delete with Trash, and import archived sessions.
+- **Chat Manager** — unified chat history browser across Claude Code, Codex CLI, Gemini CLI, Antigravity CLI, and Kiro. Search, export (single JSON or multi-chat ZIP), soft-delete with Trash, and import archived sessions.
 - **Inline Editor** — edit instruction files, rules, and steering docs without leaving the app.
 - **JSON Backups** — automatic `.bak` creation before any config mutation.
 - **Cross-platform** — Windows, Linux, and macOS builds.
@@ -21,6 +21,7 @@ Native desktop GUI for managing AI coding-agent configuration across providers. 
 | Claude Code | `CLAUDE.md` | `.claude/skills/` | `settings.json` | `settings.json` | Rules |
 | Codex CLI | `AGENTS.md` | `.codex/skills/`, `.agents/skills/` | `config.toml`, `hooks.json` | `config.toml`, `.mcp.json` | — |
 | Gemini CLI | `GEMINI.md`, `AGENTS.md` | `.gemini/skills/` | `settings.json` | `settings.json` | Rules |
+| Antigravity CLI | `GEMINI.md`, `AGENTS.md` | `.agents/skills/` | `settings.json` | `mcp_config.json` | — |
 | Kiro | — | — | Agent JSON | `settings/mcp.json` | Steering, Specs, Agents |
 | OpenCode | `AGENTS.md` | `.opencode/skills/` | Plugins | `opencode.json` | Agents |
 

@@ -6,6 +6,7 @@ pub fn scan_provider(id: ProviderId, root: &Path, scope: Scope) -> Vec<ConfigIte
         ProviderId::Claude => scan_claude(root, scope),
         ProviderId::Codex => scan_codex(root, scope),
         ProviderId::Gemini => scan_gemini(root, scope),
+        ProviderId::Antigravity => scan_antigravity(root, scope),
         ProviderId::Kiro => scan_kiro(root, scope),
         ProviderId::OpenCode => scan_opencode(root, scope),
     }
@@ -24,6 +25,11 @@ pub fn provider_exists(id: ProviderId, root: &Path, scope: Scope) -> bool {
             provider_dir(id, root, scope).is_dir() || has_cmd("codex")
         }
         (ProviderId::Gemini, _) => provider_dir(id, root, scope).is_dir() || has_cmd("gemini"),
+        (ProviderId::Antigravity, _) => {
+            provider_dir(id, root, scope).is_dir()
+                || root.join(".agents").is_dir()
+                || has_cmd("agy")
+        }
         (ProviderId::Kiro, _) => {
             provider_dir(id, root, scope).is_dir() || has_cmd("kiro") || has_cmd("kiro-cli")
         }
@@ -40,6 +46,8 @@ pub fn provider_dir(id: ProviderId, root: &Path, scope: Scope) -> PathBuf {
         (ProviderId::Codex, Scope::Global) => home.join(".codex"),
         (ProviderId::Gemini, Scope::Project) => root.join(".gemini"),
         (ProviderId::Gemini, Scope::Global) => home.join(".gemini"),
+        (ProviderId::Antigravity, Scope::Project) => root.join(".agents"),
+        (ProviderId::Antigravity, Scope::Global) => home.join(".gemini").join("antigravity-cli"),
         (ProviderId::Kiro, Scope::Project) => root.join(".kiro"),
         (ProviderId::Kiro, Scope::Global) => home.join(".kiro"),
         (ProviderId::OpenCode, Scope::Project) => root.join(".opencode"),
@@ -516,6 +524,38 @@ fn scan_gemini(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         ItemKind::Mcp,
         ProviderId::Gemini,
     ));
+    items
+}
+
+fn scan_antigravity(root: &Path, scope: Scope) -> Vec<ConfigItem> {
+    let d = provider_dir(ProviderId::Antigravity, root, scope);
+    let mut items = vec![];
+    if scope == Scope::Project {
+        items.extend(check_file(
+            root.join("GEMINI.md"),
+            ItemKind::InstructionFile,
+            ProviderId::Antigravity,
+        ));
+        items.extend(check_file(
+            root.join("AGENTS.md"),
+            ItemKind::InstructionFile,
+            ProviderId::Antigravity,
+        ));
+    }
+    items.extend(collect_subdirs_both(
+        &d.join("skills"),
+        ItemKind::Skill,
+        ProviderId::Antigravity,
+    ));
+    let mcp_cfg = d.join("mcp_config.json");
+    items.extend(scan_json_keys(
+        &mcp_cfg,
+        "mcpServers",
+        ItemKind::Mcp,
+        ProviderId::Antigravity,
+    ));
+    let settings = d.join("settings.json");
+    items.extend(scan_hook_entries(&settings, ProviderId::Antigravity, &[]));
     items
 }
 

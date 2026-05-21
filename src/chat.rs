@@ -11,7 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use walkdir::WalkDir;
-use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+use zip::{read::ZipArchive, write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 const ARCHIVE_VERSION: u32 = 1;
 const ARCHIVE_EXT: &str = "agentswitch-chat.json";
@@ -21,6 +21,7 @@ pub enum ChatProvider {
     Claude,
     Codex,
     Gemini,
+    Antigravity,
     Kiro,
 }
 
@@ -30,6 +31,7 @@ impl ChatProvider {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex CLI",
             Self::Gemini => "Gemini CLI",
+            Self::Antigravity => "Antigravity CLI",
             Self::Kiro => "Kiro",
         }
     }
@@ -39,6 +41,7 @@ impl ChatProvider {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Antigravity => "antigravity",
             Self::Kiro => "kiro",
         }
     }
@@ -48,6 +51,7 @@ impl ChatProvider {
             Self::Claude => ProviderId::Claude.color(),
             Self::Codex => ProviderId::Codex.color(),
             Self::Gemini => ProviderId::Gemini.color(),
+            Self::Antigravity => ProviderId::Antigravity.color(),
             Self::Kiro => ProviderId::Kiro.color(),
         }
     }
@@ -160,6 +164,7 @@ pub fn scan_all(workspace: &Path) -> Vec<ChatSession> {
     sessions.extend(scan_claude());
     sessions.extend(scan_codex());
     sessions.extend(scan_gemini());
+    sessions.extend(scan_antigravity());
     sessions.extend(scan_kiro(workspace));
     sessions.extend(scan_imported());
     sessions.sort_by(|a, b| {
@@ -263,9 +268,12 @@ pub fn export_sessions_zip(sessions: &[ChatSession], target: &Path) -> Result<Ba
     Ok(report)
 }
 
-pub fn import_archive(path: &Path) -> Result<PathBuf> {
-    let archive: ChatArchive = serde_json::from_str(&fs::read_to_string(path)?)?;
+pub fn import_archive(path: &Path, project_dir: Option<&Path>) -> Result<PathBuf> {
+    let mut archive: ChatArchive = serde_json::from_str(&fs::read_to_string(path)?)?;
     validate_archive(&archive)?;
+    if let Some(dir) = project_dir {
+        archive.project_path = dir.to_string_lossy().to_string();
+    }
     let dir = imports_dir();
     fs::create_dir_all(&dir)?;
     let base = safe_file_stem(&format!(
@@ -279,8 +287,57 @@ pub fn import_archive(path: &Path) -> Result<PathBuf> {
         target = dir.join(format!("{base}-{n}.{ARCHIVE_EXT}"));
         n += 1;
     }
-    fs::copy(path, &target)?;
+    fs::write(&target, serde_json::to_string_pretty(&archive)?)?;
     Ok(target)
+}
+
+pub fn import_zip(path: &Path, project_dir: Option<&Path>) -> Result<BatchReport> {
+    let file = File::open(path)?;
+    let mut zip = ZipArchive::new(file)?;
+    let dir = imports_dir();
+    fs::create_dir_all(&dir)?;
+    let mut report = BatchReport::default();
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let name = entry.name().to_string();
+        if !name.ends_with(ARCHIVE_EXT) {
+            continue;
+        }
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut buf)?;
+        let mut archive: ChatArchive = match serde_json::from_str(&buf) {
+            Ok(a) => a,
+            Err(_) => {
+                report.failed += 1;
+                continue;
+            }
+        };
+        if validate_archive(&archive).is_err() {
+            report.failed += 1;
+            continue;
+        }
+        if let Some(d) = project_dir {
+            archive.project_path = d.to_string_lossy().to_string();
+        }
+        let base = safe_file_stem(&format!(
+            "{}-{}",
+            archive.source_provider.id(),
+            archive.title
+        ));
+        let mut target = dir.join(format!("{base}.{ARCHIVE_EXT}"));
+        let mut n = 2usize;
+        while target.exists() {
+            target = dir.join(format!("{base}-{n}.{ARCHIVE_EXT}"));
+            n += 1;
+        }
+        fs::write(&target, serde_json::to_string_pretty(&archive)?)?;
+        report.ok += 1;
+    }
+    Ok(report)
+}
+
+pub fn exports_dir() -> PathBuf {
+    data_dir().join("chats").join("exports")
 }
 
 pub fn soft_delete(session: &ChatSession, workspace: &Path) -> Result<()> {
@@ -582,6 +639,59 @@ fn scan_gemini() -> Vec<ChatSession> {
                 let path = entry.path();
                 if path.is_file() && is_gemini_checkpoint_file(&path) {
                     if let Ok(session) = jsonl_session(ChatProvider::Gemini, &tmp, &path) {
+                        if session.turn_count > 0 {
+                            out.push(session);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn scan_antigravity() -> Vec<ChatSession> {
+    let Some(home) = dirs::home_dir() else {
+        return vec![];
+    };
+    let tmp = home.join(".gemini").join("antigravity-cli").join("tmp");
+    if !tmp.is_dir() {
+        return vec![];
+    }
+    let mut out = Vec::new();
+    let Ok(projects) = fs::read_dir(&tmp) else {
+        return out;
+    };
+    for project in projects.flatten().filter(|e| e.path().is_dir()) {
+        let chats = project.path().join("chats");
+        if let Ok(entries) = fs::read_dir(&chats) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && is_gemini_session_file(&path) {
+                    if let Ok(session) = jsonl_session(ChatProvider::Antigravity, &tmp, &path) {
+                        if session.turn_count > 0 {
+                            out.push(session);
+                        }
+                    }
+                } else if path.is_dir() {
+                    let files = jsonl_files_in(&path, 1);
+                    if !files.is_empty() {
+                        if let Ok(session) =
+                            jsonl_dir_session(ChatProvider::Antigravity, &tmp, &path, files)
+                        {
+                            if session.turn_count > 0 {
+                                out.push(session);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(entries) = fs::read_dir(project.path()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && is_gemini_checkpoint_file(&path) {
+                    if let Ok(session) = jsonl_session(ChatProvider::Antigravity, &tmp, &path) {
                         if session.turn_count > 0 {
                             out.push(session);
                         }
@@ -983,6 +1093,10 @@ fn update_meta_from_event(provider: ChatProvider, value: &Value, meta: &mut Sess
         meta.project_path =
             str_field(value, &["projectHash"]).map(|s| format!("Gemini project {s}"));
     }
+    if meta.project_path.is_none() && provider == ChatProvider::Antigravity {
+        meta.project_path =
+            str_field(value, &["projectHash"]).map(|s| format!("Antigravity project {s}"));
+    }
 }
 
 fn tool_title(value: &Value) -> Option<&str> {
@@ -1184,6 +1298,12 @@ fn project_label_from_path(provider: ChatProvider, root: &Path, path: &Path) -> 
             .and_then(|p| p.components().next())
             .map(|c| c.as_os_str().to_string_lossy().to_string())
             .unwrap_or_else(|| "Gemini project".into()),
+        ChatProvider::Antigravity => path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|p| p.components().next())
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .unwrap_or_else(|| "Antigravity project".into()),
         _ => path
             .parent()
             .map(|p| p.to_string_lossy().to_string())

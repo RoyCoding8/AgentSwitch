@@ -390,6 +390,16 @@ impl eframe::App for App {
 impl App {
     fn show_chats(&mut self, ui_panel: &mut egui::Ui) {
         ui_panel.horizontal(|ui| {
+            if ui.button("Back").clicked() {
+                if self.selected_provider.is_none() {
+                    self.selected_provider = self
+                        .providers
+                        .iter()
+                        .find(|(_, exists)| *exists)
+                        .map(|(id, _)| *id);
+                }
+                self.view = View::Items;
+            }
             ui.label(
                 egui::RichText::new(if self.chat_trash_mode {
                     "Chats Trash"
@@ -428,15 +438,36 @@ impl App {
         }
         if action.import {
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter("AgentSwitch chat", &["json"])
+                .add_filter("AgentSwitch chat/zip", &["json", "zip"])
+                .set_directory(chat::exports_dir())
                 .pick_file()
             {
-                match chat::import_archive(&path) {
-                    Ok(_) => {
-                        self.rescan_chats();
-                        self.status_msg = Some("Chat imported".into());
+                let project_dir = rfd::FileDialog::new()
+                    .set_title("Associate with project directory (Cancel to skip)")
+                    .pick_folder();
+                let is_zip = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+                if is_zip {
+                    match chat::import_zip(&path, project_dir.as_deref()) {
+                        Ok(report) => {
+                            self.rescan_chats();
+                            self.status_msg = Some(format!(
+                                "{} chats imported, {} failed",
+                                report.ok, report.failed
+                            ));
+                        }
+                        Err(e) => self.status_msg = Some(format!("Import error: {e}")),
                     }
-                    Err(e) => self.status_msg = Some(format!("Import error: {e}")),
+                } else {
+                    match chat::import_archive(&path, project_dir.as_deref()) {
+                        Ok(_) => {
+                            self.rescan_chats();
+                            self.status_msg = Some("Chat imported".into());
+                        }
+                        Err(e) => self.status_msg = Some(format!("Import error: {e}")),
+                    }
                 }
             }
         }
@@ -446,11 +477,13 @@ impl App {
                 .iter()
                 .filter_map(|idx| self.chat_sessions.get(*idx).cloned())
                 .collect();
+            let _ = std::fs::create_dir_all(chat::exports_dir());
             if sessions.len() == 1 {
                 let session = &sessions[0];
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("AgentSwitch chat", &["json"])
                     .set_file_name(chat::suggested_export_name(session))
+                    .set_directory(chat::exports_dir())
                     .save_file()
                 {
                     match chat::export_session(session, &path) {
@@ -462,6 +495,7 @@ impl App {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("AgentSwitch chats", &["zip"])
                     .set_file_name(chat::suggested_zip_export_name())
+                    .set_directory(chat::exports_dir())
                     .save_file()
                 {
                     match chat::export_sessions_zip(&sessions, &path) {
@@ -586,6 +620,10 @@ fn instruction_files(provider: ProviderId, root: &Path, dir: &Path, scope: Scope
             vec![root.join("GEMINI.md"), root.join("AGENTS.md")]
         }
         (ProviderId::Gemini, Scope::Global) => vec![dir.join("GEMINI.md")],
+        (ProviderId::Antigravity, Scope::Project) => {
+            vec![root.join("GEMINI.md"), root.join("AGENTS.md")]
+        }
+        (ProviderId::Antigravity, Scope::Global) => vec![dir.join("GEMINI.md")],
         (ProviderId::Kiro, Scope::Project) => {
             vec![root.join(".kiro").join("steering").join("instructions.md")]
         }

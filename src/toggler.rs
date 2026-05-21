@@ -39,7 +39,7 @@ pub fn toggle_item(item: &mut ConfigItem) -> Result<()> {
 }
 
 fn toggle_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
-    if item.provider == ProviderId::Gemini {
+    if item.provider == ProviderId::Gemini || item.provider == ProviderId::Antigravity {
         return toggle_gemini_hook(item, loc);
     }
     toggle_hook_stash(item, loc)
