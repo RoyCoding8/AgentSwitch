@@ -1,4 +1,7 @@
-use crate::{scanner, types::*};
+use crate::{
+    scanner,
+    types::{parse_json_or_string as parse_detail, str_field, *},
+};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -219,10 +222,6 @@ fn item_key(item: &ConfigItem) -> String {
     item.name.clone()
 }
 
-fn parse_detail(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()))
-}
-
 fn fingerprint(value: &Value) -> String {
     serde_json::to_string(&canonical(value, None, true)).unwrap_or_else(|_| value.to_string())
 }
@@ -338,11 +337,6 @@ fn hook_handler(value: &Value) -> Option<&str> {
         .and_then(|a| a.first())
         .and_then(|h| str_field(h, &["name", "command", "cmd"]))
         .or_else(|| str_field(value, &["name", "command", "cmd"]))
-}
-
-fn str_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .find_map(|k| value.get(*k).and_then(|v| v.as_str()))
 }
 
 fn object_len(value: &Value, key: &str) -> Option<usize> {

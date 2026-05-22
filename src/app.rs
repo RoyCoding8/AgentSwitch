@@ -616,14 +616,15 @@ fn instruction_files(provider: ProviderId, root: &Path, dir: &Path, scope: Scope
         (ProviderId::Claude, Scope::Global) => vec![dir.join("CLAUDE.md")],
         (ProviderId::Codex, Scope::Project) => vec![root.join("AGENTS.md")],
         (ProviderId::Codex, Scope::Global) => vec![dir.join("AGENTS.md")],
-        (ProviderId::Gemini, Scope::Project) => {
-            vec![root.join("GEMINI.md"), root.join("AGENTS.md")]
-        }
-        (ProviderId::Gemini, Scope::Global) => vec![dir.join("GEMINI.md")],
+
         (ProviderId::Antigravity, Scope::Project) => {
             vec![root.join("GEMINI.md"), root.join("AGENTS.md")]
         }
-        (ProviderId::Antigravity, Scope::Global) => vec![dir.join("GEMINI.md")],
+        (ProviderId::Antigravity, Scope::Global) => {
+            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            let gemini_dir = home.join(".gemini");
+            vec![gemini_dir.join("GEMINI.md"), gemini_dir.join("AGENTS.md")]
+        }
         (ProviderId::Kiro, Scope::Project) => {
             vec![root.join(".kiro").join("steering").join("instructions.md")]
         }

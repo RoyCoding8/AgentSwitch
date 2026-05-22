@@ -5,7 +5,6 @@ pub fn scan_provider(id: ProviderId, root: &Path, scope: Scope) -> Vec<ConfigIte
     match id {
         ProviderId::Claude => scan_claude(root, scope),
         ProviderId::Codex => scan_codex(root, scope),
-        ProviderId::Gemini => scan_gemini(root, scope),
         ProviderId::Antigravity => scan_antigravity(root, scope),
         ProviderId::Kiro => scan_kiro(root, scope),
         ProviderId::OpenCode => scan_opencode(root, scope),
@@ -24,7 +23,6 @@ pub fn provider_exists(id: ProviderId, root: &Path, scope: Scope) -> bool {
         (ProviderId::Codex, Scope::Global) => {
             provider_dir(id, root, scope).is_dir() || has_cmd("codex")
         }
-        (ProviderId::Gemini, _) => provider_dir(id, root, scope).is_dir() || has_cmd("gemini"),
         (ProviderId::Antigravity, _) => {
             provider_dir(id, root, scope).is_dir()
                 || root.join(".agents").is_dir()
@@ -44,10 +42,10 @@ pub fn provider_dir(id: ProviderId, root: &Path, scope: Scope) -> PathBuf {
         (ProviderId::Claude, Scope::Global) => home.join(".claude"),
         (ProviderId::Codex, Scope::Project) => root.join(".codex"),
         (ProviderId::Codex, Scope::Global) => home.join(".codex"),
-        (ProviderId::Gemini, Scope::Project) => root.join(".gemini"),
-        (ProviderId::Gemini, Scope::Global) => home.join(".gemini"),
         (ProviderId::Antigravity, Scope::Project) => root.join(".agents"),
-        (ProviderId::Antigravity, Scope::Global) => home.join(".gemini").join("antigravity-cli"),
+        (ProviderId::Antigravity, Scope::Global) => std::env::var("ANTIGRAVITY_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join(".gemini").join("antigravity-cli")),
         (ProviderId::Kiro, Scope::Project) => root.join(".kiro"),
         (ProviderId::Kiro, Scope::Global) => home.join(".kiro"),
         (ProviderId::OpenCode, Scope::Project) => root.join(".opencode"),
@@ -304,29 +302,16 @@ fn scan_toml_hooks(path: &Path, provider: ProviderId) -> Vec<ConfigItem> {
     out
 }
 
-fn scan_hook_entries(
+fn collect_hook_items(
+    entries_iter: impl Iterator<Item = (String, serde_json::Value)>,
     path: &Path,
     provider: ProviderId,
     disabled_names: &[String],
+    event_prefix: &str,
+    force_disabled: bool,
 ) -> Vec<ConfigItem> {
     let mut out = vec![];
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        _ => return out,
-    };
-    let doc: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(d) => d,
-        _ => return out,
-    };
-    let hooks_obj = match doc.get("hooks").and_then(|v| v.as_object()) {
-        Some(o) => o,
-        _ => return out,
-    };
-
-    for (event, entries) in hooks_obj {
-        if event == "disabled" || event.starts_with("_agentswitch") {
-            continue;
-        }
+    for (event, entries) in entries_iter {
         let arr = match entries.as_array() {
             Some(a) => a,
             _ => continue,
@@ -342,11 +327,12 @@ fn scan_hook_entries(
             let display = hook_name
                 .clone()
                 .unwrap_or_else(|| format!("{}: {}", event, matcher));
-            let is_disabled = hook_name
-                .as_ref()
-                .is_some_and(|n| disabled_names.contains(n));
+            let is_disabled = force_disabled
+                || hook_name
+                    .as_ref()
+                    .is_some_and(|n| disabled_names.contains(n));
             let loc = HookLoc {
-                event: event.clone(),
+                event: format!("{}{}", event_prefix, event),
                 index: i,
                 hook_name: hook_name.unwrap_or_else(|| matcher.to_string()),
             };
@@ -360,51 +346,49 @@ fn scan_hook_entries(
             out.push(item);
         }
     }
-    if let Some(stashed) = doc.get("_agentswitch_disabled").and_then(|v| v.as_object()) {
-        for (event, entries) in stashed {
-            let arr = match entries.as_array() {
-                Some(a) => a,
-                _ => continue,
-            };
-            for (i, entry) in arr.iter().enumerate() {
-                let matcher = entry.get("matcher").and_then(|v| v.as_str()).unwrap_or("*");
-                let hook_name = entry
-                    .get("hooks")
-                    .and_then(|h| h.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|h| h.get("name").and_then(|n| n.as_str()))
-                    .map(String::from);
-                let display = hook_name
-                    .clone()
-                    .unwrap_or_else(|| format!("{}: {}", event, matcher));
-                let loc = HookLoc {
-                    event: format!("_stashed_{}", event),
-                    index: i,
-                    hook_name: hook_name.unwrap_or_else(|| matcher.to_string()),
-                };
-                let mut item = ConfigItem::new(display, ItemKind::Hook, path.to_owned(), provider);
-                item.hook_loc = Some(loc);
-                item.state = ItemState::Disabled;
-                item.editable = false;
-                item.detail = Some(json_detail(entry));
-                out.push(item);
-            }
-        }
-    }
     out
 }
 
-fn gemini_disabled_names(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|d| d.get("hooks")?.get("disabled")?.as_array().cloned())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+fn scan_hook_entries(
+    path: &Path,
+    provider: ProviderId,
+    disabled_names: &[String],
+) -> Vec<ConfigItem> {
+    let mut out = vec![];
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        _ => return out,
+    };
+    let doc: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(d) => d,
+        _ => return out,
+    };
+    if let Some(hooks_obj) = doc.get("hooks").and_then(|v| v.as_object()) {
+        let filtered = hooks_obj
+            .iter()
+            .filter(|(event, _)| event.as_str() != "disabled" && !event.starts_with("_agentswitch"))
+            .map(|(e, v)| (e.clone(), v.clone()));
+        out.extend(collect_hook_items(
+            filtered,
+            path,
+            provider,
+            disabled_names,
+            "",
+            false,
+        ));
+    }
+    if let Some(stashed) = doc.get("_agentswitch_disabled").and_then(|v| v.as_object()) {
+        let mapped = stashed.iter().map(|(e, v)| (e.clone(), v.clone()));
+        out.extend(collect_hook_items(
+            mapped,
+            path,
+            provider,
+            &[],
+            "_stashed_",
+            true,
+        ));
+    }
+    out
 }
 
 fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
@@ -490,46 +474,9 @@ fn scan_codex(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     items
 }
 
-fn scan_gemini(root: &Path, scope: Scope) -> Vec<ConfigItem> {
-    let d = provider_dir(ProviderId::Gemini, root, scope);
-    let mut items = vec![];
-    if scope == Scope::Project {
-        items.extend(check_file(
-            root.join("GEMINI.md"),
-            ItemKind::InstructionFile,
-            ProviderId::Gemini,
-        ));
-        items.extend(check_file(
-            root.join("AGENTS.md"),
-            ItemKind::InstructionFile,
-            ProviderId::Gemini,
-        ));
-    }
-    items.extend(collect_subdirs_both(
-        &d.join("skills"),
-        ItemKind::Skill,
-        ProviderId::Gemini,
-    ));
-    items.extend(collect_md_both(
-        &d.join("rules"),
-        ItemKind::Rule,
-        ProviderId::Gemini,
-    ));
-    let settings = d.join("settings.json");
-    let disabled = gemini_disabled_names(&settings);
-    items.extend(scan_hook_entries(&settings, ProviderId::Gemini, &disabled));
-    items.extend(scan_json_keys(
-        &settings,
-        "mcpServers",
-        ItemKind::Mcp,
-        ProviderId::Gemini,
-    ));
-    items
-}
-
 fn scan_antigravity(root: &Path, scope: Scope) -> Vec<ConfigItem> {
-    let d = provider_dir(ProviderId::Antigravity, root, scope);
     let mut items = vec![];
+    let d = provider_dir(ProviderId::Antigravity, root, scope);
     if scope == Scope::Project {
         items.extend(check_file(
             root.join("GEMINI.md"),
@@ -541,21 +488,37 @@ fn scan_antigravity(root: &Path, scope: Scope) -> Vec<ConfigItem> {
             ItemKind::InstructionFile,
             ProviderId::Antigravity,
         ));
+        items.extend(collect_subdirs_both(
+            &root.join(".agents").join("skills"),
+            ItemKind::Skill,
+            ProviderId::Antigravity,
+        ));
+    } else {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let gemini_dir = home.join(".gemini");
+        items.extend(check_file(
+            gemini_dir.join("GEMINI.md"),
+            ItemKind::InstructionFile,
+            ProviderId::Antigravity,
+        ));
+        items.extend(check_file(
+            gemini_dir.join("AGENTS.md"),
+            ItemKind::InstructionFile,
+            ProviderId::Antigravity,
+        ));
+        items.extend(collect_subdirs_both(
+            &gemini_dir.join("skills"),
+            ItemKind::Skill,
+            ProviderId::Antigravity,
+        ));
     }
-    items.extend(collect_subdirs_both(
-        &d.join("skills"),
-        ItemKind::Skill,
-        ProviderId::Antigravity,
-    ));
-    let mcp_cfg = d.join("mcp_config.json");
+    // MCP servers from mcp_config.json (Antigravity CLI uses a separate file)
     items.extend(scan_json_keys(
-        &mcp_cfg,
+        &d.join("mcp_config.json"),
         "mcpServers",
         ItemKind::Mcp,
         ProviderId::Antigravity,
     ));
-    let settings = d.join("settings.json");
-    items.extend(scan_hook_entries(&settings, ProviderId::Antigravity, &[]));
     items
 }
 

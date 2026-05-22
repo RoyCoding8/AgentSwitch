@@ -39,7 +39,7 @@ pub fn toggle_item(item: &mut ConfigItem) -> Result<()> {
 }
 
 fn toggle_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
-    if item.provider == ProviderId::Gemini || item.provider == ProviderId::Antigravity {
+    if item.provider == ProviderId::Antigravity {
         return toggle_gemini_hook(item, loc);
     }
     toggle_hook_stash(item, loc)
@@ -160,9 +160,28 @@ fn toggle_toml_mcp(item: &mut ConfigItem) -> Result<()> {
     Ok(())
 }
 
+/// Set enable/disable markers on a JSON object. For "mcpServers" uses
+/// a "disabled" bool; for "mcp"/"agent" uses an "enabled" bool.
+fn apply_json_toggle(
+    o: &mut serde_json::Map<String, serde_json::Value>,
+    section: &str,
+    enable: bool,
+) {
+    if section == "mcpServers" {
+        if enable {
+            o.remove("disabled");
+        } else {
+            o.insert("disabled".into(), serde_json::Value::Bool(true));
+        }
+    } else {
+        o.insert("enabled".into(), serde_json::Value::Bool(enable));
+    }
+}
+
 fn toggle_json_item(item: &mut ConfigItem) -> Result<()> {
     backup(&item.path)?;
     let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&item.path)?)?;
+    let enable = !item.state.is_enabled();
 
     let candidates = ["mcpServers", "mcp", "agent"];
     let mut found = false;
@@ -170,21 +189,12 @@ fn toggle_json_item(item: &mut ConfigItem) -> Result<()> {
         if let Some(obj) = doc.get_mut(key).and_then(|v| v.as_object_mut()) {
             if let Some(val) = obj.get_mut(&item.name) {
                 if let Some(o) = val.as_object_mut() {
-                    if item.state.is_enabled() {
-                        if key == "mcp" || key == "agent" {
-                            o.insert("enabled".to_string(), serde_json::Value::Bool(false));
-                        } else {
-                            o.insert("disabled".to_string(), serde_json::Value::Bool(true));
-                        }
-                        item.state = ItemState::Disabled;
+                    apply_json_toggle(o, key, enable);
+                    item.state = if enable {
+                        ItemState::Enabled
                     } else {
-                        if key == "mcp" || key == "agent" {
-                            o.insert("enabled".to_string(), serde_json::Value::Bool(true));
-                        } else {
-                            o.remove("disabled");
-                        }
-                        item.state = ItemState::Enabled;
-                    }
+                        ItemState::Disabled
+                    };
                     found = true;
                     break;
                 }
@@ -195,21 +205,12 @@ fn toggle_json_item(item: &mut ConfigItem) -> Result<()> {
         if let Some(obj) = doc.get_mut(&disabled_key).and_then(|v| v.as_object_mut()) {
             if let Some(mut val) = obj.remove(&item.name) {
                 if let Some(o) = val.as_object_mut() {
-                    if item.state.is_enabled() {
-                        if key == "mcp" || key == "agent" {
-                            o.insert("enabled".to_string(), serde_json::Value::Bool(false));
-                        } else {
-                            o.insert("disabled".to_string(), serde_json::Value::Bool(true));
-                        }
-                        item.state = ItemState::Disabled;
+                    apply_json_toggle(o, key, enable);
+                    item.state = if enable {
+                        ItemState::Enabled
                     } else {
-                        if key == "mcp" || key == "agent" {
-                            o.insert("enabled".to_string(), serde_json::Value::Bool(true));
-                        } else {
-                            o.remove("disabled");
-                        }
-                        item.state = ItemState::Enabled;
-                    }
+                        ItemState::Disabled
+                    };
                 }
                 let main_obj = doc
                     .as_object_mut()

@@ -1,4 +1,7 @@
-use crate::{scanner, types::*};
+use crate::{
+    scanner,
+    types::{str_field, *},
+};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -103,7 +106,7 @@ pub fn build(provider: ProviderId, workspace: &Path) -> Vec<HookRow> {
 }
 
 fn row(item: ConfigItem, scope: Scope) -> HookRow {
-    let value = parse(item.detail.as_deref().unwrap_or(""));
+    let value = parse_json_or_string(item.detail.as_deref().unwrap_or(""));
     let loc = item.hook_loc.clone().unwrap_or(HookLoc {
         event: "hook".into(),
         index: 0,
@@ -259,12 +262,8 @@ fn timeout(value: &Value) -> Option<u64> {
         .or_else(|| num_field(value, &["timeout", "timeout_ms", "timeoutMs"]))
 }
 
-fn parse(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()))
-}
-fn str_field<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter().find_map(|k| v.get(*k).and_then(|v| v.as_str()))
-}
+use crate::types::parse_json_or_string;
+
 fn num_field(v: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|k| v.get(*k).and_then(|v| v.as_u64()))
 }

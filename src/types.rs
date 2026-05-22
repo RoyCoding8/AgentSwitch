@@ -51,7 +51,6 @@ impl ItemState {
 pub enum ProviderId {
     Claude,
     Codex,
-    Gemini,
     Antigravity,
     Kiro,
     OpenCode,
@@ -61,7 +60,6 @@ impl ProviderId {
     pub const ALL: &[ProviderId] = &[
         Self::Claude,
         Self::Codex,
-        Self::Gemini,
         Self::Antigravity,
         Self::Kiro,
         Self::OpenCode,
@@ -70,7 +68,6 @@ impl ProviderId {
         match self {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex CLI",
-            Self::Gemini => "Gemini CLI",
             Self::Antigravity => "Antigravity CLI",
             Self::Kiro => "Kiro",
             Self::OpenCode => "OpenCode",
@@ -80,7 +77,6 @@ impl ProviderId {
         match self {
             Self::Claude => egui::Color32::from_rgb(0xD9, 0x77, 0x57),
             Self::Codex => egui::Color32::from_rgb(0x10, 0xA3, 0x7F),
-            Self::Gemini => egui::Color32::from_rgb(0x42, 0x85, 0xF4),
             Self::Antigravity => egui::Color32::from_rgb(0xF4, 0xB4, 0x00),
             Self::Kiro => egui::Color32::from_rgb(0x7B, 0x61, 0xFF),
             Self::OpenCode => egui::Color32::from_rgb(0xFF, 0x6B, 0x35),
@@ -179,4 +175,15 @@ impl ConfigItem {
 pub enum FilterKind {
     All,
     Specific(ItemKind),
+}
+
+/// Look up the first matching key in a JSON value and return it as &str.
+pub fn str_field<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|v| v.as_str()))
+}
+
+/// Parse a string as JSON, falling back to a JSON string literal.
+pub fn parse_json_or_string(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.into()))
 }
