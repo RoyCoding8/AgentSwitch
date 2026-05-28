@@ -322,8 +322,9 @@ fn collect_hook_items(
                 .get("hooks")
                 .and_then(|h| h.as_array())
                 .and_then(|a| a.first())
-                .and_then(|h| h.get("name").and_then(|n| n.as_str()))
-                .map(String::from);
+        .and_then(|h| h.get("name").or_else(|| h.get("command")))
+            .and_then(|n| n.as_str())
+            .map(String::from);
             let display = hook_name
                 .clone()
                 .unwrap_or_else(|| format!("{}: {}", event, matcher));
@@ -353,6 +354,7 @@ fn scan_hook_entries(
     path: &Path,
     provider: ProviderId,
     disabled_names: &[String],
+    force_disabled: bool,
 ) -> Vec<ConfigItem> {
     let mut out = vec![];
     let text = match std::fs::read_to_string(path) {
@@ -374,7 +376,7 @@ fn scan_hook_entries(
             provider,
             disabled_names,
             "",
-            false,
+            force_disabled,
         ));
     }
     if let Some(stashed) = doc.get("_agentswitch_disabled").and_then(|v| v.as_object()) {
@@ -417,7 +419,7 @@ fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         ProviderId::Claude,
     ));
     let settings = d.join("settings.json");
-    items.extend(scan_hook_entries(&settings, ProviderId::Claude, &[]));
+    items.extend(scan_hook_entries(&settings, ProviderId::Claude, &[], false));
     items.extend(scan_json_keys(
         &settings,
         "mcpServers",
@@ -460,7 +462,7 @@ fn scan_codex(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     }
     let hooks = d.join("hooks.json");
     if hooks.exists() {
-        items.extend(scan_hook_entries(&hooks, ProviderId::Codex, &[]));
+        items.extend(scan_hook_entries(&hooks, ProviderId::Codex, &[], false));
     }
     let hooks_dis = PathBuf::from(format!("{}.disabled", hooks.display()));
     if hooks_dis.exists() {
@@ -541,20 +543,26 @@ fn scan_kiro(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         ProviderId::Kiro,
     ));
 
-    let mut scan_kiro_agents_dir = |agents_dir: &Path| {
+    for (agents_dir, force_disabled) in [
+        (d.join("agents"), false),
+        (d.join("agents.disabled"), true),
+    ] {
         if agents_dir.is_dir() {
-            if let Ok(rd) = std::fs::read_dir(agents_dir) {
+            if let Ok(rd) = std::fs::read_dir(&agents_dir) {
                 for e in rd.flatten() {
                     let p = e.path();
                     if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                        items.extend(scan_hook_entries(&p, ProviderId::Kiro, &[]));
+                        items.extend(scan_hook_entries(
+                            &p,
+                            ProviderId::Kiro,
+                            &[],
+                            force_disabled,
+                        ));
                     }
                 }
             }
         }
-    };
-    scan_kiro_agents_dir(&d.join("agents"));
-    scan_kiro_agents_dir(&d.join("agents.disabled"));
+    }
     items.extend(scan_json_keys(
         &d.join("settings").join("mcp.json"),
         "mcpServers",
@@ -579,10 +587,28 @@ fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         ItemKind::Skill,
         ProviderId::OpenCode,
     ));
+    if scope == Scope::Project {
+        items.extend(collect_md_both(
+            &d.join("agent"),
+            ItemKind::Agent,
+            ProviderId::OpenCode,
+        ));
+        items.extend(collect_md_both(
+            &d.join("agents"),
+            ItemKind::Agent,
+            ProviderId::OpenCode,
+        ));
+    }
     let cfg = if scope == Scope::Global {
         d.join("opencode.json")
     } else {
-        root.join("opencode.json")
+        let flat = root.join("opencode.json");
+        let nested = d.join("opencode.json");
+        if !flat.exists() && !flat.with_extension("jsonc").exists() && nested.exists() {
+            nested
+        } else {
+            flat
+        }
     };
     let cfg_jsonc = cfg.with_extension("jsonc");
     let actual_cfg = if cfg_jsonc.exists() { cfg_jsonc } else { cfg };
@@ -613,7 +639,7 @@ fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
                     };
                     let mut item = ConfigItem::new(
                         name,
-                        ItemKind::Hook,
+                        ItemKind::Plugin,
                         actual_cfg.clone(),
                         ProviderId::OpenCode,
                     );

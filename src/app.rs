@@ -114,7 +114,12 @@ impl App {
     }
 
     fn rescan_chats(&mut self) {
-        self.chat_sessions = chat::scan_all(&self.workspace);
+        let filter = if self.view == View::Chats {
+            self.selected_provider
+        } else {
+            None
+        };
+        self.chat_sessions = chat::scan_all(&self.workspace, filter);
         self.chat_trash = chat::scan_trash();
         let keys: HashSet<_> = self
             .chat_sessions
@@ -264,10 +269,14 @@ impl eframe::App for App {
                     });
                     ui_panel.add_space(4.0);
                     ui_panel.horizontal(|ui| {
+                        let old_view = self.view;
                         view_tab(ui, &mut self.view, View::Items, "Items");
                         view_tab(ui, &mut self.view, View::Hooks, "Hooks");
                         view_tab(ui, &mut self.view, View::Diff, "Diff");
                         view_tab(ui, &mut self.view, View::Chats, "Chats");
+                        if self.view != old_view && self.view == View::Chats {
+                            self.rescan_chats();
+                        }
                         if self.view == View::Items {
                             let kinds = self.available_kinds();
                             ui::item_list::filter_tabs(ui, &mut self.filter, &kinds);
@@ -317,22 +326,29 @@ impl eframe::App for App {
                             .filter(|(_, it)| it.state.is_enabled() != want_enabled)
                             .map(|(i, _)| i)
                             .collect();
-                        let (mut ok, mut errs) = (0usize, vec![]);
-                        for idx in indices {
-                            match toggler::toggle_item(&mut self.items[idx]) {
-                                Ok(()) => ok += 1,
-                                Err(e) => errs.push(format!("{}: {e}", self.items[idx].name)),
+                        let mut toggled: Vec<usize> = Vec::new();
+                        let mut failed_name = None;
+                        for idx in &indices {
+                            match toggler::toggle_item(&mut self.items[*idx]) {
+                                Ok(()) => toggled.push(*idx),
+                                Err(e) => {
+                                    failed_name = Some(format!("{}: {e}", self.items[*idx].name));
+                                    break;
+                                }
                             }
                         }
-                        self.status_msg = Some(if errs.is_empty() {
-                            format!(
-                                "{} items {}",
-                                ok,
-                                if want_enabled { "enabled" } else { "disabled" }
-                            )
+                        if let Some(err) = failed_name {
+                            for &idx in toggled.iter().rev() {
+                                let _ = toggler::toggle_item(&mut self.items[idx]);
+                            }
+                            self.status_msg = Some(format!("Rolled back, error: {err}"));
                         } else {
-                            format!("{ok} ok, {} errors: {}", errs.len(), errs.join("; "))
-                        });
+                            self.status_msg = Some(format!(
+                                "{} items {}",
+                                toggled.len(),
+                                if want_enabled { "enabled" } else { "disabled" }
+                            ));
+                        }
                         self.rescan_items();
                     } else if let Some(idx) = result.index {
                         if idx < self.items.len() {
@@ -374,9 +390,15 @@ impl eframe::App for App {
         // refresh on scope/provider change
         if self.scope != old_scope {
             self.refresh();
+            if self.view == View::Chats {
+                self.rescan_chats();
+            }
         } else if self.selected_provider != old_provider {
             self.rescan_items();
             self.filter = FilterKind::All;
+            if self.view == View::Chats {
+                self.rescan_chats();
+            }
         }
         // Prevent being stuck in a view with no way to navigate away
         if self.selected_provider.is_none()
@@ -389,6 +411,10 @@ impl eframe::App for App {
 
 impl App {
     fn show_chats(&mut self, ui_panel: &mut egui::Ui) {
+        let provider_label = self
+            .selected_provider
+            .map(|p| p.label())
+            .unwrap_or("All Providers");
         ui_panel.horizontal(|ui| {
             if ui.button("Back").clicked() {
                 if self.selected_provider.is_none() {
@@ -400,14 +426,15 @@ impl App {
                 }
                 self.view = View::Items;
             }
+            let title = if self.chat_trash_mode {
+                format!("{} Chats Trash", provider_label)
+            } else {
+                format!("{} Chats", provider_label)
+            };
             ui.label(
-                egui::RichText::new(if self.chat_trash_mode {
-                    "Chats Trash"
-                } else {
-                    "Chats"
-                })
-                .font(ui::theme::heading_font())
-                .color(ui::theme::TEXT_PRIMARY),
+                egui::RichText::new(title)
+                    .font(ui::theme::heading_font())
+                    .color(ui::theme::TEXT_PRIMARY),
             );
         });
         ui_panel.add_space(4.0);
@@ -517,7 +544,7 @@ impl App {
                 match self
                     .chat_sessions
                     .get(idx)
-                    .map(|session| chat::soft_delete(session, &self.workspace))
+                    .map(chat::soft_delete)
                 {
                     Some(Ok(())) => ok += 1,
                     _ => failed += 1,

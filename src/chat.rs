@@ -1,5 +1,6 @@
 use crate::types::{str_field, ProviderId};
 use anyhow::{anyhow, Result};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -22,6 +23,7 @@ pub enum ChatProvider {
     Codex,
     Antigravity,
     Kiro,
+    OpenCode,
 }
 
 impl ChatProvider {
@@ -31,6 +33,7 @@ impl ChatProvider {
             Self::Codex => "Codex CLI",
             Self::Antigravity => "Antigravity CLI",
             Self::Kiro => "Kiro",
+            Self::OpenCode => "OpenCode",
         }
     }
 
@@ -40,6 +43,7 @@ impl ChatProvider {
             Self::Codex => "codex",
             Self::Antigravity => "antigravity",
             Self::Kiro => "kiro",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -49,6 +53,7 @@ impl ChatProvider {
             Self::Codex => ProviderId::Codex.color(),
             Self::Antigravity => ProviderId::Antigravity.color(),
             Self::Kiro => ProviderId::Kiro.color(),
+            Self::OpenCode => ProviderId::OpenCode.color(),
         }
     }
 }
@@ -75,6 +80,7 @@ pub enum ChatSourceKind {
     JsonlDir,
     ImportedArchive,
     KiroCli,
+    OpenCodeDb,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,11 +161,32 @@ struct SessionMeta {
     turn_count: usize,
 }
 
-pub fn scan_all(workspace: &Path) -> Vec<ChatSession> {
+pub fn scan_all(workspace: &Path, provider_filter: Option<crate::types::ProviderId>) -> Vec<ChatSession> {
     let mut sessions = Vec::new();
-    sessions.extend(scan_claude());
-    sessions.extend(scan_codex());
-    sessions.extend(scan_kiro(workspace));
+    let include = |p: ChatProvider| -> bool {
+        provider_filter.is_none_or(|prov| {
+            matches!(
+                (prov, p),
+                (crate::types::ProviderId::Claude, ChatProvider::Claude)
+                    | (crate::types::ProviderId::Codex, ChatProvider::Codex)
+                    | (crate::types::ProviderId::Antigravity, ChatProvider::Antigravity)
+                    | (crate::types::ProviderId::Kiro, ChatProvider::Kiro)
+                    | (crate::types::ProviderId::OpenCode, ChatProvider::OpenCode)
+            )
+        })
+    };
+    if include(ChatProvider::Claude) {
+        sessions.extend(scan_claude());
+    }
+    if include(ChatProvider::Codex) {
+        sessions.extend(scan_codex());
+    }
+    if include(ChatProvider::Kiro) {
+        sessions.extend(scan_kiro(workspace));
+    }
+    if include(ChatProvider::OpenCode) {
+        sessions.extend(scan_opencode());
+    }
     sessions.extend(scan_imported());
     sessions.sort_by(|a, b| {
         a.provider
@@ -207,6 +234,7 @@ pub fn load_archive(session: &ChatSession) -> Result<ChatArchive> {
         }
         ChatSourceKind::Jsonl | ChatSourceKind::JsonlDir => load_jsonl_archive(session),
         ChatSourceKind::KiroCli => load_kiro_archive(session),
+        ChatSourceKind::OpenCodeDb => load_opencode_archive(session),
     }
 }
 
@@ -346,10 +374,14 @@ pub fn exports_dir() -> PathBuf {
     data_dir().join("chats").join("exports")
 }
 
-pub fn soft_delete(session: &ChatSession, workspace: &Path) -> Result<()> {
-    let _ = workspace;
+pub fn soft_delete(session: &ChatSession) -> Result<()> {
     if session.source_kind == ChatSourceKind::KiroCli {
         return soft_delete_kiro_session(session);
+    }
+    if session.source_kind == ChatSourceKind::OpenCodeDb {
+        return Err(anyhow!(
+            "OpenCode sessions are stored in a database and cannot be soft-deleted. Use export instead."
+        ));
     }
 
     let source = session
@@ -588,6 +620,152 @@ fn scan_codex() -> Vec<ChatSession> {
         }
     }
     out
+}
+
+fn opencode_db_path() -> Option<PathBuf> {
+    if let Ok(custom) = env::var("OPENCODE_DATA_DIR") {
+        let p = PathBuf::from(custom).join("opencode.db");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    dirs::data_local_dir()
+        .or_else(dirs::home_dir)
+        .map(|p| p.join("opencode").join("opencode.db"))
+        .filter(|p| p.is_file())
+}
+
+fn scan_opencode() -> Vec<ChatSession> {
+    let Some(db_path) = opencode_db_path() else {
+        return vec![];
+    };
+    let Ok(conn) = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return vec![];
+    };
+    let Some(mut stmt) = conn
+        .prepare(
+            "SELECT s.id, s.title, s.directory, s.time_created, s.time_updated, \
+             (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) as msg_count \
+             FROM session s ORDER BY s.time_updated DESC",
+        )
+        .ok()
+    else {
+        return vec![];
+    };
+    let rows: Vec<(String, String, String, i64, i64, i64)> = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let title: String = row.get(1)?;
+            let directory: String = row.get(2)?;
+            let time_created: i64 = row.get(3)?;
+            let time_updated: i64 = row.get(4)?;
+            let msg_count: i64 = row.get(5)?;
+            Ok((id, title, directory, time_created, time_updated, msg_count))
+        })
+        .ok()
+        .map(|r| r.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    rows.into_iter()
+        .map(|(id, title, directory, created, updated, msg_count)| {
+            ChatSession {
+                id: id.clone(),
+                title,
+                provider: ChatProvider::OpenCode,
+                project_path: directory,
+                created_at: Some(timestamp_label(created)),
+                updated_at: timestamp_label(updated),
+                source_path: Some(db_path.clone()),
+                source_kind: ChatSourceKind::OpenCodeDb,
+                turn_count: msg_count as usize,
+                size_bytes: 0,
+                imported: false,
+                trash_manifest: None,
+            }
+        })
+        .collect()
+}
+
+fn load_opencode_archive(session: &ChatSession) -> Result<ChatArchive> {
+    let db_path = session
+        .source_path
+        .as_ref()
+        .ok_or_else(|| anyhow!("OpenCode chat has no database path"))?;
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut messages = Vec::new();
+    let mut tools = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT data FROM session_message WHERE session_id = ?1 ORDER BY time_created ASC",
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map(rusqlite::params![session.id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    for data_str in &rows {
+        let Ok(val) = serde_json::from_str::<Value>(data_str) else {
+            continue;
+        };
+        if let Some(role) = str_field(&val, &["role"]) {
+            let text = extract_text_field(&val);
+            if !text.trim().is_empty() {
+                messages.push(ChatMessage {
+                    role: normalize_role(role).into(),
+                    timestamp: None,
+                    text,
+                });
+            }
+        }
+        if let Some(tool_name) = str_field(&val, &["name"]).or_else(|| str_field(&val, &["tool"]))
+        {
+            tools.push(ChatToolCall {
+                name: tool_name.to_string(),
+                timestamp: None,
+                summary: summarize_tool(&val),
+            });
+        }
+    }
+    Ok(ChatArchive {
+        schema_version: ARCHIVE_VERSION,
+        source_provider: ChatProvider::OpenCode,
+        source_session_id: session.id.clone(),
+        title: session.title.clone(),
+        project_path: session.project_path.clone(),
+        created_at: session.created_at.clone(),
+        updated_at: Some(session.updated_at.clone()),
+        messages,
+        tool_calls: tools,
+        raw_events: Vec::new(),
+    })
+}
+
+fn extract_text_field(val: &Value) -> String {
+    str_field(val, &["content", "text", "message"])
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            val.get("content")
+                .and_then(|c| {
+                    if let Some(s) = c.as_str() {
+                        Some(s.to_string())
+                    } else if let Some(arr) = c.as_array() {
+                        let parts: Vec<String> = arr
+                            .iter()
+                            .filter_map(|item| {
+                                str_field(item, &["text"])
+                                    .or_else(|| str_field(item, &["content"]))
+                                    .map(ToOwned::to_owned)
+                            })
+                            .collect();
+                        if parts.is_empty() {
+                            None
+                        } else {
+                            Some(parts.join("\n"))
+                        }
+                    } else {
+                        None
+                    }
+                })
+        })
+        .unwrap_or_default()
 }
 
 fn scan_kiro(workspace: &Path) -> Vec<ChatSession> {
@@ -1161,7 +1339,7 @@ fn available_restore_path(path: &Path) -> PathBuf {
             return candidate;
         }
     }
-    path.to_path_buf()
+    unreachable!("infinite loop always returns")
 }
 
 fn project_label_from_path(provider: ChatProvider, _root: &Path, path: &Path) -> String {
@@ -1377,6 +1555,14 @@ fn safe_file_stem(text: &str) -> String {
     }
 }
 
+fn timestamp_label(ts: i64) -> String {
+    if ts > 1_000_000_000_000 {
+        format!("unix:{}", ts / 1000)
+    } else {
+        format!("unix:{}", ts)
+    }
+}
+
 fn file_time_label(meta: &fs::Metadata, modified: bool) -> String {
     let time = if modified {
         meta.modified().ok()
@@ -1489,7 +1675,7 @@ mod tests {
         env::set_var("AGENT_SWITCH_DATA_DIR", dir.join("data"));
         let file = write_sample_jsonl(&dir, "trash-a", "D:/work/trash");
         let session = jsonl_session(ChatProvider::Codex, &dir, &file).unwrap();
-        soft_delete(&session, &dir).unwrap();
+        soft_delete(&session).unwrap();
         assert!(!file.exists());
         let trash = scan_trash();
         assert_eq!(trash.len(), 1);
@@ -1499,7 +1685,7 @@ mod tests {
         assert_eq!(restored, file);
         assert!(file.exists());
         let session = jsonl_session(ChatProvider::Codex, &dir, &file).unwrap();
-        soft_delete(&session, &dir).unwrap();
+        soft_delete(&session).unwrap();
         let trash = scan_trash();
         delete_trash_forever(&trash[0]).unwrap();
         assert!(scan_trash().is_empty());
@@ -1556,5 +1742,113 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn scans_opencode_sessions_from_db() {
+        let dir = temp_test_dir("opencode-db");
+        let db_path = dir.join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL,
+                version TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                "ses_test1",
+                "proj1",
+                "test-session",
+                "/home/user/project",
+                "Test OpenCode Chat",
+                "1",
+                1780000000000_i64,
+                1780001000000_i64
+            ],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "msg1",
+                "ses_test1",
+                1780000100000_i64,
+                1780000100000_i64,
+                r#"{"role":"user","content":"hello"}"#
+            ],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "msg2",
+                "ses_test1",
+                1780000200000_i64,
+                1780000200000_i64,
+                r#"{"role":"assistant","content":"hi there"}"#
+            ],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "sm1",
+                "ses_test1",
+                "user",
+                1780000100000_i64,
+                1780000100000_i64,
+                r#"{"role":"user","content":"hello"}"#
+            ],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "sm2",
+                "ses_test1",
+                "assistant",
+                1780000200000_i64,
+                1780000200000_i64,
+                r#"{"role":"assistant","content":"hi there"}"#
+            ],
+        ).unwrap();
+        conn.close().unwrap();
+
+        env::set_var("OPENCODE_DATA_DIR", &dir);
+        let sessions = scan_opencode();
+        env::remove_var("OPENCODE_DATA_DIR");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "Test OpenCode Chat");
+        assert_eq!(sessions[0].project_path, "/home/user/project");
+        assert_eq!(sessions[0].turn_count, 2);
+        assert_eq!(sessions[0].provider, ChatProvider::OpenCode);
+
+        let archive = load_archive(&sessions[0]).unwrap();
+        assert_eq!(archive.messages.len(), 2);
+        assert_eq!(archive.messages[0].role, "user");
+        assert_eq!(archive.messages[0].text, "hello");
+        assert_eq!(archive.messages[1].role, "assistant");
+        assert_eq!(archive.messages[1].text, "hi there");
     }
 }

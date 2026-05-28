@@ -1,6 +1,6 @@
 [package]
 name = "agent-switch"
-version = "1.2.0"
+version = "1.3.1"
 edition = "2021"
 description = "Unified AI agent configuration manager"
 
@@ -15,6 +15,7 @@ anyhow = "1"
 dirs = "6"
 rfd = "0.15"
 zip = { version = "2", default-features = false }
+rusqlite = { version = "0.35", features = ["bundled"] }
 
 [profile.release]
 opt-level = "z"

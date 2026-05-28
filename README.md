@@ -9,7 +9,7 @@ Native desktop GUI for managing AI coding-agent configuration across providers. 
 - **Scope Switching** — project-level vs global configuration, with workspace browser.
 - **Diff Workbench** — compare project and global configs with stable, secret-safe fingerprints. Detects duplicates, missing targets, and scope conflicts.
 - **Hook Cockpit** — static hook inventory showing event, matcher, handler, blocking risk, timeout, duplicates, and project/global overlaps.
-- **Chat Manager** — unified chat history browser across Claude Code, Codex CLI, and Kiro. Search, export (single JSON or multi-chat ZIP), soft-delete with Trash, and import archived sessions.
+- **Chat Manager** — unified chat history browser across Claude Code, Codex CLI, Kiro, and OpenCode. Per-provider filtering when a provider is selected, or browse all providers together. Search, export (single JSON or multi-chat ZIP), soft-delete with Trash, and import archived sessions.
 - **Inline Editor** — edit instruction files, rules, and steering docs without leaving the app.
 - **JSON Backups** — automatic `.bak` creation before any config mutation.
 - **Cross-platform** — Windows, Linux, and macOS builds.
@@ -24,7 +24,7 @@ Native desktop GUI for managing AI coding-agent configuration across providers. 
 | Codex CLI | `AGENTS.md` | `.codex/skills/`, `.agents/skills/` | `config.toml`, `hooks.json` | `config.toml`, `.mcp.json` | — |
 | Antigravity CLI | `GEMINI.md`, `AGENTS.md` | `~/.gemini/skills/` | — | — | — |
 | Kiro | — | — | Agent JSON | `settings/mcp.json` | Steering, Specs, Agents |
-| OpenCode | `AGENTS.md` | `.opencode/skills/` | Plugins | `opencode.json` | Agents |
+| OpenCode | `AGENTS.md` | `.opencode/skills/` | Plugins | `opencode.json` | Agents, Chats (SQLite) |
 
 ## Install
 
@@ -39,7 +39,7 @@ Download the matching binary from [Releases](https://github.com/RoyCoding8/Agent
 
 ## Build from Source
 
-Requires the [Rust toolchain](https://rustup.rs/) (1.75+).
+Requires the [Rust toolchain](https://rustup.rs/) (1.75+). SQLite is bundled via `rusqlite` — no system dependency needed.
 
 ```bash
 git clone https://github.com/RoyCoding8/AgentSwitch.git
@@ -86,7 +86,7 @@ src/
   toggler.rs       rename and JSON/TOML mutation logic
   diagnostics.rs   project/global diff workbench engine
   hook_diag.rs     static hook cockpit engine
-  chat.rs          chat history scanner, archive, export/import, trash
+  chat.rs          chat history scanner, archive, export/import, trash, OpenCode SQLite
   editor.rs        inline markdown editor state
   ui/
     mod.rs         module declarations

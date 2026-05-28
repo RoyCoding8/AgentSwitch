@@ -3,6 +3,10 @@ use anyhow::Result;
 use std::path::Path;
 
 pub fn toggle_item(item: &mut ConfigItem) -> Result<()> {
+    if item.kind == ItemKind::Plugin {
+        anyhow::bail!("Plugins cannot be toggled directly; edit opencode.json instead");
+    }
+
     if let Some(loc) = item.hook_loc.clone() {
         return toggle_hook(item, &loc);
     }
@@ -160,8 +164,9 @@ fn toggle_toml_mcp(item: &mut ConfigItem) -> Result<()> {
     Ok(())
 }
 
-/// Set enable/disable markers on a JSON object. For "mcpServers" uses
-/// a "disabled" bool; for "mcp"/"agent" uses an "enabled" bool.
+/// Set enable/disable markers on a JSON object. For "mcpServers" (Claude format)
+/// uses a "disabled" bool; for "mcp"/"agent" (OpenCode format) uses an "enabled" bool.
+/// These conventions match each provider's native config schema.
 fn apply_json_toggle(
     o: &mut serde_json::Map<String, serde_json::Value>,
     section: &str,
