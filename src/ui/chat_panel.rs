@@ -253,6 +253,7 @@ fn source_label(session: &ChatSession) -> &'static str {
         chat::ChatSourceKind::JsonlDir => "JSONL dir",
         chat::ChatSourceKind::ImportedArchive => "archive",
         chat::ChatSourceKind::KiroCli => "kiro-cli",
+        chat::ChatSourceKind::OpenCodeDb => "opencode-db",
     }
 }
 

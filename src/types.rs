@@ -15,6 +15,7 @@ pub enum ItemKind {
     Rule,
     Agent,
     Mcp,
+    Plugin,
     InstructionFile,
     SteeringRule,
     Spec,
@@ -28,6 +29,7 @@ impl ItemKind {
             Self::Rule => "Rules",
             Self::Agent => "Agents",
             Self::Mcp => "MCP",
+            Self::Plugin => "Plugins",
             Self::InstructionFile => "Files",
             Self::SteeringRule => "Steering",
             Self::Spec => "Specs",
@@ -113,7 +115,7 @@ impl ConfigItem {
         let editable = matches!(
             kind,
             ItemKind::InstructionFile | ItemKind::Rule | ItemKind::SteeringRule
-        );
+        ) && kind != ItemKind::Plugin;
         let state = if path.extension().and_then(|e| e.to_str()) == Some("disabled")
             || path.to_string_lossy().contains(".disabled")
         {
