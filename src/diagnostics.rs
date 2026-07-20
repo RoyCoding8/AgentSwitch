@@ -93,17 +93,6 @@ impl DiffRow {
     }
 }
 
-pub fn default_filter(rows: &[DiffRow]) -> DiffFilter {
-    if rows
-        .iter()
-        .any(|r| r.status != DiffStatus::Same || r.has_conflict())
-    {
-        DiffFilter::OnlyDifferences
-    } else {
-        DiffFilter::All
-    }
-}
-
 pub fn build(provider: ProviderId, workspace: &Path) -> Vec<DiffRow> {
     let project = scanner::scan_provider(provider, workspace, Scope::Project);
     let global = scanner::scan_provider(provider, workspace, Scope::Global);
@@ -403,9 +392,11 @@ mod tests {
     fn hook(name: &str, detail: &str) -> ConfigItem {
         let mut item = item(name, ItemKind::Hook, ItemState::Enabled, detail);
         item.hook_loc = Some(HookLoc {
+            section: "hooks".into(),
             event: "PreToolUse".into(),
-            index: 0,
+            order: 0,
             hook_name: name.into(),
+            fingerprint: detail.into(),
         });
         item
     }

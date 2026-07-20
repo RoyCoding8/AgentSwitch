@@ -1,13 +1,15 @@
+use crate::batch;
 use crate::chat::{self, ChatSession};
 use crate::diagnostics;
 use crate::editor::EditorState;
 use crate::hook_diag;
+use crate::provider;
 use crate::scanner;
 use crate::toggler;
 use crate::types::*;
 use crate::ui;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -32,6 +34,8 @@ pub struct App {
     chat_selection: HashSet<String>,
     chat_search: String,
     chat_trash_mode: bool,
+    /// Armed "delete forever" request awaiting confirmation.
+    chat_delete_confirm: Option<(Vec<usize>, bool)>,
     filter: FilterKind,
     view: View,
     editor: EditorState,
@@ -58,6 +62,7 @@ impl App {
             chat_selection: HashSet::new(),
             chat_search: String::new(),
             chat_trash_mode: false,
+            chat_delete_confirm: None,
             filter: FilterKind::All,
             view: View::Items,
             editor: EditorState::default(),
@@ -70,15 +75,21 @@ impl App {
         app
     }
 
-    fn scan_root(&self) -> PathBuf {
+    fn scan_root(&self) -> Option<PathBuf> {
         match self.scope {
-            Scope::Project => self.workspace.clone(),
-            Scope::Global => dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+            Scope::Project => Some(self.workspace.clone()),
+            Scope::Global => provider::home_dir().ok(),
         }
     }
 
     fn refresh(&mut self) {
-        let root = self.scan_root();
+        let Some(root) = self.scan_root() else {
+            self.providers.clear();
+            self.selected_provider = None;
+            self.items.clear();
+            self.status_msg = Some("Cannot determine the user home directory".into());
+            return;
+        };
         self.providers = ProviderId::ALL
             .iter()
             .map(|&id| (id, scanner::provider_exists(id, &root, self.scope)))
@@ -92,11 +103,19 @@ impl App {
         {
             self.selected_provider = self.providers.iter().find(|(_, d)| *d).map(|(id, _)| *id);
         }
+        // A stale kind filter would render "No items found" over a list that
+        // actually has entries of other kinds.
+        self.filter = FilterKind::All;
         self.rescan_items();
     }
 
     fn rescan_items(&mut self) {
-        let root = self.scan_root();
+        let Some(root) = self.scan_root() else {
+            self.items.clear();
+            self.diff_rows.clear();
+            self.hook_rows.clear();
+            return;
+        };
         self.items = match self.selected_provider {
             Some(id) => scanner::scan_provider(id, &root, self.scope),
             None => vec![],
@@ -105,12 +124,26 @@ impl App {
             Some(id) => diagnostics::build(id, &self.workspace),
             None => vec![],
         };
-        self.diff_filter = diagnostics::default_filter(&self.diff_rows);
         self.hook_rows = match self.selected_provider {
             Some(id) => hook_diag::build(id, &self.workspace),
             None => vec![],
         };
-        self.hook_filter = hook_diag::default_filter(&self.hook_rows);
+        // Keep the user's diff/hook filters across rescans; resetting them on
+        // every toggle made selections silently revert.
+        if !self
+            .diff_rows
+            .iter()
+            .any(|row| self.diff_filter.matches(row))
+        {
+            self.diff_filter = diagnostics::DiffFilter::All;
+        }
+        if !self
+            .hook_rows
+            .iter()
+            .any(|row| self.hook_filter.matches(row))
+        {
+            self.hook_filter = hook_diag::HookFilter::All;
+        }
     }
 
     fn rescan_chats(&mut self) {
@@ -215,9 +248,16 @@ impl eframe::App for App {
                     ui::editor_panel::show(ui_panel, &mut self.editor);
                 } else if self.view == View::Chats {
                     self.show_chats(ui_panel);
-                } else if let Some(provider) = self.selected_provider {
-                    let root = self.scan_root();
-                    let dir = scanner::provider_dir(provider, &root, self.scope);
+                } else if let Some(provider_id) = self.selected_provider {
+                    let Some(root) = self.scan_root() else {
+                        ui_panel.label("Cannot determine the user home directory");
+                        return;
+                    };
+                    let Ok(dir) = scanner::provider_dir(provider_id, &root, self.scope) else {
+                        ui_panel.label("Cannot resolve the provider configuration directory");
+                        return;
+                    };
+                    let provider = provider_id;
                     ui_panel.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(provider.label())
@@ -226,9 +266,11 @@ impl eframe::App for App {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Open folder").clicked() {
-                                open_path(&dir);
+                                self.open_and_report(&dir);
                             }
-                            for md in instruction_files(provider, &root, &dir, self.scope) {
+                            for md in provider::instruction_files(provider, &root, self.scope)
+                                .unwrap_or_default()
+                            {
                                 let label = md
                                     .file_name()
                                     .unwrap_or_default()
@@ -254,15 +296,30 @@ impl eframe::App for App {
                                     .clicked()
                                 {
                                     if !exists {
-                                        if let Some(p) = md.parent() {
-                                            let _ = std::fs::create_dir_all(p);
+                                        let created = md
+                                            .parent()
+                                            .map(std::fs::create_dir_all)
+                                            .transpose()
+                                            .and_then(|_| {
+                                                std::fs::write(
+                                                    &md,
+                                                    format!(
+                                                        "# {} instructions\n",
+                                                        provider.label()
+                                                    ),
+                                                )
+                                            });
+                                        if let Err(error) = created {
+                                            self.status_msg = Some(format!(
+                                                "Could not create {}: {error}",
+                                                md.display()
+                                            ));
+                                            return;
                                         }
-                                        let _ = std::fs::write(
-                                            &md,
-                                            format!("# {} instructions\n", provider.label()),
-                                        );
                                     }
-                                    self.editor.open(md);
+                                    self.editor.open(md).unwrap_or_else(|error| {
+                                        self.status_msg = Some(format!("Error: {error}"));
+                                    });
                                 }
                             }
                         });
@@ -290,8 +347,8 @@ impl eframe::App for App {
                                 &self.diff_rows,
                                 &mut self.diff_filter,
                             );
-                            if let Some(path) = action.open {
-                                open_path(&path);
+                            if let Some(path) = action.open.clone() {
+                                self.open_and_report(&path);
                             }
                             return;
                         }
@@ -301,8 +358,8 @@ impl eframe::App for App {
                                 &self.hook_rows,
                                 &mut self.hook_filter,
                             );
-                            if let Some(path) = action.open {
-                                open_path(&path);
+                            if let Some(path) = action.open.clone() {
+                                self.open_and_report(&path);
                             }
                             return;
                         }
@@ -326,26 +383,20 @@ impl eframe::App for App {
                             .filter(|(_, it)| it.state.is_enabled() != want_enabled)
                             .map(|(i, _)| i)
                             .collect();
-                        let mut toggled: Vec<usize> = Vec::new();
-                        let mut failed_name = None;
-                        for idx in &indices {
-                            match toggler::toggle_item(&mut self.items[*idx]) {
-                                Ok(()) => toggled.push(*idx),
-                                Err(e) => {
-                                    failed_name = Some(format!("{}: {e}", self.items[*idx].name));
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(err) = failed_name {
-                            for &idx in toggled.iter().rev() {
-                                let _ = toggler::toggle_item(&mut self.items[idx]);
-                            }
-                            self.status_msg = Some(format!("Rolled back, error: {err}"));
+                        let outcome = batch::toggle(&mut self.items, &indices);
+                        if let Some(error) = outcome.error {
+                            self.status_msg = Some(if outcome.rollback_errors.is_empty() {
+                                format!("Rolled back after {error}")
+                            } else {
+                                format!(
+                                    "Rollback incomplete after {error}: {}",
+                                    outcome.rollback_errors.join("; ")
+                                )
+                            });
                         } else {
                             self.status_msg = Some(format!(
                                 "{} items {}",
-                                toggled.len(),
+                                outcome.toggled,
                                 if want_enabled { "enabled" } else { "disabled" }
                             ));
                         }
@@ -364,7 +415,10 @@ impl eframe::App for App {
                     }
                     if let Some(idx) = result.edit {
                         if idx < self.items.len() && self.items[idx].editable {
-                            self.editor.open(self.items[idx].path.clone());
+                            let path = self.items[idx].path.clone();
+                            self.editor.open(path).unwrap_or_else(|error| {
+                                self.status_msg = Some(format!("Error: {error}"));
+                            });
                         }
                     }
                 } else {
@@ -410,6 +464,12 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn open_and_report(&mut self, path: &std::path::Path) {
+        if let Err(error) = open_path(path) {
+            self.status_msg = Some(format!("Could not open {}: {error}", path.display()));
+        }
+    }
+
     fn show_chats(&mut self, ui_panel: &mut egui::Ui) {
         let provider_label = self
             .selected_provider
@@ -445,6 +505,7 @@ impl App {
                 &mut self.chat_selection,
                 &mut self.chat_search,
                 true,
+                &mut self.chat_delete_confirm,
             )
         } else {
             ui::chat_panel::show(
@@ -453,8 +514,12 @@ impl App {
                 &mut self.chat_selection,
                 &mut self.chat_search,
                 false,
+                &mut self.chat_delete_confirm,
             )
         };
+        if action.toggle_trash {
+            self.chat_delete_confirm = None;
+        }
         if action.refresh {
             self.rescan_chats();
             self.status_msg = Some("Chats refreshed".into());
@@ -498,6 +563,33 @@ impl App {
                 }
             }
         }
+        if let Some(target) = action.convert_archive_to {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("AgentSwitch chats", &["json", "zip"])
+                .set_directory(chat::exports_dir())
+                .pick_file()
+            {
+                match chat::convert_archive_file(&path, target) {
+                    Ok((out, skipped)) => {
+                        self.status_msg = Some(if skipped == 0 {
+                            format!(
+                                "Converted archive for {}: {} — use Import to place it in {}",
+                                target.label(),
+                                out.display(),
+                                target.label()
+                            )
+                        } else {
+                            format!(
+                                "Converted archive for {}: {} ({skipped} Antigravity chat(s) skipped)",
+                                target.label(),
+                                out.display()
+                            )
+                        });
+                    }
+                    Err(e) => self.status_msg = Some(format!("Convert error: {e}")),
+                }
+            }
+        }
         if !action.export.is_empty() {
             let sessions: Vec<_> = action
                 .export
@@ -537,23 +629,49 @@ impl App {
                 }
             }
         }
+        if !action.convert.is_empty() {
+            let mut ok = 0usize;
+            let mut failed = 0usize;
+            let mut errors: Vec<String> = Vec::new();
+            for (idx, target) in action.convert {
+                let Some(session) = self.chat_sessions.get(idx) else {
+                    failed += 1;
+                    continue;
+                };
+                match chat::convert_session(session, target) {
+                    Ok(_) => ok += 1,
+                    Err(error) => record_failure(&mut errors, &mut failed, error),
+                }
+            }
+            self.rescan_chats();
+            self.status_msg = Some(format!(
+                "{ok} chat(s) converted{}",
+                failure_note(failed, &errors)
+            ));
+        }
         if !action.trash.is_empty() {
             let mut ok = 0usize;
             let mut failed = 0usize;
+            let mut errors: Vec<String> = Vec::new();
             for idx in action.trash {
                 match self.chat_sessions.get(idx).map(chat::soft_delete) {
                     Some(Ok(())) => ok += 1,
-                    _ => failed += 1,
+                    Some(Err(error)) => record_failure(&mut errors, &mut failed, error),
+                    None => failed += 1,
                 }
             }
             self.chat_selection.clear();
             self.rescan_chats();
-            self.status_msg = Some(format!("{ok} chats moved to Trash, {failed} failed"));
+            self.status_msg = Some(format!(
+                "{ok} chats moved to Trash{}",
+                failure_note(failed, &errors)
+            ));
         }
         if !action.restore.is_empty() {
             let mut ok = 0usize;
             let mut failed = 0usize;
             let mut alternates = 0usize;
+            let mut errors: Vec<String> = Vec::new();
             for idx in action.restore {
                 if let Some(session) = self.chat_trash.get(idx) {
                     let original = session
@@ -573,45 +691,83 @@ impl App {
                                 alternates += 1;
                             }
                         }
-                        Err(_) => failed += 1,
+                        Err(error) => record_failure(&mut errors, &mut failed, error),
                     }
                 }
             }
             self.chat_selection.clear();
             self.rescan_chats();
-            self.status_msg = Some(format!(
-                "{ok} chats restored, {failed} failed, {alternates} renamed"
-            ));
+            let mut message = format!("{ok} chats restored{}", failure_note(failed, &errors));
+            if alternates > 0 {
+                message.push_str(&format!(", {alternates} renamed"));
+            }
+            self.status_msg = Some(message);
         }
         if !action.delete_forever.is_empty() || !action.empty_visible.is_empty() {
-            let indices = if action.delete_forever.is_empty() {
-                action.empty_visible
-            } else {
-                action.delete_forever
-            };
+            // Merge both sources so a future UI change can never silently drop
+            // one half of the request.
+            let mut indices: Vec<usize> = Vec::new();
+            indices.extend(action.delete_forever);
+            indices.extend(action.empty_visible);
+            indices.sort_unstable();
+            indices.dedup();
             let mut ok = 0usize;
             let mut failed = 0usize;
+            let mut errors: Vec<String> = Vec::new();
             for idx in indices {
                 match self.chat_trash.get(idx).map(chat::delete_trash_forever) {
                     Some(Ok(())) => ok += 1,
-                    _ => failed += 1,
+                    Some(Err(error)) => record_failure(&mut errors, &mut failed, error),
+                    None => failed += 1,
                 }
             }
             self.chat_selection.clear();
             self.rescan_chats();
-            self.status_msg = Some(format!("{ok} trash chats deleted forever, {failed} failed"));
+            self.status_msg = Some(format!(
+                "{ok} trash chats deleted forever{}",
+                failure_note(failed, &errors)
+            ));
         }
     }
 }
 
-fn open_path(path: &std::path::Path) {
-    let _ = if cfg!(windows) {
+fn open_path(path: &std::path::Path) -> std::io::Result<()> {
+    let result = if cfg!(windows) {
         std::process::Command::new("explorer").arg(path).spawn()
     } else if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(path).spawn()
     } else {
         std::process::Command::new("xdg-open").arg(path).spawn()
     };
+    result.map(|_| ())
+}
+
+fn truncate_error(error: anyhow::Error) -> String {
+    let text = error.to_string();
+    if text.chars().count() <= 200 {
+        text
+    } else {
+        let mut short: String = text.chars().take(200).collect();
+        short.push('…');
+        short
+    }
+}
+
+/// Count a failure and remember its reason so batch actions can explain what
+/// went wrong instead of only reporting "N failed".
+fn record_failure(errors: &mut Vec<String>, failed: &mut usize, error: anyhow::Error) {
+    *failed += 1;
+    let text = truncate_error(error);
+    if errors.len() < 3 && !errors.contains(&text) {
+        errors.push(text);
+    }
+}
+
+fn failure_note(failed: usize, errors: &[String]) -> String {
+    if failed == 0 {
+        return String::new();
+    }
+    format!(" — {failed} failed: {}", errors.join("; "))
 }
 
 fn view_tab(ui: &mut egui::Ui, view: &mut View, value: View, label: &str) {
@@ -630,29 +786,5 @@ fn view_tab(ui: &mut egui::Ui, view: &mut View, value: View, label: &str) {
         .clicked()
     {
         *view = value;
-    }
-}
-
-fn instruction_files(provider: ProviderId, root: &Path, dir: &Path, scope: Scope) -> Vec<PathBuf> {
-    match (provider, scope) {
-        (ProviderId::Claude, Scope::Project) => vec![root.join("CLAUDE.md")],
-        (ProviderId::Claude, Scope::Global) => vec![dir.join("CLAUDE.md")],
-        (ProviderId::Codex, Scope::Project) => vec![root.join("AGENTS.md")],
-        (ProviderId::Codex, Scope::Global) => vec![dir.join("AGENTS.md")],
-
-        (ProviderId::Antigravity, Scope::Project) => {
-            vec![root.join("GEMINI.md"), root.join("AGENTS.md")]
-        }
-        (ProviderId::Antigravity, Scope::Global) => {
-            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-            let gemini_dir = home.join(".gemini");
-            vec![gemini_dir.join("GEMINI.md"), gemini_dir.join("AGENTS.md")]
-        }
-        (ProviderId::Kiro, Scope::Project) => {
-            vec![root.join(".kiro").join("steering").join("instructions.md")]
-        }
-        (ProviderId::Kiro, Scope::Global) => vec![dir.join("steering").join("instructions.md")],
-        (ProviderId::OpenCode, Scope::Project) => vec![root.join("AGENTS.md")],
-        (ProviderId::OpenCode, Scope::Global) => vec![dir.join("AGENTS.md")],
     }
 }

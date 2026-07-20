@@ -1,9 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
+mod batch;
 mod chat;
+mod config_store;
 mod diagnostics;
 mod editor;
 mod hook_diag;
+mod process;
+mod provider;
 mod scanner;
 mod toggler;
 mod types;

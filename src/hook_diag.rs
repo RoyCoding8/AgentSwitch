@@ -70,14 +70,6 @@ impl HookFilter {
     }
 }
 
-pub fn default_filter(rows: &[HookRow]) -> HookFilter {
-    if rows.iter().any(|r| !r.warnings.is_empty()) {
-        HookFilter::Warnings
-    } else {
-        HookFilter::All
-    }
-}
-
 pub fn build(provider: ProviderId, workspace: &Path) -> Vec<HookRow> {
     let mut rows = vec![];
     for scope in [Scope::Project, Scope::Global] {
@@ -108,9 +100,11 @@ pub fn build(provider: ProviderId, workspace: &Path) -> Vec<HookRow> {
 fn row(item: ConfigItem, scope: Scope) -> HookRow {
     let value = parse_json_or_string(item.detail.as_deref().unwrap_or(""));
     let loc = item.hook_loc.clone().unwrap_or(HookLoc {
+        section: "hooks".into(),
         event: "hook".into(),
-        index: 0,
+        order: 0,
         hook_name: item.name.clone(),
+        fingerprint: String::new(),
     });
     let event = loc.event.trim_start_matches("_stashed_").to_string();
     let matcher = str_field(&value, &["matcher"]).unwrap_or("*").to_string();
@@ -129,7 +123,7 @@ fn row(item: ConfigItem, scope: Scope) -> HookRow {
         behavior: behavior(item.provider, &loc.event),
         execution: execution(item.provider, &loc.event),
         timeout,
-        order: loc.index + 1,
+        order: loc.order + 1,
         warnings: vec![],
     };
     row.warnings = own_warnings(&row);
@@ -311,9 +305,11 @@ mod tests {
         );
         i.detail = Some(detail.into());
         i.hook_loc = Some(HookLoc {
+            section: "hooks".into(),
             event: "PreToolUse".into(),
-            index: 0,
+            order: 0,
             hook_name: name.into(),
+            fingerprint: detail.into(),
         });
         row(i, scope)
     }

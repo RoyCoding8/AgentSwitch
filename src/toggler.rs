@@ -1,22 +1,28 @@
+use crate::config_store::{move_path, Snapshot};
 use crate::types::*;
 use anyhow::Result;
-use std::path::Path;
 
 pub fn toggle_item(item: &mut ConfigItem) -> Result<()> {
     if item.kind == ItemKind::Plugin {
         anyhow::bail!("Plugins cannot be toggled directly; edit opencode.json instead");
+    }
+    if item.kind == ItemKind::Hook
+        && item.provider == ProviderId::Codex
+        && item.path.extension() == Some(std::ffi::OsStr::new("toml"))
+    {
+        anyhow::bail!("Codex TOML hook '{}' is read-only", item.name);
     }
 
     if let Some(loc) = item.hook_loc.clone() {
         return toggle_hook(item, &loc);
     }
 
-    if item.kind == ItemKind::Mcp || item.kind == ItemKind::Agent {
-        if item.path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            return toggle_toml_mcp(item);
-        } else {
-            return toggle_json_item(item);
-        }
+    if let Some(spec) = item.toggle_spec.clone() {
+        return toggle_structured_item(item, &spec);
+    }
+
+    if item.kind == ItemKind::Mcp || (item.kind == ItemKind::Agent && !item.path.exists()) {
+        anyhow::bail!("No safe toggle strategy is available for '{}'", item.name);
     }
 
     match item.state {
@@ -25,7 +31,7 @@ pub fn toggle_item(item: &mut ConfigItem) -> Result<()> {
             if let Some(p) = dst.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            std::fs::rename(&item.path, &dst)?;
+            move_path(&item.path, &dst)?;
             item.path = dst;
             item.state = ItemState::Disabled;
         }
@@ -34,7 +40,7 @@ pub fn toggle_item(item: &mut ConfigItem) -> Result<()> {
             if let Some(p) = dst.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            std::fs::rename(&item.path, &dst)?;
+            move_path(&item.path, &dst)?;
             item.path = dst;
             item.state = ItemState::Enabled;
         }
@@ -43,15 +49,44 @@ pub fn toggle_item(item: &mut ConfigItem) -> Result<()> {
 }
 
 fn toggle_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
-    if item.provider == ProviderId::Antigravity {
-        return toggle_gemini_hook(item, loc);
+    match item.provider {
+        ProviderId::Antigravity => return toggle_antigravity_hook(item, loc),
+        // ZCode documents a native per-entry `enabled` flag that its runtime
+        // genuinely skips — prefer it over moving entries around.
+        ProviderId::Zcode => return toggle_zcode_hook(item, loc),
+        _ => {}
     }
     toggle_hook_stash(item, loc)
 }
 
-fn toggle_gemini_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
-    backup(&item.path)?;
-    let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&item.path)?)?;
+fn toggle_zcode_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
+    let snapshot = Snapshot::read(&item.path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
+    let arr = array_at_mut(&mut doc, &loc.section, &loc.event)?;
+    let enable = !item.state.is_enabled();
+    // Identity ignores the `enabled` flag itself, or a toggle would invalidate
+    // the fingerprint needed to find the entry again.
+    let entry = arr
+        .iter_mut()
+        .find(|entry| zcode_entry_fingerprint(entry) == loc.fingerprint)
+        .ok_or_else(|| anyhow::anyhow!("hook no longer exists in {}.{}", loc.section, loc.event))?;
+    let obj = entry
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("hook entry is not an object"))?;
+    if enable {
+        obj.remove("enabled");
+        item.state = ItemState::Enabled;
+    } else {
+        obj.insert("enabled".into(), serde_json::Value::Bool(false));
+        item.state = ItemState::Disabled;
+    }
+    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    Ok(())
+}
+
+fn toggle_antigravity_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
+    let snapshot = Snapshot::read(&item.path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
     let hooks = doc
         .get_mut("hooks")
         .and_then(|v| v.as_object_mut())
@@ -71,178 +106,629 @@ fn toggle_gemini_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
         arr.retain(|v| v.as_str() != Some(&loc.hook_name));
         item.state = ItemState::Enabled;
     }
-    std::fs::write(&item.path, serde_json::to_string_pretty(&doc)?)?;
+    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
     Ok(())
 }
 
 fn toggle_hook_stash(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
-    backup(&item.path)?;
-    let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&item.path)?)?;
+    let snapshot = Snapshot::read(&item.path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
     if item.state.is_enabled() {
-        let entry = remove_from_array(&mut doc, "hooks", &loc.event, loc.index)?;
-        ensure_array(&mut doc, "_agentswitch_disabled", &loc.event).push(entry);
+        let entry = remove_hook(&mut doc, &loc.section, &loc.event, &loc.fingerprint)?;
+        ensure_array(&mut doc, "_agentswitch_disabled", &loc.event)?.push(entry);
         item.state = ItemState::Disabled;
     } else {
         let real_event = loc.event.strip_prefix("_stashed_").unwrap_or(&loc.event);
-        let entry = remove_from_array(&mut doc, "_agentswitch_disabled", real_event, loc.index)?;
-        ensure_array(&mut doc, "hooks", real_event).push(entry);
-        if let Some(obj) = doc.get("_agentswitch_disabled").and_then(|v| v.as_object()) {
-            if obj
-                .values()
-                .all(|v| v.as_array().is_none_or(|a| a.is_empty()))
-            {
-                doc.as_object_mut().unwrap().remove("_agentswitch_disabled");
-            }
+        let entry = remove_hook(
+            &mut doc,
+            "_agentswitch_disabled",
+            real_event,
+            &loc.fingerprint,
+        )?;
+        // Put the hook back where it was instead of appending it last.
+        let arr = array_at_mut(&mut doc, &loc.section, real_event)?;
+        let index = loc.order.min(arr.len());
+        arr.insert(index, entry);
+        let stash_is_empty = doc
+            .get("_agentswitch_disabled")
+            .and_then(|v| v.as_object())
+            .is_some_and(|obj| {
+                obj.values()
+                    .all(|v| v.as_array().is_some_and(|a| a.is_empty()))
+            });
+        if stash_is_empty {
+            doc.as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("configuration root is not an object"))?
+                .remove("_agentswitch_disabled");
         }
         item.state = ItemState::Enabled;
     }
-    std::fs::write(&item.path, serde_json::to_string_pretty(&doc)?)?;
+    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
     Ok(())
 }
 
-fn remove_from_array(
+fn remove_hook(
     doc: &mut serde_json::Value,
     section: &str,
     event: &str,
-    index: usize,
+    fingerprint: &str,
 ) -> Result<serde_json::Value> {
-    let arr = doc
-        .get_mut(section)
-        .and_then(|v| v.get_mut(event))
-        .and_then(|v| v.as_array_mut())
-        .ok_or_else(|| anyhow::anyhow!("{}.{} not found", section, event))?;
-    if index >= arr.len() {
-        anyhow::bail!("index {} >= len {}", index, arr.len());
+    let arr = array_at_mut(doc, section, event)?;
+    let matches: Vec<_> = arr
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (hook_fingerprint(entry) == fingerprint).then_some(index))
+        .collect();
+    match matches.as_slice() {
+        [index] => Ok(arr.remove(*index)),
+        [] => anyhow::bail!("hook no longer exists in {section}.{event}"),
+        _ => anyhow::bail!("hook identity is ambiguous in {section}.{event}"),
     }
-    Ok(arr.remove(index))
+}
+
+/// Content identity of a ZCode hook entry with the runtime `enabled` flag
+/// stripped out.
+pub(crate) fn zcode_entry_fingerprint(entry: &serde_json::Value) -> String {
+    let mut stripped = entry.clone();
+    if let Some(object) = stripped.as_object_mut() {
+        object.remove("enabled");
+    }
+    hook_fingerprint(&stripped)
+}
+
+/// Resolve `section/event` to the event array, creating missing parents.
+/// `section` is a slash-separated object path ("hooks", "hooks/events").
+fn array_at_mut<'a>(
+    doc: &'a mut serde_json::Value,
+    section: &str,
+    event: &str,
+) -> Result<&'a mut Vec<serde_json::Value>> {
+    ensure_array(doc, section, event)
 }
 
 fn ensure_array<'a>(
     doc: &'a mut serde_json::Value,
     section: &str,
     event: &str,
-) -> &'a mut Vec<serde_json::Value> {
-    let obj = doc.as_object_mut().unwrap();
-    let sec = obj.entry(section).or_insert_with(|| serde_json::json!({}));
-    let sec_obj = sec.as_object_mut().unwrap();
-    sec_obj
-        .entry(event)
+) -> Result<&'a mut Vec<serde_json::Value>> {
+    let segments: Vec<&str> = section.split('/').filter(|s| !s.is_empty()).collect();
+    let obj = ensure_object_path(doc, &segments)?;
+    obj.entry(event.to_string())
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
-        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("{section}.{event} is not an array"))
 }
 
-fn backup(path: &Path) -> Result<()> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
-    std::fs::copy(path, path.with_extension(format!("{ext}.bak")))?;
-    Ok(())
+fn ensure_object_path<'a>(
+    doc: &'a mut serde_json::Value,
+    segments: &[&str],
+) -> Result<&'a mut serde_json::Map<String, serde_json::Value>> {
+    let not_object = || anyhow::anyhow!("configuration root is not an object");
+    let Some((first, rest)) = segments.split_first() else {
+        return doc.as_object_mut().ok_or_else(not_object);
+    };
+    let child = doc
+        .as_object_mut()
+        .ok_or_else(not_object)?
+        .entry(first.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if rest.is_empty() {
+        return child
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("{first} is not an object"));
+    }
+    ensure_object_path(child, rest)
 }
 
-fn toggle_toml_mcp(item: &mut ConfigItem) -> Result<()> {
-    backup(&item.path)?;
-    let text = std::fs::read_to_string(&item.path)?;
-    let mut doc: toml::Value = toml::from_str(&text)?;
-    let servers = doc
-        .get_mut("mcp_servers")
-        .and_then(|v| v.as_table_mut())
-        .ok_or_else(|| anyhow::anyhow!("no mcp_servers table"))?;
-
-    let server = servers
-        .get_mut(&item.name)
-        .and_then(|v| v.as_table_mut())
-        .ok_or_else(|| anyhow::anyhow!("server {} not found", item.name))?;
-
-    if item.state.is_enabled() {
-        server.insert("enabled".to_string(), toml::Value::Boolean(false));
-        item.state = ItemState::Disabled;
-    } else {
-        server.insert("enabled".to_string(), toml::Value::Boolean(true));
-        item.state = ItemState::Enabled;
+fn hook_fingerprint(value: &serde_json::Value) -> String {
+    fn canonical(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.iter().map(canonical).collect())
+            }
+            serde_json::Value::Object(object) => {
+                let mut keys: Vec<_> = object.keys().collect();
+                keys.sort();
+                let mut sorted = serde_json::Map::new();
+                for key in keys {
+                    sorted.insert(key.clone(), canonical(&object[key]));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            _ => value.clone(),
+        }
     }
 
-    std::fs::write(&item.path, toml::to_string_pretty(&doc)?)?;
-    Ok(())
+    serde_json::to_string(&canonical(value)).unwrap_or_else(|_| value.to_string())
 }
 
-/// Set enable/disable markers on a JSON object. For "mcpServers" (Claude format)
-/// uses a "disabled" bool; for "mcp"/"agent" (OpenCode format) uses an "enabled" bool.
-/// These conventions match each provider's native config schema.
-fn apply_json_toggle(
-    o: &mut serde_json::Map<String, serde_json::Value>,
+fn toggle_structured_item(item: &mut ConfigItem, spec: &ToggleSpec) -> Result<()> {
+    match spec {
+        ToggleSpec::JsonFlag {
+            section,
+            name,
+            flag,
+            enabled_value,
+            disabled_value,
+        } => toggle_json_flag(item, section, name, flag, *enabled_value, *disabled_value),
+        ToggleSpec::TomlFlag {
+            section,
+            name,
+            flag,
+            enabled_value,
+            disabled_value,
+        } => toggle_toml_flag(item, section, name, flag, *enabled_value, *disabled_value),
+        ToggleSpec::StringLists {
+            path,
+            enabled_key,
+            disabled_key,
+            name,
+        } => toggle_string_lists(item, path, enabled_key, disabled_key, name),
+        ToggleSpec::JsonStash { section, name } => toggle_json_stash(item, section, name),
+    }
+}
+
+fn toggle_json_flag(
+    item: &mut ConfigItem,
     section: &str,
-    enable: bool,
-) {
-    if section == "mcpServers" {
-        if enable {
-            o.remove("disabled");
+    name: &str,
+    flag: &str,
+    enabled_value: bool,
+    disabled_value: bool,
+) -> Result<()> {
+    let snapshot = Snapshot::read(&item.path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
+    let segments: Vec<&str> = section.split('/').filter(|s| !s.is_empty()).collect();
+    let section_obj = ensure_object_path(&mut doc, &segments)?;
+    let entry = section_obj
+        .get_mut(name)
+        .and_then(|value| value.as_object_mut())
+        .ok_or_else(|| anyhow::anyhow!("{section}.{name} is not an object"))?;
+    let enable = !item.state.is_enabled();
+    entry.insert(
+        flag.into(),
+        serde_json::Value::Bool(if enable {
+            enabled_value
         } else {
-            o.insert("disabled".into(), serde_json::Value::Bool(true));
-        }
+            disabled_value
+        }),
+    );
+    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    item.state = if enable {
+        ItemState::Enabled
     } else {
-        o.insert("enabled".into(), serde_json::Value::Bool(enable));
-    }
+        ItemState::Disabled
+    };
+    Ok(())
 }
 
-fn toggle_json_item(item: &mut ConfigItem) -> Result<()> {
-    backup(&item.path)?;
-    let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&item.path)?)?;
+fn toggle_toml_flag(
+    item: &mut ConfigItem,
+    section: &str,
+    name: &str,
+    flag: &str,
+    enabled_value: bool,
+    disabled_value: bool,
+) -> Result<()> {
+    let snapshot = Snapshot::read(&item.path)?;
+    // toml_edit preserves comments, formatting, and key order that a
+    // round-trip through toml::Value would destroy.
+    let mut doc: toml_edit::DocumentMut = snapshot
+        .text()?
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid TOML in {}: {error}", item.path.display()))?;
+    // [mcp_servers.docs] nests under the parent table, but a bare
+    // [mcp_servers.docs] written as a dotted top-level key also occurs.
+    let nested = doc
+        .get_mut(section)
+        .and_then(|value| value.as_table_mut())
+        .and_then(|table| table.get_mut(name))
+        .and_then(|value| value.as_table_mut());
+    let table = match nested {
+        Some(table) => table,
+        None => doc
+            .get_mut(&format!("{section}.{name}"))
+            .and_then(|value| value.as_table_mut())
+            .ok_or_else(|| anyhow::anyhow!("{section}.{name} is not a table"))?,
+    };
     let enable = !item.state.is_enabled();
-
-    let candidates = ["mcpServers", "mcp", "agent"];
-    let mut found = false;
-    for key in candidates {
-        if let Some(obj) = doc.get_mut(key).and_then(|v| v.as_object_mut()) {
-            if let Some(val) = obj.get_mut(&item.name) {
-                if let Some(o) = val.as_object_mut() {
-                    apply_json_toggle(o, key, enable);
-                    item.state = if enable {
-                        ItemState::Enabled
-                    } else {
-                        ItemState::Disabled
-                    };
-                    found = true;
-                    break;
-                }
-            }
-        }
-
-        let disabled_key = format!("_disabled_{}", key);
-        if let Some(obj) = doc.get_mut(&disabled_key).and_then(|v| v.as_object_mut()) {
-            if let Some(mut val) = obj.remove(&item.name) {
-                if let Some(o) = val.as_object_mut() {
-                    apply_json_toggle(o, key, enable);
-                    item.state = if enable {
-                        ItemState::Enabled
-                    } else {
-                        ItemState::Disabled
-                    };
-                }
-                let main_obj = doc
-                    .as_object_mut()
-                    .unwrap()
-                    .entry(key)
-                    .or_insert_with(|| serde_json::json!({}));
-                main_obj
-                    .as_object_mut()
-                    .unwrap()
-                    .insert(item.name.clone(), val);
-
-                if doc
-                    .get(&disabled_key)
-                    .and_then(|v| v.as_object())
-                    .is_some_and(|o| o.is_empty())
-                {
-                    doc.as_object_mut().unwrap().remove(&disabled_key);
-                }
-
-                found = true;
-                break;
-            }
-        }
-    }
-    if !found {
-        anyhow::bail!("Item '{}' not found in JSON", item.name);
-    }
-    std::fs::write(&item.path, serde_json::to_string_pretty(&doc)?)?;
+    table.insert(
+        flag,
+        toml_edit::value(if enable {
+            enabled_value
+        } else {
+            disabled_value
+        }),
+    );
+    snapshot.commit(doc.to_string().as_bytes())?;
+    item.state = if enable {
+        ItemState::Enabled
+    } else {
+        ItemState::Disabled
+    };
     Ok(())
+}
+
+fn toggle_string_lists(
+    item: &mut ConfigItem,
+    path: &std::path::Path,
+    enabled_key: &str,
+    disabled_key: &str,
+    name: &str,
+) -> Result<()> {
+    let snapshot = Snapshot::read_or(path, b"{}")?;
+    let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
+    let enable = !item.state.is_enabled();
+    remove_string(&mut doc, enabled_key, name)?;
+    remove_string(&mut doc, disabled_key, name)?;
+    let target_key = if enable { enabled_key } else { disabled_key };
+    ensure_string_array(&mut doc, target_key)?.push(name.into());
+    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    item.state = if enable {
+        ItemState::Enabled
+    } else {
+        ItemState::Disabled
+    };
+    Ok(())
+}
+
+fn toggle_json_stash(item: &mut ConfigItem, section: &str, name: &str) -> Result<()> {
+    let snapshot = Snapshot::read(&item.path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
+    let enable = !item.state.is_enabled();
+    // Stash keys stay at the document root; slashes in a nested section path
+    // become underscores so the key stays a single identifier.
+    let disabled_section = format!("_disabled_{}", section.replace('/', "_"));
+    let (source_obj, target_key) = if enable {
+        (disabled_section.as_str(), section)
+    } else {
+        (section, disabled_section.as_str())
+    };
+    let source_segments: Vec<&str> = source_obj.split('/').filter(|s| !s.is_empty()).collect();
+    let value = ensure_object_path(&mut doc, &source_segments)
+        .ok()
+        .and_then(|object| object.remove(name))
+        .ok_or_else(|| anyhow::anyhow!("{source_obj}.{name} not found"))?;
+    let target_segments: Vec<&str> = target_key.split('/').filter(|s| !s.is_empty()).collect();
+    ensure_object_path(&mut doc, &target_segments)?.insert(name.into(), value);
+    // Drop the stash container once it is empty so the file carries no
+    // AgentSwitch residue after everything is re-enabled.
+    if enable {
+        if let Some(obj) = doc.as_object_mut() {
+            let empty = obj
+                .get(disabled_section.as_str())
+                .and_then(|v| v.as_object())
+                .is_some_and(|stash| stash.is_empty());
+            if empty {
+                obj.remove(disabled_section.as_str());
+            }
+        }
+    }
+    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    item.state = if enable {
+        ItemState::Enabled
+    } else {
+        ItemState::Disabled
+    };
+    Ok(())
+}
+
+fn ensure_string_array<'a>(
+    doc: &'a mut serde_json::Value,
+    key: &str,
+) -> Result<&'a mut Vec<serde_json::Value>> {
+    doc.as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("configuration root is not an object"))?
+        .entry(key)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("{key} is not an array"))
+}
+
+fn remove_string(doc: &mut serde_json::Value, key: &str, name: &str) -> Result<()> {
+    if let Some(value) = doc.get_mut(key) {
+        let array = value
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("{key} is not an array"))?;
+        array.retain(|value| value.as_str() != Some(name));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file(name: &str, content: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("agentswitch-toggler-{name}-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn hook_item(path: std::path::PathBuf, entry: &serde_json::Value, name: &str) -> ConfigItem {
+        let mut item = ConfigItem::new(name, ItemKind::Hook, path, ProviderId::Claude);
+        item.hook_loc = Some(HookLoc {
+            section: "hooks".into(),
+            event: "PreToolUse".into(),
+            order: 0,
+            hook_name: name.into(),
+            fingerprint: hook_fingerprint(entry),
+        });
+        item
+    }
+
+    #[test]
+    fn hook_toggle_uses_content_identity_after_sibling_moves() {
+        let first =
+            serde_json::json!({"matcher":"Bash","hooks":[{"type":"command","command":"first"}]});
+        let second =
+            serde_json::json!({"matcher":"Edit","hooks":[{"type":"command","command":"second"}]});
+        let path = temp_file(
+            "identity",
+            &serde_json::json!({"hooks":{"PreToolUse":[first.clone(), second.clone()]}})
+                .to_string(),
+        );
+        let mut first_item = hook_item(path.clone(), &first, "first");
+        let mut second_item = hook_item(path.clone(), &second, "second");
+
+        toggle_item(&mut first_item).unwrap();
+        toggle_item(&mut second_item).unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 0);
+        let stashed = doc["_agentswitch_disabled"]["PreToolUse"]
+            .as_array()
+            .unwrap();
+        assert_eq!(stashed, &[first, second]);
+    }
+
+    #[test]
+    fn malformed_stash_returns_error_instead_of_panicking() {
+        let entry = serde_json::json!({"hooks":[{"command":"first"}]});
+        let path = temp_file(
+            "malformed",
+            &serde_json::json!({
+                "hooks":{"PreToolUse":[entry.clone()]},
+                "_agentswitch_disabled":"broken"
+            })
+            .to_string(),
+        );
+        let mut item = hook_item(path, &entry, "first");
+        let error = toggle_item(&mut item).unwrap_err().to_string();
+        assert!(error.contains("_agentswitch_disabled is not an object"));
+    }
+
+    #[test]
+    fn filesystem_agent_toggle_renames_and_restores_directory() {
+        let path = temp_file("agent-dir", "agent");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("config.json"), "{}").unwrap();
+        let mut item = ConfigItem::new("agent", ItemKind::Agent, path.clone(), ProviderId::Kiro);
+
+        toggle_item(&mut item).unwrap();
+        assert_eq!(item.state, ItemState::Disabled);
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(item.path.join("config.json")).unwrap(),
+            "{}"
+        );
+
+        toggle_item(&mut item).unwrap();
+        assert_eq!(item.state, ItemState::Enabled);
+        assert_eq!(item.path, path);
+        assert_eq!(
+            std::fs::read_to_string(path.join("config.json")).unwrap(),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn codex_toml_hook_is_reported_as_read_only() {
+        let mut path = temp_file("codex-hook", "[hooks]\n");
+        path.set_extension("toml");
+        std::fs::write(&path, "[hooks]\n").unwrap();
+        let mut item = ConfigItem::new("notify", ItemKind::Hook, path, ProviderId::Codex);
+        item.hook_loc = Some(HookLoc {
+            section: "hooks".into(),
+            event: "notify".into(),
+            order: 0,
+            hook_name: "notify".into(),
+            fingerprint: "fingerprint".into(),
+        });
+
+        let error = toggle_item(&mut item).unwrap_err().to_string();
+        assert!(error.contains("Codex TOML hook 'notify' is read-only"));
+    }
+
+    #[test]
+    fn claude_project_mcp_toggle_updates_approval_lists() {
+        let mcp_path = temp_file(
+            "claude-mcp",
+            r#"{"mcpServers":{"docs":{"type":"http","url":"https://example.test"}}}"#,
+        );
+        let settings_path = mcp_path.parent().unwrap().join("settings.local.json");
+        std::fs::write(&settings_path, "{}").unwrap();
+        let mut item = ConfigItem::new("docs", ItemKind::Mcp, mcp_path, ProviderId::Claude);
+        item.toggle_spec = Some(ToggleSpec::StringLists {
+            path: settings_path.clone(),
+            enabled_key: "enabledMcpjsonServers".into(),
+            disabled_key: "disabledMcpjsonServers".into(),
+            name: "docs".into(),
+        });
+
+        toggle_item(&mut item).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(settings_path).unwrap()).unwrap();
+        assert_eq!(
+            settings["disabledMcpjsonServers"],
+            serde_json::json!(["docs"])
+        );
+        assert!(settings.get("enabledMcpjsonServers").is_none());
+    }
+
+    #[test]
+    fn antigravity_mcp_toggle_uses_disabled_flag() {
+        let path = temp_file(
+            "antigravity-mcp",
+            r#"{"mcpServers":{"docs":{"command":"server"}}}"#,
+        );
+        let mut item =
+            ConfigItem::new("docs", ItemKind::Mcp, path.clone(), ProviderId::Antigravity);
+        item.toggle_spec = Some(ToggleSpec::JsonFlag {
+            section: "mcpServers".into(),
+            name: "docs".into(),
+            flag: "disabled".into(),
+            enabled_value: false,
+            disabled_value: true,
+        });
+
+        toggle_item(&mut item).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(config["mcpServers"]["docs"]["disabled"], true);
+    }
+
+    #[test]
+    fn zcode_hook_toggle_uses_native_enabled_flag() {
+        let first =
+            serde_json::json!({"matcher":"Bash","hooks":[{"type":"process","command":"check"}]});
+        let path = temp_file(
+            "zcode-hook",
+            &serde_json::json!({"hooks":{"enabled":true,"events":{"PreToolUse":[first.clone()]}}})
+                .to_string(),
+        );
+        let mut item = ConfigItem::new("check", ItemKind::Hook, path.clone(), ProviderId::Zcode);
+        item.hook_loc = Some(HookLoc {
+            section: "hooks/events".into(),
+            event: "PreToolUse".into(),
+            order: 0,
+            hook_name: "check".into(),
+            fingerprint: hook_fingerprint(&first),
+        });
+
+        toggle_item(&mut item).unwrap();
+        assert_eq!(item.state, ItemState::Disabled);
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = &doc["hooks"]["events"]["PreToolUse"][0];
+        assert_eq!(entry["enabled"], serde_json::json!(false));
+        assert_eq!(entry["matcher"], "Bash", "entry must stay in place");
+
+        toggle_item(&mut item).unwrap();
+        assert_eq!(item.state, ItemState::Enabled);
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(doc["hooks"]["events"]["PreToolUse"][0]
+            .get("enabled")
+            .is_none());
+    }
+
+    #[test]
+    fn zcode_mcp_stash_moves_servers_out_of_mcp_servers() {
+        let path = temp_file(
+            "zcode-mcp",
+            r#"{"mcp":{"servers":{"docs":{"type":"stdio","command":"ctx"}}}}"#,
+        );
+        let mut item = ConfigItem::new("docs", ItemKind::Mcp, path.clone(), ProviderId::Zcode);
+        item.toggle_spec = Some(ToggleSpec::JsonStash {
+            section: "mcp/servers".into(),
+            name: "docs".into(),
+        });
+
+        toggle_item(&mut item).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(doc["mcp"]["servers"].get("docs").is_none());
+        assert_eq!(
+            doc["_disabled_mcp_servers"]["docs"]["command"], "ctx",
+            "disabled server keeps its definition"
+        );
+
+        toggle_item(&mut item).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["mcp"]["servers"]["docs"]["command"], "ctx");
+        assert!(doc.get("_disabled_mcp_servers").is_none());
+    }
+
+    #[test]
+    fn reenabling_a_middle_hook_restores_its_original_order() {
+        let a = serde_json::json!({"matcher":"A","hooks":[{"type":"command","command":"a"}]});
+        let b = serde_json::json!({"matcher":"B","hooks":[{"type":"command","command":"b"}]});
+        let c = serde_json::json!({"matcher":"C","hooks":[{"type":"command","command":"c"}]});
+        let path = temp_file(
+            "order",
+            &serde_json::json!({"hooks":{"PostToolUse":[a.clone(), b.clone(), c.clone()]}})
+                .to_string(),
+        );
+        let make = |entry: &serde_json::Value, order: usize| {
+            let mut item =
+                ConfigItem::new("hook", ItemKind::Hook, path.clone(), ProviderId::Claude);
+            item.hook_loc = Some(HookLoc {
+                section: "hooks".into(),
+                event: "PostToolUse".into(),
+                order,
+                hook_name: "hook".into(),
+                fingerprint: hook_fingerprint(entry),
+            });
+            item
+        };
+        let mut middle = make(&b, 1);
+        toggle_item(&mut middle).unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["hooks"]["PostToolUse"].as_array().unwrap().len(), 2);
+
+        toggle_item(&mut middle).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let restored = doc["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(restored.len(), 3);
+        assert_eq!(
+            restored[1]["matcher"], "B",
+            "middle hook goes back to index 1"
+        );
+    }
+
+    #[test]
+    fn toml_flag_toggle_preserves_comments_and_layout() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentswitch-toml-edit-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "# my precious comment\nmodel = \"gpt-5\"\n\n[mcp_servers.docs]\ncommand = \"docs\"\n",
+        )
+        .unwrap();
+        let mut item = ConfigItem::new("docs", ItemKind::Mcp, path.clone(), ProviderId::Codex);
+        item.toggle_spec = Some(ToggleSpec::TomlFlag {
+            section: "mcp_servers".into(),
+            name: "docs".into(),
+            flag: "enabled".into(),
+            enabled_value: true,
+            disabled_value: false,
+        });
+
+        toggle_item(&mut item).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my precious comment"), "comments survive");
+        assert!(text.contains("model = \"gpt-5\""), "layout survives");
+        assert!(text.contains("enabled = false"));
+    }
 }

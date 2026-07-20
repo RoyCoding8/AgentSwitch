@@ -12,25 +12,45 @@ pub struct ChatAction {
     pub restore: Vec<usize>,
     pub delete_forever: Vec<usize>,
     pub empty_visible: Vec<usize>,
+    pub convert: Vec<(usize, crate::chat::ChatProvider)>,
+    pub convert_archive_to: Option<crate::chat::ChatProvider>,
     pub import: bool,
     pub refresh: bool,
     pub toggle_trash: bool,
 }
 
+/// Two-step confirmation for irreversible deletes: the first click arms a
+/// pending request that must be confirmed on the next frame.
+/// Two-step confirmation id for irreversible deletes; the pending request is
+/// stored in egui memory so it survives between frames.
 pub fn show(
     ui: &mut Ui,
     sessions: &[ChatSession],
     selected: &mut HashSet<String>,
     search: &mut String,
     trash_mode: bool,
+    // Pending irreversible delete, owned by the app so it survives frames.
+    delete_confirm: &mut Option<(Vec<usize>, bool)>,
 ) -> ChatAction {
     let mut action = ChatAction::default();
+    if !trash_mode {
+        *delete_confirm = None;
+    }
+    let mut request_arm: Option<(Vec<usize>, bool)> = None;
     let visible = visible_indices(sessions, search);
     let selected_indices = selected_indices(sessions, selected);
     ui.horizontal_wrapped(|ui| {
         if ui.button("Import").clicked() {
             action.import = true;
         }
+        ui.menu_button("Convert archive…", |ui| {
+            for target in chat::conversion_targets() {
+                if ui.button(target.label()).clicked() {
+                    ui.close_menu();
+                    action.convert_archive_to = Some(target);
+                }
+            }
+        });
         if ui.button("Refresh").clicked() {
             action.refresh = true;
         }
@@ -80,18 +100,21 @@ pub fn show(
             }
             if ui
                 .add_enabled(
-                    !selected_indices.is_empty(),
+                    !selected_indices.is_empty() && delete_confirm.is_none(),
                     Button::new("Delete selected forever"),
                 )
                 .clicked()
             {
-                action.delete_forever = selected_indices.clone();
+                request_arm = Some((selected_indices.clone(), false));
             }
             if ui
-                .add_enabled(!visible.is_empty(), Button::new("Empty visible trash"))
+                .add_enabled(
+                    !visible.is_empty() && delete_confirm.is_none(),
+                    Button::new("Empty visible trash"),
+                )
                 .clicked()
             {
-                action.empty_visible = visible.clone();
+                request_arm = Some((visible.clone(), true));
             }
         } else {
             if ui
@@ -109,6 +132,27 @@ pub fn show(
             {
                 action.trash = selected_indices.clone();
             }
+            ui.menu_button("Convert selected…", |ui| {
+                let providers: Vec<_> = selected_indices
+                    .iter()
+                    .filter_map(|&i| sessions.get(i))
+                    .map(|s| s.provider)
+                    .collect();
+                for target in chat::conversion_targets() {
+                    // A provider every selected chat already uses would be a no-op.
+                    if !providers.is_empty() && providers.iter().all(|p| *p == target) {
+                        continue;
+                    }
+                    if ui.button(target.label()).clicked() {
+                        ui.close_menu();
+                        for (&idx, &provider) in selected_indices.iter().zip(providers.iter()) {
+                            if provider != target {
+                                action.convert.push((idx, target));
+                            }
+                        }
+                    }
+                }
+            });
         }
         ui.label(
             RichText::new(format!("{} selected", selected_indices.len()))
@@ -116,6 +160,33 @@ pub fn show(
                 .color(theme::TEXT_DIM),
         );
     });
+    // Irreversible deletes need an explicit second click.
+    if let Some(request) = request_arm {
+        *delete_confirm = Some(request);
+    }
+    if let Some((indices, empty_all)) = delete_confirm.clone() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "Permanently delete {} chat(s)? This cannot be undone.",
+                    indices.len()
+                ))
+                .font(theme::small_font())
+                .color(theme::YELLOW),
+            );
+            if ui.button("Yes, delete forever").clicked() {
+                if empty_all {
+                    action.empty_visible = indices;
+                } else {
+                    action.delete_forever = indices;
+                }
+                *delete_confirm = None;
+            }
+            if ui.button("Cancel").clicked() {
+                *delete_confirm = None;
+            }
+        });
+    }
     ui.add_space(8.0);
     if visible.is_empty() {
         ui.add_space(40.0);
@@ -164,7 +235,7 @@ pub fn show(
                         .default_open(true)
                         .show(ui, |ui| {
                             for &idx in &visible[project_start..j] {
-                                row(ui, &sessions[idx], selected);
+                                row(ui, &sessions[idx], selected, &mut action, idx, !trash_mode);
                                 ui.add_space(4.0);
                             }
                         });
@@ -175,7 +246,14 @@ pub fn show(
     action
 }
 
-fn row(ui: &mut Ui, session: &ChatSession, selected: &mut HashSet<String>) {
+fn row(
+    ui: &mut Ui,
+    session: &ChatSession,
+    selected: &mut HashSet<String>,
+    action: &mut ChatAction,
+    idx: usize,
+    allow_convert: bool,
+) {
     let key = chat::session_key(session);
     let mut checked = selected.contains(&key);
     egui::Frame::NONE
@@ -213,6 +291,16 @@ fn row(ui: &mut Ui, session: &ChatSession, selected: &mut HashSet<String>) {
                 });
             });
             ui.horizontal_wrapped(|ui| {
+                if allow_convert && session.provider != crate::chat::ChatProvider::Antigravity {
+                    ui.menu_button("Convert…", |ui| {
+                        for target in chat::convertible_targets(session.provider) {
+                            if ui.button(target.label()).clicked() {
+                                ui.close_menu();
+                                action.convert.push((idx, target));
+                            }
+                        }
+                    });
+                }
                 bit(ui, "updated", &session.updated_at);
                 bit(ui, "turns", &session.turn_count.to_string());
                 bit(ui, "size", &size_label(session.size_bytes));

@@ -4,27 +4,32 @@ Native desktop GUI for managing AI coding-agent configuration across providers. 
 
 ## Features
 
-- **Item Toggle** — per-item enable/disable with reversible rename or JSON mutation.
-- **Bulk Toggle** — Enable All / Disable All for filtered item categories.
+- **Item Toggle** — per-item enable/disable with collision-aware moves and provider-specific JSON/TOML mutation.
+- **Bulk Toggle** — Enable All / Disable All for filtered item categories with exact file/path rollback on failure.
 - **Scope Switching** — project-level vs global configuration, with workspace browser.
 - **Diff Workbench** — compare project and global configs with stable, secret-safe fingerprints. Detects duplicates, missing targets, and scope conflicts.
 - **Hook Cockpit** — static hook inventory showing event, matcher, handler, blocking risk, timeout, duplicates, and project/global overlaps.
-- **Chat Manager** — unified chat history browser across Claude Code, Codex CLI, Kiro, and OpenCode. Per-provider filtering when a provider is selected, or browse all providers together. Search, export (single JSON or multi-chat ZIP), soft-delete with Trash, and import archived sessions.
-- **Inline Editor** — edit instruction files, rules, and steering docs without leaving the app.
-- **JSON Backups** — automatic `.bak` creation before any config mutation.
+- **Chat Manager** — unified chat history browser across Claude Code, Codex CLI, Kiro, OpenCode, and ZCode. Per-provider filtering when a provider is selected, or browse all providers together. Search, export (single JSON or multi-chat ZIP), soft-delete with Trash — including database-backed OpenCode/ZCode chats, which are archived and then removed from the live SQLite store (this works while the CLI is running) and restored later with their original session identity — plus import of archived sessions, and converting any chat into another harness's native store or exported archive file (Antigravity excluded — its chats are encrypted).
+- **Inline Editor** — edit instruction files, rules, and steering docs without leaving the app. Saves are atomic, refuse to clobber external edits, and warn before discarding unsaved changes.
+- **Atomic Config Writes** — structured mutations use same-directory atomic replacement, stale-edit detection, and compatible `.bak` files. TOML mutations preserve comments and formatting; JSON mutations preserve key order.
 - **Cross-platform** — Windows, Linux, and macOS builds.
 
-**NOTE:** Antigravity CLI chats are encrypted, so chat management is not possible (atleast 'easily'). However the CLI itself helps to manage chats and MCPs well. 
+> Antigravity (`agy`) is the supported Google CLI. The discontinued Gemini CLI is not treated as a separate provider. Antigravity may still use the documented `GEMINI.md` filename.
 
 ## Supported Providers
 
-| Provider | Instruction File | Skills | Hooks | MCP | Other |
+| Provider | Instruction File | Skills | Hooks | MCP | Native Chats |
 |---|---|---|---|---|---|
-| Claude Code | `CLAUDE.md` | `.claude/skills/` | `settings.json` | `settings.json` | Rules |
-| Codex CLI | `AGENTS.md` | `.codex/skills/`, `.agents/skills/` | `config.toml`, `hooks.json` | `config.toml`, `.mcp.json` | — |
-| Antigravity CLI | `GEMINI.md`, `AGENTS.md` | `~/.gemini/skills/` | — | — | — |
-| Kiro | — | — | Agent JSON | `settings/mcp.json` | Steering, Specs, Agents |
-| OpenCode | `AGENTS.md` | `.opencode/skills/` | Plugins | `opencode.json` | Agents, Chats (SQLite) |
+| Claude Code | `CLAUDE.md` | `.claude/skills/` | `.claude/settings*.json` | Project `.mcp.json`; approval lists in settings | Best-effort JSONL (internal format) |
+| Codex CLI | `AGENTS.md` | `.codex/skills/`, `.agents/skills/` | `config.toml`, `hooks.json` | `config.toml` `mcp_servers` | Best-effort JSONL (internal format) |
+| Antigravity CLI (`agy`) | `GEMINI.md`, `AGENTS.md` | `.agents/skills/`, global `skills/` | `.agents/hooks.json` | `.agents/mcp_config.json` | Not supported (encrypted/internal) |
+| Kiro | Steering documents | Steering, Specs, Agents | Agent JSON | `settings/mcp.json` | JSON + JSONL ACP sessions |
+| OpenCode | `AGENTS.md` | `.opencode/skills/` plus `.agents/`/`.claude/` compatibility | Plugins | `opencode.json` | SQLite with schema detection |
+| ZCode | `AGENTS.md` (workspace) / `~/.zcode/AGENTS.md` (user) | `.zcode/skills/`, `.agents/skills/` | `hooks.events` in `.zcode/config.json` / `~/.zcode/cli/config.json` (native per-entry `enabled` flag) | `mcp.servers` in the same configs (fallback `.agents/mcp.json`) | SQLite (`~/.zcode/cli/db/db.sqlite`) |
+
+> ZCode support follows z.ai's official configuration guide: user scope lives under `~/.zcode` (override with `ZCODE_HOME`), workspace scope under `<repo>/.zcode`. Hook entries are toggled through ZCode's own documented per-entry `enabled: false` flag; MCP servers are disabled by stashing them out of `mcp.servers`, since that is the key ZCode reads. Chat browsing reads the OpenCode-compatible session/message/part database ZCode ships at `~/.zcode/cli/db/db.sqlite` (override with `ZCODE_DB`).
+
+> **Chat conversion** moves sessions between harnesses in two ways. *Direct:* pick a chat and use **Convert…** to write it straight into another installed harness's native store. *File-based migration:* export from harness A to an archive file, run **Convert archive…** on that file (single JSON or multi-chat ZIP), then use **Import** on the converted file and choose the project folder — the chat lands as a first-class session of harness B. This works even after harness A is uninstalled, since conversion operates purely on the exported file. Conversions always re-synthesize target-native events from AgentSwitch's normalized archive; source-harness event lines are never copied across formats, because each harness only parses its own schema. Converted chats are made discoverable by each harness's own mechanism — e.g. Codex sessions get a full native `session_meta` rollout **and a row in Codex's state database** (`state_N.sqlite` `threads`), since `/resume` lists from SQLite rather than scanning disk. Antigravity is never a conversion source or target because its chats are encrypted inside the CLI.
 
 ## Install
 
@@ -81,9 +86,12 @@ Launch AgentSwitch from the workspace you want to inspect, or use **Browse** to 
 src/
   main.rs          eframe entry point
   app.rs           state machine and UI orchestration
+  batch.rs         exact multi-item recovery and rollback
+  config_store.rs  atomic writes, backups, and verified moves
+  provider.rs      current provider paths, CLI names, and instructions
   types.rs         shared item, provider, and scope types
   scanner.rs       provider filesystem discovery
-  toggler.rs       rename and JSON/TOML mutation logic
+  toggler.rs       rename and provider-specific structured mutations
   diagnostics.rs   project/global diff workbench engine
   hook_diag.rs     static hook cockpit engine
   chat.rs          chat history scanner, archive, export/import, trash, OpenCode SQLite

@@ -89,8 +89,11 @@ pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResu
                 };
                 ui.painter().circle_filled(circ_center, 6.0, circ_color);
                 if enabled {
-                    ui.painter()
-                        .circle_stroke(circ_center, 6.0, Stroke::new(1.0, theme::GREEN));
+                    ui.painter().circle_stroke(
+                        circ_center,
+                        6.0,
+                        Stroke::new(1.0_f32, theme::GREEN),
+                    );
                 }
                 // name
                 let name_color = if enabled {
@@ -105,13 +108,14 @@ pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResu
                     theme::body_font(),
                     name_color,
                 );
-                // path (right side)
+                // path (right side); keep a clear gutter so the "edit" link
+                // below never overlaps it and steals the click
                 let path_str = item.path.to_string_lossy();
-                let short = if path_str.len() > 35 {
+                let short = if path_str.len() > 28 {
                     let start = path_str
                         .char_indices()
                         .rev()
-                        .nth(31)
+                        .nth(24)
                         .map(|(i, _)| i)
                         .unwrap_or(0);
                     format!("...{}", &path_str[start..])
@@ -119,7 +123,7 @@ pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResu
                     path_str.to_string()
                 };
                 ui.painter().text(
-                    egui::pos2(r.right() - 8.0, r.center().y - 6.0),
+                    egui::pos2(r.right() - 52.0, r.center().y - 6.0),
                     egui::Align2::RIGHT_TOP,
                     short,
                     theme::small_font(),

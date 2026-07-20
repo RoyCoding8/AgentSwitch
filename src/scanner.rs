@@ -1,73 +1,37 @@
+use crate::process::{self, CliProbe};
+use crate::provider;
 use crate::types::*;
 use std::path::{Path, PathBuf};
 
 pub fn scan_provider(id: ProviderId, root: &Path, scope: Scope) -> Vec<ConfigItem> {
-    match id {
+    deduplicate_items(match id {
         ProviderId::Claude => scan_claude(root, scope),
         ProviderId::Codex => scan_codex(root, scope),
         ProviderId::Antigravity => scan_antigravity(root, scope),
         ProviderId::Kiro => scan_kiro(root, scope),
         ProviderId::OpenCode => scan_opencode(root, scope),
-    }
+        ProviderId::Zcode => scan_zcode(root, scope),
+    })
 }
 
 pub fn provider_exists(id: ProviderId, root: &Path, scope: Scope) -> bool {
-    match (id, scope) {
-        (ProviderId::Claude, _) => provider_dir(id, root, scope).is_dir() || has_cmd("claude"),
-        (ProviderId::Codex, Scope::Project) => {
-            root.join(".codex").is_dir()
-                || root.join(".agents").is_dir()
-                || root.join(".mcp.json").is_file()
-                || has_cmd("codex")
-        }
-        (ProviderId::Codex, Scope::Global) => {
-            provider_dir(id, root, scope).is_dir() || has_cmd("codex")
-        }
-        (ProviderId::Antigravity, _) => {
-            provider_dir(id, root, scope).is_dir()
-                || root.join(".agents").is_dir()
-                || has_cmd("agy")
-        }
-        (ProviderId::Kiro, _) => {
-            provider_dir(id, root, scope).is_dir() || has_cmd("kiro") || has_cmd("kiro-cli")
-        }
-        (ProviderId::OpenCode, _) => provider_dir(id, root, scope).is_dir() || has_cmd("opencode"),
-    }
+    let configured = provider::provider_dir(id, root, scope).is_ok_and(|path| path.is_dir());
+    let shared_project_path = scope == Scope::Project
+        && matches!(
+            id,
+            ProviderId::Codex | ProviderId::Antigravity | ProviderId::Zcode
+        )
+        && root.join(".agents").is_dir();
+    configured
+        || shared_project_path
+        || provider::cli_names(id)
+            .iter()
+            .any(|name| process::shared().probe(name).installed)
 }
 
-pub fn provider_dir(id: ProviderId, root: &Path, scope: Scope) -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    match (id, scope) {
-        (ProviderId::Claude, Scope::Project) => root.join(".claude"),
-        (ProviderId::Claude, Scope::Global) => home.join(".claude"),
-        (ProviderId::Codex, Scope::Project) => root.join(".codex"),
-        (ProviderId::Codex, Scope::Global) => home.join(".codex"),
-        (ProviderId::Antigravity, Scope::Project) => root.join(".agents"),
-        (ProviderId::Antigravity, Scope::Global) => std::env::var("ANTIGRAVITY_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home.join(".gemini").join("antigravity-cli")),
-        (ProviderId::Kiro, Scope::Project) => root.join(".kiro"),
-        (ProviderId::Kiro, Scope::Global) => home.join(".kiro"),
-        (ProviderId::OpenCode, Scope::Project) => root.join(".opencode"),
-        (ProviderId::OpenCode, Scope::Global) => home.join(".config").join("opencode"),
-    }
+pub fn provider_dir(id: ProviderId, root: &Path, scope: Scope) -> anyhow::Result<PathBuf> {
+    provider::provider_dir(id, root, scope)
 }
-
-fn has_cmd(name: &str) -> bool {
-    let mut cmd = std::process::Command::new(if cfg!(windows) { "where" } else { "which" });
-    cmd.arg(name);
-    hide_cmd_window(&mut cmd);
-    cmd.output().map(|o| o.status.success()).unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn hide_cmd_window(cmd: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(0x08000000);
-}
-
-#[cfg(not(windows))]
-fn hide_cmd_window(_: &mut std::process::Command) {}
 
 fn collect_md(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
     let mut out = vec![];
@@ -119,10 +83,37 @@ fn collect_subdirs_both(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec
     let mut out = collect_subdirs(dir, kind, provider);
     let mut dis_dir = dir.to_path_buf();
     if let Some(name) = dir.file_name() {
-        dis_dir.set_file_name(format!("{}.disabled", name.to_string_lossy()));
+        let mut disabled_name = name.to_os_string();
+        disabled_name.push(".disabled");
+        dis_dir.set_file_name(disabled_name);
         out.extend(collect_subdirs(&dis_dir, kind, provider));
     }
     out
+}
+
+fn deduplicate_items(items: Vec<ConfigItem>) -> Vec<ConfigItem> {
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter(|item| {
+            seen.insert((
+                item.kind,
+                item.state,
+                item.path.clone(),
+                item.name.clone(),
+                // Hooks sharing one settings file and display name are distinct
+                // entries; without this they collapse and become untogglable.
+                item.hook_loc.as_ref().map(|l| {
+                    (
+                        l.section.clone(),
+                        l.event.clone(),
+                        l.order,
+                        l.fingerprint.clone(),
+                    )
+                }),
+            ))
+        })
+        .collect()
 }
 
 fn check_file(path: PathBuf, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
@@ -145,6 +136,28 @@ fn check_file(path: PathBuf, kind: ItemKind, provider: ProviderId) -> Vec<Config
         out.push(ConfigItem::new(name, kind, dis, provider));
     }
     out
+}
+
+fn read_string_lists(
+    path: &Path,
+    enabled_key: &str,
+    disabled_key: &str,
+) -> (Vec<String>, Vec<String>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (vec![], vec![]);
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (vec![], vec![]);
+    };
+    let read = |key: &str| {
+        doc.get(key)
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(String::from))
+            .collect()
+    };
+    (read(enabled_key), read(disabled_key))
 }
 
 fn scan_json_keys(path: &Path, key: &str, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
@@ -173,6 +186,32 @@ fn scan_json_keys(path: &Path, key: &str, kind: ItemKind, provider: ProviderId) 
                     ItemState::Enabled
                 };
                 item.editable = false;
+                item.toggle_spec = Some(match (provider, key) {
+                    (ProviderId::OpenCode, "mcp" | "agent") => ToggleSpec::JsonFlag {
+                        section: key.to_string(),
+                        name: name.clone(),
+                        flag: "enabled".into(),
+                        enabled_value: true,
+                        disabled_value: false,
+                    },
+                    (ProviderId::Antigravity | ProviderId::Kiro, "mcpServers") => {
+                        ToggleSpec::JsonFlag {
+                            section: key.to_string(),
+                            name: name.clone(),
+                            flag: "disabled".into(),
+                            enabled_value: false,
+                            disabled_value: true,
+                        }
+                    }
+                    (ProviderId::Claude, "mcpServers") => ToggleSpec::JsonStash {
+                        section: key.to_string(),
+                        name: name.clone(),
+                    },
+                    _ => ToggleSpec::JsonStash {
+                        section: key.to_string(),
+                        name: name.clone(),
+                    },
+                });
                 item.detail = Some(json_detail(value));
                 out.push(item);
             }
@@ -205,6 +244,10 @@ fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
         }
         _ => value.clone(),
     }
+}
+
+fn json_fingerprint(value: &serde_json::Value) -> String {
+    serde_json::to_string(&canonical_json(value)).unwrap_or_else(|_| value.to_string())
 }
 
 fn toml_to_json(value: &toml::Value) -> serde_json::Value {
@@ -244,6 +287,13 @@ fn scan_toml_mcp(path: &Path, provider: ProviderId) -> Vec<ConfigItem> {
     for (name, value) in servers {
         let mut item = ConfigItem::new(name.clone(), ItemKind::Mcp, path.to_owned(), provider);
         item.editable = false;
+        item.toggle_spec = Some(ToggleSpec::TomlFlag {
+            section: "mcp_servers".into(),
+            name: name.clone(),
+            flag: "enabled".into(),
+            enabled_value: true,
+            disabled_value: false,
+        });
         item.detail = Some(toml_detail(value));
         if value.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
             item.state = ItemState::Disabled;
@@ -275,7 +325,7 @@ fn scan_toml_hooks(path: &Path, provider: ProviderId) -> Vec<ConfigItem> {
             Some(a) => a,
             _ => continue,
         };
-        for (i, entry) in arr.iter().enumerate() {
+        for (order, entry) in arr.iter().enumerate() {
             let matcher = entry.get("matcher").and_then(|v| v.as_str()).unwrap_or("*");
             let hook_name = entry
                 .get("hooks")
@@ -288,9 +338,11 @@ fn scan_toml_hooks(path: &Path, provider: ProviderId) -> Vec<ConfigItem> {
                 .clone()
                 .unwrap_or_else(|| format!("{}: {}", event, matcher));
             let loc = HookLoc {
+                section: "hooks".into(),
                 event: event.clone(),
-                index: i,
+                order,
                 hook_name: hook_name.unwrap_or_else(|| matcher.to_string()),
+                fingerprint: json_fingerprint(&toml_to_json(entry)),
             };
             let mut item = ConfigItem::new(display, ItemKind::Hook, path.to_owned(), provider);
             item.hook_loc = Some(loc);
@@ -306,6 +358,7 @@ fn collect_hook_items(
     entries_iter: impl Iterator<Item = (String, serde_json::Value)>,
     path: &Path,
     provider: ProviderId,
+    section_path: &str,
     disabled_names: &[String],
     event_prefix: &str,
     force_disabled: bool,
@@ -316,7 +369,7 @@ fn collect_hook_items(
             Some(a) => a,
             _ => continue,
         };
-        for (i, entry) in arr.iter().enumerate() {
+        for (order, entry) in arr.iter().enumerate() {
             let matcher = entry.get("matcher").and_then(|v| v.as_str()).unwrap_or("*");
             let hook_name = entry
                 .get("hooks")
@@ -328,14 +381,26 @@ fn collect_hook_items(
             let display = hook_name
                 .clone()
                 .unwrap_or_else(|| format!("{}: {}", event, matcher));
+            // ZCode documents a native per-entry `enabled: false` flag that the
+            // runtime genuinely skips; honor it when reading state back.
+            let entry_flag_disabled = provider == ProviderId::Zcode
+                && entry.get("enabled").and_then(|v| v.as_bool()) == Some(false);
             let is_disabled = force_disabled
+                || entry_flag_disabled
                 || hook_name
                     .as_ref()
                     .is_some_and(|n| disabled_names.contains(n));
             let loc = HookLoc {
+                section: section_path.to_string(),
                 event: format!("{}{}", event_prefix, event),
-                index: i,
+                order,
                 hook_name: hook_name.unwrap_or_else(|| matcher.to_string()),
+                fingerprint: if provider == ProviderId::Zcode {
+                    // Identity must survive the enabled-flag flip.
+                    crate::toggler::zcode_entry_fingerprint(entry)
+                } else {
+                    json_fingerprint(entry)
+                },
             };
             let mut item = ConfigItem::new(display, ItemKind::Hook, path.to_owned(), provider);
             item.hook_loc = Some(loc);
@@ -353,6 +418,7 @@ fn collect_hook_items(
 fn scan_hook_entries(
     path: &Path,
     provider: ProviderId,
+    section_path: &str,
     disabled_names: &[String],
     force_disabled: bool,
 ) -> Vec<ConfigItem> {
@@ -365,7 +431,7 @@ fn scan_hook_entries(
         Ok(d) => d,
         _ => return out,
     };
-    if let Some(hooks_obj) = doc.get("hooks").and_then(|v| v.as_object()) {
+    if let Some(hooks_obj) = json_at(&doc, section_path).and_then(|v| v.as_object()) {
         let filtered = hooks_obj
             .iter()
             .filter(|(event, _)| event.as_str() != "disabled" && !event.starts_with("_agentswitch"))
@@ -374,6 +440,7 @@ fn scan_hook_entries(
             filtered,
             path,
             provider,
+            section_path,
             disabled_names,
             "",
             force_disabled,
@@ -385,6 +452,7 @@ fn scan_hook_entries(
             mapped,
             path,
             provider,
+            section_path,
             &[],
             "_stashed_",
             true,
@@ -393,8 +461,38 @@ fn scan_hook_entries(
     out
 }
 
+/// Walk a slash-separated object path ("hooks/events") from a JSON root.
+fn json_at<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = doc;
+    for segment in path.split('/').filter(|s| !s.is_empty()) {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+/// Read the `hooks.disabled` name list that the Antigravity toggler writes.
+fn read_antigravity_disabled_names(path: &Path) -> Vec<String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        _ => return vec![],
+    };
+    let doc: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(d) => d,
+        _ => return vec![],
+    };
+    doc.get("hooks")
+        .and_then(|hooks| hooks.get("disabled"))
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(String::from))
+        .collect()
+}
+
 fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
-    let d = provider_dir(ProviderId::Claude, root, scope);
+    let Ok(d) = provider_dir(ProviderId::Claude, root, scope) else {
+        return vec![];
+    };
     let mut items = vec![];
     match scope {
         Scope::Project => items.extend(check_file(
@@ -419,18 +517,52 @@ fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         ProviderId::Claude,
     ));
     let settings = d.join("settings.json");
-    items.extend(scan_hook_entries(&settings, ProviderId::Claude, &[], false));
-    items.extend(scan_json_keys(
+    items.extend(scan_hook_entries(
         &settings,
-        "mcpServers",
-        ItemKind::Mcp,
         ProviderId::Claude,
+        "hooks",
+        &[],
+        false,
     ));
+    let mcp_path = match scope {
+        Scope::Project => root.join(".mcp.json"),
+        Scope::Global => provider::home_dir()
+            .map(|home| home.join(".claude.json"))
+            .unwrap_or_default(),
+    };
+    let mut mcp_items = scan_json_keys(&mcp_path, "mcpServers", ItemKind::Mcp, ProviderId::Claude);
+    if scope == Scope::Project {
+        let approval_path = d.join("settings.local.json");
+        let approval_path = if approval_path.exists() {
+            approval_path
+        } else {
+            d.join("settings.json")
+        };
+        let approval = read_string_lists(
+            &approval_path,
+            "enabledMcpjsonServers",
+            "disabledMcpjsonServers",
+        );
+        for item in &mut mcp_items {
+            if approval.1.contains(&item.name) {
+                item.state = ItemState::Disabled;
+            }
+            item.toggle_spec = Some(ToggleSpec::StringLists {
+                path: approval_path.clone(),
+                enabled_key: "enabledMcpjsonServers".into(),
+                disabled_key: "disabledMcpjsonServers".into(),
+                name: item.name.clone(),
+            });
+        }
+    }
+    items.extend(mcp_items);
     items
 }
 
 fn scan_codex(root: &Path, scope: Scope) -> Vec<ConfigItem> {
-    let d = provider_dir(ProviderId::Codex, root, scope);
+    let Ok(d) = provider_dir(ProviderId::Codex, root, scope) else {
+        return vec![];
+    };
     let mut items = vec![];
     if scope == Scope::Project {
         items.extend(check_file(
@@ -441,6 +573,12 @@ fn scan_codex(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         items.extend(collect_subdirs_both(
             &root.join(".agents").join("skills"),
             ItemKind::Skill,
+            ProviderId::Codex,
+        ));
+    } else {
+        items.extend(check_file(
+            d.join("AGENTS.md"),
+            ItemKind::InstructionFile,
             ProviderId::Codex,
         ));
     }
@@ -462,7 +600,13 @@ fn scan_codex(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     }
     let hooks = d.join("hooks.json");
     if hooks.exists() {
-        items.extend(scan_hook_entries(&hooks, ProviderId::Codex, &[], false));
+        items.extend(scan_hook_entries(
+            &hooks,
+            ProviderId::Codex,
+            "hooks",
+            &[],
+            false,
+        ));
     }
     let hooks_dis = PathBuf::from(format!("{}.disabled", hooks.display()));
     if hooks_dis.exists() {
@@ -478,7 +622,9 @@ fn scan_codex(root: &Path, scope: Scope) -> Vec<ConfigItem> {
 
 fn scan_antigravity(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     let mut items = vec![];
-    let d = provider_dir(ProviderId::Antigravity, root, scope);
+    let Ok(d) = provider_dir(ProviderId::Antigravity, root, scope) else {
+        return vec![];
+    };
     if scope == Scope::Project {
         items.extend(check_file(
             root.join("GEMINI.md"),
@@ -496,36 +642,46 @@ fn scan_antigravity(root: &Path, scope: Scope) -> Vec<ConfigItem> {
             ProviderId::Antigravity,
         ));
     } else {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let gemini_dir = home.join(".gemini");
         items.extend(check_file(
-            gemini_dir.join("GEMINI.md"),
+            d.join("GEMINI.md"),
             ItemKind::InstructionFile,
             ProviderId::Antigravity,
         ));
         items.extend(check_file(
-            gemini_dir.join("AGENTS.md"),
+            d.join("AGENTS.md"),
             ItemKind::InstructionFile,
             ProviderId::Antigravity,
         ));
         items.extend(collect_subdirs_both(
-            &gemini_dir.join("skills"),
+            &d.join("skills"),
             ItemKind::Skill,
             ProviderId::Antigravity,
         ));
     }
-    // MCP servers from mcp_config.json (Antigravity CLI uses a separate file)
     items.extend(scan_json_keys(
         &d.join("mcp_config.json"),
         "mcpServers",
         ItemKind::Mcp,
         ProviderId::Antigravity,
     ));
+    // The Antigravity toggler records disabled hooks by name in hooks.disabled;
+    // feed those names back in so state survives a rescan.
+    let hooks_path = d.join("hooks.json");
+    let disabled_names = read_antigravity_disabled_names(&hooks_path);
+    items.extend(scan_hook_entries(
+        &hooks_path,
+        ProviderId::Antigravity,
+        "hooks",
+        &disabled_names,
+        false,
+    ));
     items
 }
 
 fn scan_kiro(root: &Path, scope: Scope) -> Vec<ConfigItem> {
-    let d = provider_dir(ProviderId::Kiro, root, scope);
+    let Ok(d) = provider_dir(ProviderId::Kiro, root, scope) else {
+        return vec![];
+    };
     let mut items = vec![];
     items.extend(collect_md_both(
         &d.join("steering"),
@@ -551,7 +707,13 @@ fn scan_kiro(root: &Path, scope: Scope) -> Vec<ConfigItem> {
                 for e in rd.flatten() {
                     let p = e.path();
                     if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                        items.extend(scan_hook_entries(&p, ProviderId::Kiro, &[], force_disabled));
+                        items.extend(scan_hook_entries(
+                            &p,
+                            ProviderId::Kiro,
+                            "hooks",
+                            &[],
+                            force_disabled,
+                        ));
                     }
                 }
             }
@@ -567,11 +729,19 @@ fn scan_kiro(root: &Path, scope: Scope) -> Vec<ConfigItem> {
 }
 
 fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
-    let d = provider_dir(ProviderId::OpenCode, root, scope);
+    let Ok(d) = provider_dir(ProviderId::OpenCode, root, scope) else {
+        return vec![];
+    };
     let mut items = vec![];
     if scope == Scope::Project {
         items.extend(check_file(
             root.join("AGENTS.md"),
+            ItemKind::InstructionFile,
+            ProviderId::OpenCode,
+        ));
+    } else {
+        items.extend(check_file(
+            d.join("AGENTS.md"),
             ItemKind::InstructionFile,
             ProviderId::OpenCode,
         ));
@@ -581,6 +751,18 @@ fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         ItemKind::Skill,
         ProviderId::OpenCode,
     ));
+    if scope == Scope::Project {
+        items.extend(collect_subdirs_both(
+            &root.join(".agents").join("skills"),
+            ItemKind::Skill,
+            ProviderId::OpenCode,
+        ));
+        items.extend(collect_subdirs_both(
+            &root.join(".claude").join("skills"),
+            ItemKind::Skill,
+            ProviderId::OpenCode,
+        ));
+    }
     if scope == Scope::Project {
         items.extend(collect_md_both(
             &d.join("agent"),
@@ -638,9 +820,11 @@ fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
                         ProviderId::OpenCode,
                     );
                     item.hook_loc = Some(HookLoc {
+                        section: String::new(),
                         event: "plugin".into(),
-                        index: i,
+                        order: i,
                         hook_name: String::new(),
+                        fingerprint: format!("plugin:{i}"),
                     });
                     item.editable = false;
                     item.detail = Some(json_detail(p));
@@ -650,4 +834,323 @@ fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         }
     }
     items
+}
+
+/// ZCode (z.ai) layout, per its official configuration guide:
+/// - workspace config `<repo>/.zcode/config.json` (fallback `zcode.json`),
+///   user config `~/.zcode/cli/config.json` — both hold `hooks` and `mcp.servers`
+/// - MCP compatibility fallback `.agents/mcp.json` with a top-level `mcpServers`,
+///   only honored when the primary config declares no servers (ZCode's own rule)
+/// - skills in `.zcode/skills/` then `.agents/skills/`, instructions in `AGENTS.md`
+fn scan_zcode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
+    let Ok(d) = provider_dir(ProviderId::Zcode, root, scope) else {
+        return vec![];
+    };
+    let mut items = vec![];
+    items.extend(check_file(
+        if scope == Scope::Project {
+            root.join("AGENTS.md")
+        } else {
+            d.join("AGENTS.md")
+        },
+        ItemKind::InstructionFile,
+        ProviderId::Zcode,
+    ));
+    items.extend(collect_subdirs_both(
+        &d.join("skills"),
+        ItemKind::Skill,
+        ProviderId::Zcode,
+    ));
+    let shared_skills = match scope {
+        Scope::Project => root.join(".agents").join("skills"),
+        Scope::Global => provider::home_dir()
+            .map(|home| home.join(".agents").join("skills"))
+            .unwrap_or_default(),
+    };
+    if !shared_skills.as_os_str().is_empty() {
+        items.extend(collect_subdirs_both(
+            &shared_skills,
+            ItemKind::Skill,
+            ProviderId::Zcode,
+        ));
+    }
+
+    let config_path = match scope {
+        Scope::Project => {
+            let nested = d.join("config.json");
+            let flat = root.join("zcode.json");
+            if !nested.exists() && flat.exists() {
+                flat
+            } else {
+                nested
+            }
+        }
+        Scope::Global => d.join("cli").join("config.json"),
+    };
+    let primary_servers = scan_json_keys_at(&config_path, "mcp/servers", ProviderId::Zcode);
+    let has_primary_servers = !primary_servers.is_empty();
+    items.extend(primary_servers);
+    if !has_primary_servers {
+        let fallback_mcp = match scope {
+            Scope::Project => root.join(".agents").join("mcp.json"),
+            Scope::Global => provider::home_dir()
+                .map(|home| home.join(".agents").join("mcp.json"))
+                .unwrap_or_default(),
+        };
+        if !fallback_mcp.as_os_str().is_empty() {
+            items.extend(scan_json_keys(
+                &fallback_mcp,
+                "mcpServers",
+                ItemKind::Mcp,
+                ProviderId::Zcode,
+            ));
+        }
+    }
+    if config_path.is_file() {
+        items.extend(scan_hook_entries(
+            &config_path,
+            ProviderId::Zcode,
+            "hooks/events",
+            &[],
+            false,
+        ));
+    }
+    items
+}
+
+/// Like [`scan_json_keys`] but for servers nested under a slash-separated path
+/// (e.g. ZCode's `mcp.servers`). Toggling stashes entries out of that path.
+fn scan_json_keys_at(path: &Path, section_path: &str, provider: ProviderId) -> Vec<ConfigItem> {
+    let mut out = vec![];
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        _ => return out,
+    };
+    let doc: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(d) => d,
+        _ => return out,
+    };
+    let Some(servers) = json_at(&doc, section_path).and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (name, value) in servers {
+        let mut item = ConfigItem::new(name.clone(), ItemKind::Mcp, path.to_owned(), provider);
+        item.editable = false;
+        item.toggle_spec = Some(ToggleSpec::JsonStash {
+            section: section_path.to_string(),
+            name: name.clone(),
+        });
+        item.detail = Some(json_detail(value));
+        out.push(item);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("agentswitch-scanner-{name}-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn claude_project_mcp_comes_from_dot_mcp_json() {
+        let root = temp_dir("claude-mcp");
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"docs":{"type":"http","url":"https://example.test"}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(
+            root.join(".claude").join("settings.json"),
+            r#"{"mcpServers":{"stale":{"command":"old"}}}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Claude, &root, Scope::Project);
+        let mcps: Vec<_> = items
+            .iter()
+            .filter(|item| item.kind == ItemKind::Mcp)
+            .collect();
+        assert_eq!(mcps.len(), 1);
+        assert_eq!(mcps[0].name, "docs");
+        assert_eq!(mcps[0].path, root.join(".mcp.json"));
+    }
+
+    #[test]
+    fn antigravity_scans_project_hooks() {
+        let root = temp_dir("antigravity-project");
+        let agents = root.join(".agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"command":"check"}]}]}}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Antigravity, &root, Scope::Project);
+        assert!(items.iter().any(|item| item.kind == ItemKind::Hook));
+    }
+
+    #[test]
+    fn antigravity_disabled_hooks_survive_a_rescan() {
+        let root = temp_dir("antigravity-state");
+        let agents = root.join(".agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("hooks.json"),
+            r#"{"hooks":{
+                "PreToolUse":[{"matcher":"Bash","hooks":[{"command":"check"}]}],
+                "disabled":["check"]
+            }}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Antigravity, &root, Scope::Project);
+        let hook = items
+            .iter()
+            .find(|item| item.kind == ItemKind::Hook && item.name == "check")
+            .expect("hook must be listed");
+        assert_eq!(
+            hook.state,
+            ItemState::Disabled,
+            "hooks.disabled is read back"
+        );
+    }
+
+    #[test]
+    fn hooks_on_different_events_with_the_same_name_stay_separate() {
+        let root = temp_dir("hook-dedup");
+        let claude = root.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{
+                "PreToolUse":[{"matcher":"*","hooks":[{"command":"notify"}]}],
+                "PostToolUse":[{"matcher":"*","hooks":[{"command":"notify"}]}]
+            }}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Claude, &root, Scope::Project);
+        let hooks: Vec<_> = items
+            .iter()
+            .filter(|item| item.kind == ItemKind::Hook)
+            .collect();
+        assert_eq!(hooks.len(), 2, "same command on two events is two hooks");
+    }
+
+    #[test]
+    fn zcode_scans_config_skills_and_mcp() {
+        let root = temp_dir("zcode-scan");
+        let zc = root.join(".zcode");
+        std::fs::create_dir_all(zc.join("skills").join("reviewer")).unwrap();
+        std::fs::write(
+            zc.join("config.json"),
+            r#"{"hooks":{"enabled":true,"events":{"PostToolUse":[
+                {"matcher":"Write","hooks":[{"type":"process","command":"lint"}]}
+            ]}},"mcp":{"servers":{"docs":{"type":"stdio","command":"docs-mcp"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("AGENTS.md"), "# project").unwrap();
+
+        let items = scan_provider(ProviderId::Zcode, &root, Scope::Project);
+        let skill = items
+            .iter()
+            .find(|i| i.kind == ItemKind::Skill && i.name == "reviewer")
+            .expect("workspace skill discovered");
+        assert_eq!(skill.state, ItemState::Enabled);
+        let mcp = items
+            .iter()
+            .find(|i| i.kind == ItemKind::Mcp && i.name == "docs")
+            .expect("mcp.servers discovered");
+        assert_eq!(
+            mcp.path,
+            zc.join("config.json"),
+            "server points at the workspace config"
+        );
+        let hook = items
+            .iter()
+            .find(|i| i.kind == ItemKind::Hook && i.name == "lint")
+            .expect("hook under hooks/events discovered");
+        let loc = hook.hook_loc.as_ref().unwrap();
+        assert_eq!(loc.section, "hooks/events");
+        assert_eq!(loc.event, "PostToolUse");
+        let agents_md = items
+            .iter()
+            .find(|i| i.kind == ItemKind::InstructionFile)
+            .expect("AGENTS.md discovered");
+        assert!(agents_md.editable);
+    }
+
+    #[test]
+    fn zcode_mcp_fallback_only_applies_without_primary_servers() {
+        let root = temp_dir("zcode-fallback");
+        let zc = root.join(".zcode");
+        std::fs::create_dir_all(&zc).unwrap();
+        std::fs::write(zc.join("config.json"), r#"{"hooks":{"enabled":false}}"#).unwrap();
+        let agents = root.join(".agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("mcp.json"),
+            r#"{"mcpServers":{"shared":{"command":"shared-mcp"}}}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Zcode, &root, Scope::Project);
+        assert!(
+            items
+                .iter()
+                .any(|i| i.kind == ItemKind::Mcp && i.name == "shared"),
+            "compat fallback is honored when the primary config has no servers"
+        );
+
+        // Once the primary config declares a server, the fallback is ignored
+        // (ZCode reads .zcode first and never merges both).
+        std::fs::write(
+            zc.join("config.json"),
+            r#"{"mcp":{"servers":{"native":{"command":"native-mcp"}}}}"#,
+        )
+        .unwrap();
+        let items = scan_provider(ProviderId::Zcode, &root, Scope::Project);
+        assert!(items
+            .iter()
+            .any(|i| i.kind == ItemKind::Mcp && i.name == "native"));
+        assert!(
+            !items
+                .iter()
+                .any(|i| i.kind == ItemKind::Mcp && i.name == "shared"),
+            "fallback hidden once primary servers exist"
+        );
+    }
+
+    #[test]
+    fn zcode_disabled_entry_flag_is_reported() {
+        let root = temp_dir("zcode-flag");
+        let zc = root.join(".zcode");
+        std::fs::create_dir_all(&zc).unwrap();
+        std::fs::write(
+            zc.join("config.json"),
+            r#"{"hooks":{"enabled":true,"events":{"Stop":[
+                {"matcher":"*","enabled":false,"hooks":[{"type":"command","command":"slow"}]}
+            ]}}}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Zcode, &root, Scope::Project);
+        let hook = items
+            .iter()
+            .find(|i| i.kind == ItemKind::Hook)
+            .expect("hook listed");
+        assert_eq!(hook.state, ItemState::Disabled, "enabled:false is honored");
+    }
 }
