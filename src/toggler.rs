@@ -51,8 +51,6 @@ pub fn toggle_item(item: &mut ConfigItem) -> Result<()> {
 fn toggle_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     match item.provider {
         ProviderId::Antigravity => return toggle_antigravity_hook(item, loc),
-        // ZCode documents a native per-entry `enabled` flag that its runtime
-        // genuinely skips — prefer it over moving entries around.
         ProviderId::Zcode => return toggle_zcode_hook(item, loc),
         _ => {}
     }
@@ -64,8 +62,6 @@ fn toggle_zcode_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
     let arr = array_at_mut(&mut doc, &loc.section, &loc.event)?;
     let enable = !item.state.is_enabled();
-    // Identity ignores the `enabled` flag itself, or a toggle would invalidate
-    // the fingerprint needed to find the entry again.
     let entry = arr
         .iter_mut()
         .find(|entry| zcode_entry_fingerprint(entry) == loc.fingerprint)
@@ -97,13 +93,17 @@ fn toggle_antigravity_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     let arr = disabled
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("disabled not array"))?;
+    let scoped_name = format!("{}:{}", loc.event, loc.hook_name);
     if item.state.is_enabled() {
-        if !arr.iter().any(|v| v.as_str() == Some(&loc.hook_name)) {
-            arr.push(serde_json::Value::String(loc.hook_name.clone()));
+        arr.retain(|v| v.as_str() != Some(loc.hook_name.as_str()));
+        if !arr.iter().any(|v| v.as_str() == Some(&scoped_name)) {
+            arr.push(serde_json::Value::String(scoped_name));
         }
         item.state = ItemState::Disabled;
     } else {
-        arr.retain(|v| v.as_str() != Some(&loc.hook_name));
+        arr.retain(|v| {
+            v.as_str() != Some(&scoped_name) && v.as_str() != Some(loc.hook_name.as_str())
+        });
         item.state = ItemState::Enabled;
     }
     snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
@@ -114,20 +114,56 @@ fn toggle_hook_stash(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     let snapshot = Snapshot::read(&item.path)?;
     let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
     if item.state.is_enabled() {
-        let entry = remove_hook(&mut doc, &loc.section, &loc.event, &loc.fingerprint)?;
+        let mut entry = remove_hook(&mut doc, &loc.section, &loc.event, &loc.fingerprint)?;
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("_agentswitch_order".into(), serde_json::json!(loc.order));
+        }
         ensure_array(&mut doc, "_agentswitch_disabled", &loc.event)?.push(entry);
         item.state = ItemState::Disabled;
     } else {
         let real_event = loc.event.strip_prefix("_stashed_").unwrap_or(&loc.event);
-        let entry = remove_hook(
+        let mut entry = remove_hook(
             &mut doc,
             "_agentswitch_disabled",
             real_event,
             &loc.fingerprint,
         )?;
-        // Put the hook back where it was instead of appending it last.
+        let original_order = entry
+            .get("_agentswitch_order")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(loc.order as u64) as usize;
+        let stashed_orders: Vec<usize> = doc
+            .get("_agentswitch_disabled")
+            .and_then(|stash| stash.get(real_event))
+            .and_then(serde_json::Value::as_array)
+            .map_or(vec![], |entries| {
+                entries
+                    .iter()
+                    .chain(std::iter::once(&entry))
+                    .filter_map(|e| e.get("_agentswitch_order"))
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|o| o as usize)
+                    .collect()
+            });
+        if let Some(obj) = entry.as_object_mut() {
+            obj.remove("_agentswitch_order");
+        }
         let arr = array_at_mut(&mut doc, &loc.section, real_event)?;
-        let index = loc.order.min(arr.len());
+        let mut index = arr.len();
+        for (current, _) in arr.iter().enumerate() {
+            let mut original = current;
+            loop {
+                let shifted = current + stashed_orders.iter().filter(|&&o| o <= original).count();
+                if shifted == original {
+                    break;
+                }
+                original = shifted;
+            }
+            if original > original_order {
+                index = current;
+                break;
+            }
+        }
         arr.insert(index, entry);
         let stash_is_empty = doc
             .get("_agentswitch_disabled")
@@ -153,11 +189,18 @@ fn remove_hook(
     event: &str,
     fingerprint: &str,
 ) -> Result<serde_json::Value> {
+    let identity = |entry: &serde_json::Value| {
+        let mut stripped = entry.clone();
+        if let Some(obj) = stripped.as_object_mut() {
+            obj.remove("_agentswitch_order");
+        }
+        hook_fingerprint(&stripped)
+    };
     let arr = array_at_mut(doc, section, event)?;
     let matches: Vec<_> = arr
         .iter()
         .enumerate()
-        .filter_map(|(index, entry)| (hook_fingerprint(entry) == fingerprint).then_some(index))
+        .filter_map(|(index, entry)| (identity(entry) == fingerprint).then_some(index))
         .collect();
     match matches.as_slice() {
         [index] => Ok(arr.remove(*index)),
@@ -166,8 +209,6 @@ fn remove_hook(
     }
 }
 
-/// Content identity of a ZCode hook entry with the runtime `enabled` flag
-/// stripped out.
 pub(crate) fn zcode_entry_fingerprint(entry: &serde_json::Value) -> String {
     let mut stripped = entry.clone();
     if let Some(object) = stripped.as_object_mut() {
@@ -176,8 +217,6 @@ pub(crate) fn zcode_entry_fingerprint(entry: &serde_json::Value) -> String {
     hook_fingerprint(&stripped)
 }
 
-/// Resolve `section/event` to the event array, creating missing parents.
-/// `section` is a slash-separated object path ("hooks", "hooks/events").
 fn array_at_mut<'a>(
     doc: &'a mut serde_json::Value,
     section: &str,
@@ -242,6 +281,21 @@ fn hook_fingerprint(value: &serde_json::Value) -> String {
     serde_json::to_string(&canonical(value)).unwrap_or_else(|_| value.to_string())
 }
 
+fn commit_json(
+    item: &mut ConfigItem,
+    snapshot: &Snapshot,
+    doc: &serde_json::Value,
+    enable: bool,
+) -> Result<()> {
+    snapshot.commit(serde_json::to_string_pretty(doc)?.as_bytes())?;
+    item.state = if enable {
+        ItemState::Enabled
+    } else {
+        ItemState::Disabled
+    };
+    Ok(())
+}
+
 fn toggle_structured_item(item: &mut ConfigItem, spec: &ToggleSpec) -> Result<()> {
     match spec {
         ToggleSpec::JsonFlag {
@@ -293,13 +347,7 @@ fn toggle_json_flag(
             disabled_value
         }),
     );
-    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
-    item.state = if enable {
-        ItemState::Enabled
-    } else {
-        ItemState::Disabled
-    };
-    Ok(())
+    commit_json(item, &snapshot, &doc, enable)
 }
 
 fn toggle_toml_flag(
@@ -311,24 +359,32 @@ fn toggle_toml_flag(
     disabled_value: bool,
 ) -> Result<()> {
     let snapshot = Snapshot::read(&item.path)?;
-    // toml_edit preserves comments, formatting, and key order that a
-    // round-trip through toml::Value would destroy.
     let mut doc: toml_edit::DocumentMut = snapshot
         .text()?
         .parse()
         .map_err(|error| anyhow::anyhow!("invalid TOML in {}: {error}", item.path.display()))?;
-    // [mcp_servers.docs] nests under the parent table, but a bare
-    // [mcp_servers.docs] written as a dotted top-level key also occurs.
+    fn inline_to_regular(item: &mut toml_edit::Item) -> Option<&mut toml_edit::Table> {
+        if item.is_inline_table() {
+            let inline = item.as_inline_table_mut()?;
+            let mut table = toml_edit::Table::new();
+            table.set_implicit(true);
+            for (key, value) in inline.iter() {
+                table.insert(key, toml_edit::Item::Value(value.clone()));
+            }
+            *item = toml_edit::Item::Table(table);
+        }
+        item.as_table_mut()
+    }
     let nested = doc
         .get_mut(section)
         .and_then(|value| value.as_table_mut())
         .and_then(|table| table.get_mut(name))
-        .and_then(|value| value.as_table_mut());
+        .and_then(inline_to_regular);
     let table = match nested {
         Some(table) => table,
         None => doc
             .get_mut(&format!("{section}.{name}"))
-            .and_then(|value| value.as_table_mut())
+            .and_then(inline_to_regular)
             .ok_or_else(|| anyhow::anyhow!("{section}.{name} is not a table"))?,
     };
     let enable = !item.state.is_enabled();
@@ -363,21 +419,13 @@ fn toggle_string_lists(
     remove_string(&mut doc, disabled_key, name)?;
     let target_key = if enable { enabled_key } else { disabled_key };
     ensure_string_array(&mut doc, target_key)?.push(name.into());
-    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
-    item.state = if enable {
-        ItemState::Enabled
-    } else {
-        ItemState::Disabled
-    };
-    Ok(())
+    commit_json(item, &snapshot, &doc, enable)
 }
 
 fn toggle_json_stash(item: &mut ConfigItem, section: &str, name: &str) -> Result<()> {
     let snapshot = Snapshot::read(&item.path)?;
     let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
     let enable = !item.state.is_enabled();
-    // Stash keys stay at the document root; slashes in a nested section path
-    // become underscores so the key stays a single identifier.
     let disabled_section = format!("_disabled_{}", section.replace('/', "_"));
     let (source_obj, target_key) = if enable {
         (disabled_section.as_str(), section)
@@ -391,8 +439,6 @@ fn toggle_json_stash(item: &mut ConfigItem, section: &str, name: &str) -> Result
         .ok_or_else(|| anyhow::anyhow!("{source_obj}.{name} not found"))?;
     let target_segments: Vec<&str> = target_key.split('/').filter(|s| !s.is_empty()).collect();
     ensure_object_path(&mut doc, &target_segments)?.insert(name.into(), value);
-    // Drop the stash container once it is empty so the file carries no
-    // AgentSwitch residue after everything is re-enabled.
     if enable {
         if let Some(obj) = doc.as_object_mut() {
             let empty = obj
@@ -404,13 +450,7 @@ fn toggle_json_stash(item: &mut ConfigItem, section: &str, name: &str) -> Result
             }
         }
     }
-    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
-    item.state = if enable {
-        ItemState::Enabled
-    } else {
-        ItemState::Disabled
-    };
-    Ok(())
+    commit_json(item, &snapshot, &doc, enable)
 }
 
 fn ensure_string_array<'a>(
@@ -487,7 +527,17 @@ mod tests {
         let stashed = doc["_agentswitch_disabled"]["PreToolUse"]
             .as_array()
             .unwrap();
-        assert_eq!(stashed, &[first, second]);
+        let stripped: Vec<_> = stashed
+            .iter()
+            .map(|entry| {
+                let mut entry = entry.clone();
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.remove("_agentswitch_order");
+                }
+                entry
+            })
+            .collect();
+        assert_eq!(stripped, &[first, second]);
     }
 
     #[test]
@@ -698,6 +748,90 @@ mod tests {
             restored[1]["matcher"], "B",
             "middle hook goes back to index 1"
         );
+    }
+
+    #[test]
+    fn reenabling_after_a_earlier_disable_keeps_relative_order() {
+        let a = serde_json::json!({"matcher":"A","hooks":[{"type":"command","command":"a"}]});
+        let b = serde_json::json!({"matcher":"B","hooks":[{"type":"command","command":"b"}]});
+        let c = serde_json::json!({"matcher":"C","hooks":[{"type":"command","command":"c"}]});
+        let d = serde_json::json!({"matcher":"D","hooks":[{"type":"command","command":"d"}]});
+        let path = temp_file(
+            "order-shift",
+            &serde_json::json!({"hooks":{"PostToolUse":[a.clone(), b.clone(), c.clone(), d.clone()]}})
+                .to_string(),
+        );
+        let make = |entry: &serde_json::Value, order: usize| {
+            let mut item =
+                ConfigItem::new("hook", ItemKind::Hook, path.clone(), ProviderId::Claude);
+            item.hook_loc = Some(HookLoc {
+                section: "hooks".into(),
+                event: "PostToolUse".into(),
+                order,
+                hook_name: "hook".into(),
+                fingerprint: hook_fingerprint(entry),
+            });
+            item
+        };
+        let mut first = make(&a, 0);
+        toggle_item(&mut first).unwrap();
+        let mut third = make(&c, 2);
+        toggle_item(&mut third).unwrap();
+
+        toggle_item(&mut third).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let restored = doc["hooks"]["PostToolUse"].as_array().unwrap();
+        let matchers: Vec<_> = restored
+            .iter()
+            .map(|entry| entry["matcher"].as_str().unwrap())
+            .collect();
+        assert_eq!(matchers, ["B", "C", "D"]);
+
+        toggle_item(&mut first).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let restored = doc["hooks"]["PostToolUse"].as_array().unwrap();
+        let matchers: Vec<_> = restored
+            .iter()
+            .map(|entry| entry["matcher"].as_str().unwrap())
+            .collect();
+        assert_eq!(matchers, ["A", "B", "C", "D"]);
+    }
+
+    #[test]
+    fn toml_inline_table_toggles_into_a_regular_table() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentswitch-toml-inline-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "model = \"gpt-5\"\nmcp_servers.docs = { command = \"docs\" }\n",
+        )
+        .unwrap();
+        let mut item = ConfigItem::new("docs", ItemKind::Mcp, path.clone(), ProviderId::Codex);
+        item.toggle_spec = Some(ToggleSpec::TomlFlag {
+            section: "mcp_servers".into(),
+            name: "docs".into(),
+            flag: "enabled".into(),
+            enabled_value: true,
+            disabled_value: false,
+        });
+
+        toggle_item(&mut item).unwrap();
+        assert_eq!(item.state, ItemState::Disabled);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("enabled = false"),
+            "flag written into converted table: {text}"
+        );
+        assert!(text.contains("command"), "existing keys survive: {text}");
     }
 
     #[test]

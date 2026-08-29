@@ -101,8 +101,6 @@ fn deduplicate_items(items: Vec<ConfigItem>) -> Vec<ConfigItem> {
                 item.state,
                 item.path.clone(),
                 item.name.clone(),
-                // Hooks sharing one settings file and display name are distinct
-                // entries; without this they collapse and become untogglable.
                 item.hook_loc.as_ref().map(|l| {
                     (
                         l.section.clone(),
@@ -160,15 +158,18 @@ fn read_string_lists(
     (read(enabled_key), read(disabled_key))
 }
 
+fn read_json(path: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn read_toml(path: &Path) -> Option<toml::Value> {
+    toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
 fn scan_json_keys(path: &Path, key: &str, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
     let mut out = vec![];
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        _ => return out,
-    };
-    let doc: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(d) => d,
-        _ => return out,
+    let Some(doc) = read_json(path) else {
+        return out;
     };
     for (check_key, base_state) in [
         (key, ItemState::Enabled),
@@ -272,13 +273,8 @@ fn toml_to_json(value: &toml::Value) -> serde_json::Value {
 
 fn scan_toml_mcp(path: &Path, provider: ProviderId) -> Vec<ConfigItem> {
     let mut out = vec![];
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        _ => return out,
-    };
-    let doc: toml::Value = match toml::from_str(&text) {
-        Ok(d) => d,
-        _ => return out,
+    let Some(doc) = read_toml(path) else {
+        return out;
     };
     let servers = match doc.get("mcp_servers").and_then(|v| v.as_table()) {
         Some(t) => t,
@@ -305,13 +301,8 @@ fn scan_toml_mcp(path: &Path, provider: ProviderId) -> Vec<ConfigItem> {
 
 fn scan_toml_hooks(path: &Path, provider: ProviderId) -> Vec<ConfigItem> {
     let mut out = vec![];
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        _ => return out,
-    };
-    let doc: toml::Value = match toml::from_str(&text) {
-        Ok(d) => d,
-        _ => return out,
+    let Some(doc) = read_toml(path) else {
+        return out;
     };
     let hooks = match doc.get("hooks").and_then(|v| v.as_table()) {
         Some(t) => t,
@@ -381,22 +372,20 @@ fn collect_hook_items(
             let display = hook_name
                 .clone()
                 .unwrap_or_else(|| format!("{}: {}", event, matcher));
-            // ZCode documents a native per-entry `enabled: false` flag that the
-            // runtime genuinely skips; honor it when reading state back.
             let entry_flag_disabled = provider == ProviderId::Zcode
                 && entry.get("enabled").and_then(|v| v.as_bool()) == Some(false);
             let is_disabled = force_disabled
                 || entry_flag_disabled
-                || hook_name
-                    .as_ref()
-                    .is_some_and(|n| disabled_names.contains(n));
+                || hook_name.as_ref().is_some_and(|n| {
+                    disabled_names.contains(n)
+                        || disabled_names.contains(&format!("{}:{}", event, n))
+                });
             let loc = HookLoc {
                 section: section_path.to_string(),
                 event: format!("{}{}", event_prefix, event),
                 order,
                 hook_name: hook_name.unwrap_or_else(|| matcher.to_string()),
                 fingerprint: if provider == ProviderId::Zcode {
-                    // Identity must survive the enabled-flag flip.
                     crate::toggler::zcode_entry_fingerprint(entry)
                 } else {
                     json_fingerprint(entry)
@@ -423,13 +412,8 @@ fn scan_hook_entries(
     force_disabled: bool,
 ) -> Vec<ConfigItem> {
     let mut out = vec![];
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        _ => return out,
-    };
-    let doc: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(d) => d,
-        _ => return out,
+    let Some(doc) = read_json(path) else {
+        return out;
     };
     if let Some(hooks_obj) = json_at(&doc, section_path).and_then(|v| v.as_object()) {
         let filtered = hooks_obj
@@ -461,7 +445,6 @@ fn scan_hook_entries(
     out
 }
 
-/// Walk a slash-separated object path ("hooks/events") from a JSON root.
 fn json_at<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut current = doc;
     for segment in path.split('/').filter(|s| !s.is_empty()) {
@@ -470,15 +453,9 @@ fn json_at<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a serde_json:
     Some(current)
 }
 
-/// Read the `hooks.disabled` name list that the Antigravity toggler writes.
 fn read_antigravity_disabled_names(path: &Path) -> Vec<String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        _ => return vec![],
-    };
-    let doc: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(d) => d,
-        _ => return vec![],
+    let Some(doc) = read_json(path) else {
+        return vec![];
     };
     doc.get("hooks")
         .and_then(|hooks| hooks.get("disabled"))
@@ -494,18 +471,12 @@ fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         return vec![];
     };
     let mut items = vec![];
-    match scope {
-        Scope::Project => items.extend(check_file(
-            root.join("CLAUDE.md"),
-            ItemKind::InstructionFile,
-            ProviderId::Claude,
-        )),
-        Scope::Global => items.extend(check_file(
-            d.join("CLAUDE.md"),
-            ItemKind::InstructionFile,
-            ProviderId::Claude,
-        )),
-    }
+    let instructions: &Path = if scope == Scope::Project { root } else { &d };
+    items.extend(check_file(
+        instructions.join("CLAUDE.md"),
+        ItemKind::InstructionFile,
+        ProviderId::Claude,
+    ));
     items.extend(collect_subdirs_both(
         &d.join("skills"),
         ItemKind::Skill,
@@ -664,8 +635,6 @@ fn scan_antigravity(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         ItemKind::Mcp,
         ProviderId::Antigravity,
     ));
-    // The Antigravity toggler records disabled hooks by name in hooks.disabled;
-    // feed those names back in so state survives a rescan.
     let hooks_path = d.join("hooks.json");
     let disabled_names = read_antigravity_disabled_names(&hooks_path);
     items.extend(scan_hook_entries(
@@ -836,12 +805,6 @@ fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     items
 }
 
-/// ZCode (z.ai) layout, per its official configuration guide:
-/// - workspace config `<repo>/.zcode/config.json` (fallback `zcode.json`),
-///   user config `~/.zcode/cli/config.json` — both hold `hooks` and `mcp.servers`
-/// - MCP compatibility fallback `.agents/mcp.json` with a top-level `mcpServers`,
-///   only honored when the primary config declares no servers (ZCode's own rule)
-/// - skills in `.zcode/skills/` then `.agents/skills/`, instructions in `AGENTS.md`
 fn scan_zcode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     let Ok(d) = provider_dir(ProviderId::Zcode, root, scope) else {
         return vec![];
@@ -918,30 +881,30 @@ fn scan_zcode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     items
 }
 
-/// Like [`scan_json_keys`] but for servers nested under a slash-separated path
-/// (e.g. ZCode's `mcp.servers`). Toggling stashes entries out of that path.
 fn scan_json_keys_at(path: &Path, section_path: &str, provider: ProviderId) -> Vec<ConfigItem> {
     let mut out = vec![];
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        _ => return out,
-    };
-    let doc: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(d) => d,
-        _ => return out,
-    };
-    let Some(servers) = json_at(&doc, section_path).and_then(|v| v.as_object()) else {
+    let Some(doc) = read_json(path) else {
         return out;
     };
-    for (name, value) in servers {
-        let mut item = ConfigItem::new(name.clone(), ItemKind::Mcp, path.to_owned(), provider);
-        item.editable = false;
-        item.toggle_spec = Some(ToggleSpec::JsonStash {
-            section: section_path.to_string(),
-            name: name.clone(),
-        });
-        item.detail = Some(json_detail(value));
-        out.push(item);
+    let stash_key = format!("_disabled_{}", section_path.replace('/', "_"));
+    for (section, base_state) in [
+        (section_path, ItemState::Enabled),
+        (&stash_key, ItemState::Disabled),
+    ] {
+        let Some(servers) = json_at(&doc, section).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (name, value) in servers {
+            let mut item = ConfigItem::new(name.clone(), ItemKind::Mcp, path.to_owned(), provider);
+            item.state = base_state;
+            item.editable = false;
+            item.toggle_spec = Some(ToggleSpec::JsonStash {
+                section: section_path.to_string(),
+                name: name.clone(),
+            });
+            item.detail = Some(json_detail(value));
+            out.push(item);
+        }
     }
     out
 }
@@ -1010,6 +973,41 @@ mod tests {
             agents.join("hooks.json"),
             r#"{"hooks":{
                 "PreToolUse":[{"matcher":"Bash","hooks":[{"command":"check"}]}],
+                "PostToolUse":[{"matcher":"Bash","hooks":[{"command":"check"}]}],
+                "disabled":["PreToolUse:check"]
+            }}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Antigravity, &root, Scope::Project);
+        let hooks: Vec<_> = items
+            .iter()
+            .filter(|item| item.kind == ItemKind::Hook)
+            .collect();
+        assert_eq!(hooks.len(), 2, "both events list their hook");
+        for hook in hooks {
+            let expected = if hook
+                .hook_loc
+                .as_ref()
+                .is_some_and(|loc| loc.event == "PreToolUse")
+            {
+                ItemState::Disabled
+            } else {
+                ItemState::Enabled
+            };
+            assert_eq!(hook.state, expected, "only the PreToolUse copy is disabled");
+        }
+    }
+
+    #[test]
+    fn antigravity_legacy_bare_names_still_disable() {
+        let root = temp_dir("antigravity-legacy");
+        let agents = root.join(".agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("hooks.json"),
+            r#"{"hooks":{
+                "PreToolUse":[{"matcher":"Bash","hooks":[{"command":"check"}]}],
                 "disabled":["check"]
             }}"#,
         )
@@ -1020,11 +1018,7 @@ mod tests {
             .iter()
             .find(|item| item.kind == ItemKind::Hook && item.name == "check")
             .expect("hook must be listed");
-        assert_eq!(
-            hook.state,
-            ItemState::Disabled,
-            "hooks.disabled is read back"
-        );
+        assert_eq!(hook.state, ItemState::Disabled, "legacy bare name honored");
     }
 
     #[test]
@@ -1114,8 +1108,6 @@ mod tests {
             "compat fallback is honored when the primary config has no servers"
         );
 
-        // Once the primary config declares a server, the fallback is ignored
-        // (ZCode reads .zcode first and never merges both).
         std::fs::write(
             zc.join("config.json"),
             r#"{"mcp":{"servers":{"native":{"command":"native-mcp"}}}}"#,
@@ -1130,6 +1122,33 @@ mod tests {
                 .iter()
                 .any(|i| i.kind == ItemKind::Mcp && i.name == "shared"),
             "fallback hidden once primary servers exist"
+        );
+    }
+
+    #[test]
+    fn zcode_stashed_servers_stay_listed_as_disabled() {
+        let root = temp_dir("zcode-stash");
+        let zc = root.join(".zcode");
+        std::fs::create_dir_all(&zc).unwrap();
+        std::fs::write(
+            zc.join("config.json"),
+            r#"{"mcp":{"servers":{"live":{"command":"live-mcp"}}},"_disabled_mcp_servers":{"parked":{"command":"parked-mcp"}}}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Zcode, &root, Scope::Project);
+        let mcps: Vec<_> = items.iter().filter(|i| i.kind == ItemKind::Mcp).collect();
+        assert_eq!(mcps.len(), 2, "stashed server stays listed");
+        let live = mcps.iter().find(|i| i.name == "live").unwrap();
+        assert_eq!(live.state, ItemState::Enabled);
+        let parked = mcps.iter().find(|i| i.name == "parked").unwrap();
+        assert_eq!(parked.state, ItemState::Disabled);
+
+        assert!(
+            !items
+                .iter()
+                .any(|i| i.kind == ItemKind::Hook && i.name == "shared"),
+            "no fallback leakage"
         );
     }
 

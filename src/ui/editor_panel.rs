@@ -7,7 +7,6 @@ pub fn show(ui: &mut Ui, editor: &mut EditorState) {
         return;
     }
     ui.vertical(|ui| {
-        // header
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("Editing: {}", editor.filename()))
@@ -62,7 +61,6 @@ pub fn show(ui: &mut Ui, editor: &mut EditorState) {
                 }
             });
         });
-        // inline status line: save/open failures or the close prompt
         match editor.error.as_deref() {
             Some("__confirm_close__") => {
                 ui.label(
@@ -81,7 +79,6 @@ pub fn show(ui: &mut Ui, editor: &mut EditorState) {
             None => {}
         }
         ui.separator();
-        // editor area
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let resp = ui.add(
                 TextEdit::multiline(&mut editor.content)

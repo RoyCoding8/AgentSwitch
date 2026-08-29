@@ -18,8 +18,6 @@ use std::{
 };
 use walkdir::WalkDir;
 
-/// Read JSONL as lossy UTF-8 lines. Unlike `BufRead::lines`, a single invalid
-/// byte neither truncates the rest of the file nor produces fallible items.
 fn jsonl_lines(file: File) -> impl Iterator<Item = String> {
     let mut reader = BufReader::new(file);
     let mut buf = Vec::new();
@@ -60,9 +58,6 @@ struct DeleteManifest {
     original_path: Option<PathBuf>,
     trashed_path: Option<PathBuf>,
     source_kind: Option<ChatSourceKind>,
-    /// True when the chat was trashed out of a provider's SQLite database
-    /// rather than moved from a file; restore must re-insert rows instead of
-    /// moving a file back.
     from_database: Option<bool>,
     deleted_at_unix: u64,
 }
@@ -75,17 +70,10 @@ struct SessionMeta {
     created_at: Option<String>,
     updated_at: Option<String>,
     turn_count: usize,
-    /// Turns carrying an explicit `role`. Codex rollouts contain both these
-    /// (`response_item`) and typed marker events (`event_msg`) for the same
-    /// message; the markers must not double the count when both exist.
     role_turns: usize,
-    /// Turns recorded only as typed markers (restored/synthesized logs).
     marker_turns: usize,
 }
 
-/// Numeric ordering key for the mixed display labels stored in `updated_at`
-/// ("unix:123…" from file times and databases, ISO-8601 from JSONL events).
-/// Lexicographic comparison would rank every "unix:*" above every ISO string.
 fn timestamp_sort_key(label: &str) -> i64 {
     if let Some(raw) = label.strip_prefix("unix:") {
         return raw.parse::<i64>().unwrap_or(i64::MIN);
@@ -93,7 +81,6 @@ fn timestamp_sort_key(label: &str) -> i64 {
     parse_iso_seconds(label).unwrap_or(i64::MIN)
 }
 
-/// Parse the first 19 characters of an ISO-8601 UTC timestamp to epoch seconds.
 fn parse_iso_seconds(label: &str) -> Option<i64> {
     let bytes = label.as_bytes();
     if bytes.len() < 19
@@ -112,7 +99,6 @@ fn parse_iso_seconds(label: &str) -> Option<i64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    // Days-from-civil (Howard Hinnant's algorithm), inverted.
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
@@ -123,27 +109,34 @@ fn parse_iso_seconds(label: &str) -> Option<i64> {
     Some(days * 86400 + hour * 3600 + minute * 60 + second)
 }
 
-pub fn scan_all(
-    workspace: &Path,
-    provider_filter: Option<crate::types::ProviderId>,
-) -> Vec<ChatSession> {
+fn provider_matches(filter: Option<crate::types::ProviderId>, provider: ChatProvider) -> bool {
+    use crate::types::ProviderId;
+    filter.map_or(true, |prov| {
+        matches!(
+            (prov, provider),
+            (ProviderId::Claude, ChatProvider::Claude)
+                | (ProviderId::Codex, ChatProvider::Codex)
+                | (ProviderId::Antigravity, ChatProvider::Antigravity)
+                | (ProviderId::Kiro, ChatProvider::Kiro)
+                | (ProviderId::OpenCode, ChatProvider::OpenCode)
+                | (ProviderId::Zcode, ChatProvider::Zcode)
+        )
+    })
+}
+
+fn sort_sessions(sessions: &mut [ChatSession]) {
+    sessions.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then(a.project_path.cmp(&b.project_path))
+            .then(timestamp_sort_key(&b.updated_at).cmp(&timestamp_sort_key(&a.updated_at)))
+            .then(a.title.cmp(&b.title))
+    });
+}
+
+pub fn scan_all(provider_filter: Option<crate::types::ProviderId>) -> Vec<ChatSession> {
     let mut sessions = Vec::new();
-    let include = |p: ChatProvider| -> bool {
-        provider_filter.map_or(true, |prov| {
-            matches!(
-                (prov, p),
-                (crate::types::ProviderId::Claude, ChatProvider::Claude)
-                    | (crate::types::ProviderId::Codex, ChatProvider::Codex)
-                    | (
-                        crate::types::ProviderId::Antigravity,
-                        ChatProvider::Antigravity
-                    )
-                    | (crate::types::ProviderId::Kiro, ChatProvider::Kiro)
-                    | (crate::types::ProviderId::OpenCode, ChatProvider::OpenCode)
-                    | (crate::types::ProviderId::Zcode, ChatProvider::Zcode)
-            )
-        })
-    };
+    let include = |p: ChatProvider| provider_matches(provider_filter, p);
     if include(ChatProvider::Claude) {
         sessions.extend(scan_claude());
     }
@@ -151,7 +144,7 @@ pub fn scan_all(
         sessions.extend(scan_codex());
     }
     if include(ChatProvider::Kiro) {
-        sessions.extend(scan_kiro(workspace));
+        sessions.extend(scan_kiro());
     }
     if include(ChatProvider::OpenCode) {
         sessions.extend(scan_opencode());
@@ -160,17 +153,11 @@ pub fn scan_all(
         sessions.extend(scan_zcode());
     }
     sessions.extend(scan_imported().into_iter().filter(|s| include(s.provider)));
-    sessions.sort_by(|a, b| {
-        a.provider
-            .cmp(&b.provider)
-            .then(a.project_path.cmp(&b.project_path))
-            .then(timestamp_sort_key(&b.updated_at).cmp(&timestamp_sort_key(&a.updated_at)))
-            .then(a.title.cmp(&b.title))
-    });
+    sort_sessions(&mut sessions);
     sessions
 }
 
-pub fn scan_trash() -> Vec<ChatSession> {
+pub fn scan_trash(provider_filter: Option<crate::types::ProviderId>) -> Vec<ChatSession> {
     let root = trash_dir();
     if !root.is_dir() {
         return vec![];
@@ -182,14 +169,9 @@ pub fn scan_trash() -> Vec<ChatSession> {
         .filter(|e| e.file_type().is_file())
         .filter(|e| e.path().to_string_lossy().ends_with(".delete.json"))
         .filter_map(|e| trashed_session(e.path()).ok())
+        .filter(|session| provider_matches(provider_filter, session.provider))
         .collect();
-    sessions.sort_by(|a, b| {
-        a.provider
-            .cmp(&b.provider)
-            .then(a.project_path.cmp(&b.project_path))
-            .then(timestamp_sort_key(&b.updated_at).cmp(&timestamp_sort_key(&a.updated_at)))
-            .then(a.title.cmp(&b.title))
-    });
+    sort_sessions(&mut sessions);
     sessions
 }
 
@@ -223,8 +205,6 @@ pub fn export_sessions_zip(sessions: &[ChatSession], target: &Path) -> Result<Ba
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Build the archive next to the destination and rename it into place so a
-    // crash mid-export cannot leave a truncated .zip behind.
     let staging = target.with_extension("zip.part");
     let file = File::create(&staging)?;
     let mut zip = ZipWriter::new(file);
@@ -311,9 +291,6 @@ fn persist_imported_archive(
     Ok(target)
 }
 
-/// Providers any chat can be converted into. Antigravity is excluded because
-/// its chats live encrypted inside the CLI: AgentSwitch can neither read nor
-/// write them.
 pub fn conversion_targets() -> Vec<ChatProvider> {
     ChatProvider::ALL
         .iter()
@@ -322,8 +299,6 @@ pub fn conversion_targets() -> Vec<ChatProvider> {
         .collect()
 }
 
-/// Targets available for a specific session: every conversion target except
-/// the provider the session already lives in.
 pub fn convertible_targets(from: ChatProvider) -> Vec<ChatProvider> {
     conversion_targets()
         .into_iter()
@@ -331,8 +306,6 @@ pub fn convertible_targets(from: ChatProvider) -> Vec<ChatProvider> {
         .collect()
 }
 
-/// Convert a chat into another harness's native store so it opens as a
-/// first-class session there. The source session is left untouched.
 pub fn convert_session(session: &ChatSession, target: ChatProvider) -> Result<PathBuf> {
     if target == ChatProvider::Antigravity || session.provider == ChatProvider::Antigravity {
         anyhow::bail!(
@@ -343,10 +316,6 @@ pub fn convert_session(session: &ChatSession, target: ChatProvider) -> Result<Pa
         anyhow::bail!("chat is already a {} conversation", target.label());
     }
     let mut archive = load_archive(session)?;
-    // raw_events are lines in the SOURCE harness's private schema; replaying
-    // them into another harness would store events that harness cannot parse.
-    // Drop them so the restorer synthesizes target-native events from the
-    // normalized messages instead.
     archive.raw_events.clear();
     write_converted(target, &archive)
 }
@@ -371,10 +340,6 @@ fn write_converted(target: ChatProvider, archive: &ChatArchive) -> Result<PathBu
     }
 }
 
-/// Convert an exported AgentSwitch chat archive (single JSON or multi-chat
-/// ZIP) so importing the result places the chats into `target`'s native
-/// store. Returns the converted file's path plus how many Antigravity chats
-/// were skipped (ZIP inputs only; a malformed entry aborts the conversion).
 pub fn convert_archive_file(input: &Path, target: ChatProvider) -> Result<(PathBuf, usize)> {
     if target == ChatProvider::Antigravity {
         anyhow::bail!("Antigravity chats are encrypted inside the CLI and cannot be written");
@@ -390,9 +355,6 @@ pub fn convert_archive_file(input: &Path, target: ChatProvider) -> Result<(PathB
     }
 }
 
-/// Retag an archive for another harness. raw_events must go: they are lines
-/// in the ORIGINAL harness's private schema, and the importer replays them
-/// verbatim into the retagged provider's native store.
 fn retag_archive_for(archive: &mut ChatArchive, target: ChatProvider) -> Result<()> {
     if archive.source_provider == ChatProvider::Antigravity {
         anyhow::bail!("Antigravity chats are encrypted inside the CLI and cannot be converted");
@@ -425,6 +387,16 @@ fn convert_archive_json(input: &Path, target: ChatProvider) -> Result<PathBuf> {
     Ok(out)
 }
 
+fn add_zip_bytes(total: &mut u64, size: u64) -> Result<()> {
+    *total = total
+        .checked_add(size)
+        .ok_or_else(|| anyhow!("ZIP uncompressed size overflow"))?;
+    if *total > MAX_ZIP_TOTAL_BYTES {
+        anyhow::bail!("ZIP exceeds the total uncompressed size limit");
+    }
+    Ok(())
+}
+
 fn convert_archive_zip(input: &Path, target: ChatProvider) -> Result<(PathBuf, usize)> {
     let mut zip = ZipArchive::new(File::open(input)?)?;
     if zip.len() > MAX_ZIP_ENTRIES {
@@ -438,9 +410,8 @@ fn convert_archive_zip(input: &Path, target: ChatProvider) -> Result<(PathBuf, u
         let mut entry = zip.by_index(i)?;
         let name = entry.name().to_string();
         if !name.ends_with(ARCHIVE_EXT) {
-            // manifest.json is regenerated below; other payload files are
-            // carried over unchanged.
             if !name.ends_with('/') && name != "manifest.json" {
+                add_zip_bytes(&mut total_bytes, entry.size())?;
                 let mut buf = Vec::with_capacity(entry.size() as usize);
                 entry.read_to_end(&mut buf)?;
                 extras.push((name, buf));
@@ -450,12 +421,7 @@ fn convert_archive_zip(input: &Path, target: ChatProvider) -> Result<(PathBuf, u
         if entry.size() > MAX_ZIP_ENTRY_BYTES {
             anyhow::bail!("ZIP entry '{name}' exceeds the uncompressed size limit");
         }
-        total_bytes = total_bytes
-            .checked_add(entry.size())
-            .ok_or_else(|| anyhow!("ZIP uncompressed size overflow"))?;
-        if total_bytes > MAX_ZIP_TOTAL_BYTES {
-            anyhow::bail!("ZIP exceeds the total uncompressed size limit");
-        }
+        add_zip_bytes(&mut total_bytes, entry.size())?;
         let mut buf = String::with_capacity(entry.size() as usize);
         entry.read_to_string(&mut buf)?;
         let mut archive: ChatArchive = serde_json::from_str(&buf)
@@ -520,25 +486,15 @@ fn convert_archive_zip(input: &Path, target: ChatProvider) -> Result<(PathBuf, u
 }
 
 fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
-    let first = if ext.is_empty() {
-        dir.join(stem)
+    let suffix = if ext.is_empty() {
+        String::new()
     } else {
-        dir.join(format!("{stem}.{ext}"))
+        format!(".{ext}")
     };
-    if !first.exists() {
-        return first;
-    }
-    for n in 2.. {
-        let candidate = if ext.is_empty() {
-            dir.join(format!("{stem}-{n}"))
-        } else {
-            dir.join(format!("{stem}-{n}.{ext}"))
-        };
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    unreachable!()
+    std::iter::once(dir.join(format!("{stem}{suffix}")))
+        .chain((2u32..).map(|n| dir.join(format!("{stem}-{n}{suffix}"))))
+        .find(|candidate| !candidate.exists())
+        .expect("the candidate sequence is infinite")
 }
 
 pub fn import_zip(path: &Path, project_dir: Option<&Path>) -> Result<BatchReport> {
@@ -558,12 +514,7 @@ pub fn import_zip(path: &Path, project_dir: Option<&Path>) -> Result<BatchReport
         if entry.size() > MAX_ZIP_ENTRY_BYTES {
             anyhow::bail!("ZIP entry '{name}' exceeds the uncompressed size limit");
         }
-        total_bytes = total_bytes
-            .checked_add(entry.size())
-            .ok_or_else(|| anyhow!("ZIP uncompressed size overflow"))?;
-        if total_bytes > MAX_ZIP_TOTAL_BYTES {
-            anyhow::bail!("ZIP exceeds the total uncompressed size limit");
-        }
+        add_zip_bytes(&mut total_bytes, entry.size())?;
         let mut buf = String::with_capacity(entry.size() as usize);
         std::io::Read::read_to_string(&mut entry, &mut buf)?;
         let archive: ChatArchive = match serde_json::from_str(&buf) {
@@ -611,24 +562,10 @@ pub fn soft_delete(session: &ChatSession) -> Result<()> {
     let target = unique_path(&trash_dir, &stem, ext);
     move_path(source, &target)?;
     let manifest = DeleteManifest {
-        schema_version: ARCHIVE_VERSION,
-        provider: session.provider,
-        session_id: session.id.clone(),
-        title: Some(session.title.clone()),
-        project_path: Some(session.project_path.clone()),
-        created_at: session.created_at.clone(),
-        updated_at: Some(session.updated_at.clone()),
-        turn_count: Some(session.turn_count),
-        size_bytes: Some(session.size_bytes),
-        imported: Some(session.imported),
         original_path: Some(source.clone()),
         trashed_path: Some(target.clone()),
-        source_kind: Some(session.source_kind),
-        from_database: None,
-        deleted_at_unix: unix_now(),
+        ..base_manifest(session)
     };
-    // The manifest is what makes a trashed chat discoverable; if it cannot be
-    // written, put the chat back instead of orphaning it outside both stores.
     if let Err(error) = fs::write(
         target.with_extension("delete.json"),
         serde_json::to_string_pretty(&manifest)?,
@@ -650,6 +587,26 @@ pub fn soft_delete(session: &ChatSession) -> Result<()> {
     Ok(())
 }
 
+fn base_manifest(session: &ChatSession) -> DeleteManifest {
+    DeleteManifest {
+        schema_version: ARCHIVE_VERSION,
+        provider: session.provider,
+        session_id: session.id.clone(),
+        title: Some(session.title.clone()),
+        project_path: Some(session.project_path.clone()),
+        created_at: session.created_at.clone(),
+        updated_at: Some(session.updated_at.clone()),
+        turn_count: Some(session.turn_count),
+        size_bytes: Some(session.size_bytes),
+        imported: Some(session.imported),
+        original_path: None,
+        trashed_path: None,
+        source_kind: Some(session.source_kind),
+        from_database: None,
+        deleted_at_unix: unix_now(),
+    }
+}
+
 fn soft_delete_kiro_session(session: &ChatSession) -> Result<()> {
     let source = session
         .source_path
@@ -662,46 +619,43 @@ fn soft_delete_kiro_session(session: &ChatSession) -> Result<()> {
     let target = unique_path(&trash_dir, &stem, "");
     fs::create_dir_all(&target)?;
     let base = meta_path.with_extension("");
-    for ext in ["json", "jsonl", "lock"] {
-        let source_file = base.with_extension(ext);
-        if source_file.exists() {
-            let dest = target.join(
-                source_file
-                    .file_name()
-                    .ok_or_else(|| anyhow!("invalid Kiro session path"))?,
-            );
-            move_path(&source_file, &dest)?;
-        }
-    }
     let manifest = DeleteManifest {
-        schema_version: ARCHIVE_VERSION,
-        provider: session.provider,
-        session_id: session.id.clone(),
-        title: Some(session.title.clone()),
-        project_path: Some(session.project_path.clone()),
-        created_at: session.created_at.clone(),
-        updated_at: Some(session.updated_at.clone()),
-        turn_count: Some(session.turn_count),
-        size_bytes: Some(session.size_bytes),
-        imported: Some(session.imported),
         original_path: Some(meta_path),
         trashed_path: Some(target.clone()),
-        source_kind: Some(session.source_kind),
-        from_database: None,
-        deleted_at_unix: unix_now(),
+        ..base_manifest(session)
     };
-    fs::write(
-        target.with_extension("delete.json"),
-        serde_json::to_string_pretty(&manifest)?,
-    )?;
+    let mut moved = Vec::new();
+    let result = (|| -> Result<()> {
+        for ext in ["json", "jsonl", "lock"] {
+            let source_file = base.with_extension(ext);
+            if source_file.exists() {
+                let dest = target.join(
+                    source_file
+                        .file_name()
+                        .ok_or_else(|| anyhow!("invalid Kiro session path"))?,
+                );
+                move_path(&source_file, &dest)?;
+                moved.push((dest, source_file));
+            }
+        }
+        Ok(())
+    })()
+    .and_then(|()| {
+        fs::write(
+            target.with_extension("delete.json"),
+            serde_json::to_string_pretty(&manifest)?,
+        )
+        .map_err(Into::into)
+    });
+    if let Err(error) = result {
+        for (dest, source_file) in moved {
+            let _ = move_path(&dest, &source_file);
+        }
+        return Err(error).context("Kiro chat trash failed; session was rolled back");
+    }
     Ok(())
 }
 
-/// Database-backed chats (OpenCode, ZCode) cannot be trashed file-wise: their
-/// messages are rows inside a live SQLite store. Instead, archive the chat,
-/// then delete its rows. The row deletion is the commit point — until it
-/// succeeds, nothing in the provider's database has changed, and a failed
-/// deletion rolls the staged trash files back.
 fn soft_delete_db_session(session: &ChatSession) -> Result<()> {
     let db_path = session
         .source_path
@@ -717,23 +671,11 @@ fn soft_delete_db_session(session: &ChatSession) -> Result<()> {
         serde_json::to_string_pretty(&archive)?.as_bytes(),
     )?;
     let manifest = DeleteManifest {
-        schema_version: ARCHIVE_VERSION,
-        provider: session.provider,
-        session_id: session.id.clone(),
-        title: Some(session.title.clone()),
-        project_path: Some(session.project_path.clone()),
-        created_at: session.created_at.clone(),
-        updated_at: Some(session.updated_at.clone()),
-        turn_count: Some(session.turn_count),
-        size_bytes: Some(session.size_bytes),
-        imported: Some(session.imported),
         original_path: Some(db_path.clone()),
         trashed_path: Some(archive_path.clone()),
-        // The trash copy is a neutral archive; listing and loading treat it
-        // like an imported chat until it is restored.
         source_kind: Some(ChatSourceKind::ImportedArchive),
         from_database: Some(true),
-        deleted_at_unix: unix_now(),
+        ..base_manifest(session)
     };
     let manifest_path = archive_path.with_extension("delete.json");
     fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
@@ -746,9 +688,17 @@ fn soft_delete_db_session(session: &ChatSession) -> Result<()> {
     Ok(())
 }
 
-/// Delete one session's rows from an OpenCode/ZCode database, children first.
-/// A short busy timeout waits out brief write locks the harness itself holds;
-/// merely having the CLI open does not block this.
+fn finish_tx(conn: &Connection, result: Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn delete_db_session_rows(db_path: &Path, session_id: &str) -> Result<()> {
     let conn = Connection::open(db_path)?;
     conn.busy_timeout(std::time::Duration::from_secs(3))?;
@@ -779,14 +729,7 @@ fn delete_db_session_rows(db_path: &Path, session_id: &str) -> Result<()> {
         )?;
         Ok(())
     })();
-    match result {
-        Ok(()) => conn.execute_batch("COMMIT")?,
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(error);
-        }
-    }
-    Ok(())
+    finish_tx(&conn, result)
 }
 
 pub fn restore_from_trash(session: &ChatSession) -> Result<PathBuf> {
@@ -814,10 +757,10 @@ pub fn restore_from_trash(session: &ChatSession) -> Result<PathBuf> {
         fs::create_dir_all(parent)?;
     }
     move_path(source, &target)?;
-    // Re-register with Codex's state database before dropping the manifest so
-    // a restored rollout shows up in /resume again; the manifest is only
-    // removed once the chat is fully back in both stores.
-    let registered = if manifest.provider == ChatProvider::Codex {
+    let registered = if manifest.provider == ChatProvider::Codex
+        && manifest.source_kind != Some(ChatSourceKind::ImportedArchive)
+        && !manifest.imported.unwrap_or(false)
+    {
         codex_state_register(
             &target,
             &manifest.session_id,
@@ -829,8 +772,8 @@ pub fn restore_from_trash(session: &ChatSession) -> Result<PathBuf> {
     } else {
         Ok(())
     };
-    fs::remove_file(manifest_path)?;
     registered?;
+    fs::remove_file(manifest_path)?;
     Ok(target)
 }
 
@@ -934,28 +877,15 @@ fn scan_claude() -> Vec<ChatSession> {
 }
 
 fn claude_home() -> Option<PathBuf> {
-    env::var("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .ok()
+    crate::provider::env_path("CLAUDE_CONFIG_DIR")
         .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
 }
 
 fn scan_codex() -> Vec<ChatSession> {
-    // An explicit CODEX_HOME is authoritative; merging in ~/.codex would show
-    // chats from an unrelated store and break round trips.
     let mut roots = Vec::new();
-    match env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
-        Some(custom) => {
-            let custom = PathBuf::from(custom);
-            roots.push(custom.join("sessions"));
-            roots.push(custom.join("archived_sessions"));
-        }
-        None => {
-            if let Some(home) = dirs::home_dir() {
-                roots.push(home.join(".codex").join("sessions"));
-                roots.push(home.join(".codex").join("archived_sessions"));
-            }
-        }
+    if let Some(home) = codex_home() {
+        roots.push(home.join("sessions"));
+        roots.push(home.join("archived_sessions"));
     }
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -984,8 +914,6 @@ fn opencode_db_path() -> Option<PathBuf> {
         .filter(|path| path.is_file())
 }
 
-/// ZCode keeps its sessions in a database with the same session/message/part
-/// layout OpenCode uses (verified against `~/.zcode/cli/db/db.sqlite`).
 fn zcode_db_path() -> Option<PathBuf> {
     if let Some(custom) = env::var_os("ZCODE_DB").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(custom)).filter(|path| path.is_file());
@@ -1014,8 +942,6 @@ fn scan_sqlite_sessions(db_path: &Path, provider: ChatProvider) -> Vec<ChatSessi
     else {
         return vec![];
     };
-    // Current schema stores turns in `message`; the legacy schema used
-    // `session_message` and would otherwise list as zero sessions.
     let current = conn.prepare(
         "SELECT s.id, s.title, s.directory, s.time_created, s.time_updated, \
          (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) as msg_count \
@@ -1061,6 +987,7 @@ fn scan_sqlite_sessions(db_path: &Path, provider: ChatProvider) -> Vec<ChatSessi
                 turn_count: msg_count as usize,
                 size_bytes: 0,
                 imported: false,
+                subagent: false,
                 trash_manifest: None,
             },
         )
@@ -1083,7 +1010,16 @@ fn load_opencode_archive(session: &ChatSession) -> Result<ChatArchive> {
     } else {
         anyhow::bail!("unsupported chat database schema: no known message tables");
     }
-    Ok(ChatArchive {
+    Ok(archive_from(session, messages, tools, Vec::new()))
+}
+
+fn archive_from(
+    session: &ChatSession,
+    messages: Vec<ChatMessage>,
+    tool_calls: Vec<ChatToolCall>,
+    raw_events: Vec<Value>,
+) -> ChatArchive {
+    ChatArchive {
         schema_version: ARCHIVE_VERSION,
         source_provider: session.provider,
         source_session_id: session.id.clone(),
@@ -1092,9 +1028,9 @@ fn load_opencode_archive(session: &ChatSession) -> Result<ChatArchive> {
         created_at: session.created_at.clone(),
         updated_at: Some(session.updated_at.clone()),
         messages,
-        tool_calls: tools,
-        raw_events: Vec::new(),
-    })
+        tool_calls,
+        raw_events,
+    }
 }
 
 fn sqlite_tables(conn: &Connection) -> Result<HashSet<String>> {
@@ -1104,8 +1040,6 @@ fn sqlite_tables(conn: &Connection) -> Result<HashSet<String>> {
     Ok(tables)
 }
 
-/// Column names of one table, so inserts can adapt to schema drift between
-/// OpenCode's original layout and ZCode's extended one.
 fn sqlite_columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -1241,7 +1175,7 @@ fn extract_text_field(val: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn scan_kiro(workspace: &Path) -> Vec<ChatSession> {
+fn scan_kiro() -> Vec<ChatSession> {
     let Ok(root) = kiro_sessions_dir() else {
         return vec![];
     };
@@ -1256,29 +1190,7 @@ fn scan_kiro(workspace: &Path) -> Vec<ChatSession> {
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
         .filter_map(|path| kiro_session(&path).ok())
-        .filter(|session| session_matches_workspace(session, workspace))
         .collect()
-}
-
-fn session_matches_workspace(session: &ChatSession, workspace: &Path) -> bool {
-    let project = Path::new(&session.project_path);
-    if !project.is_absolute() {
-        return true;
-    }
-    same_path(project, workspace)
-}
-
-fn same_path(left: &Path, right: &Path) -> bool {
-    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
-    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
-    if cfg!(windows) {
-        // eq_ignore_ascii_case misses non-ASCII casing differences (Ä vs ä).
-        left.to_string_lossy()
-            .to_lowercase()
-            .eq(&right.to_string_lossy().to_lowercase())
-    } else {
-        left == right
-    }
 }
 
 fn scan_imported() -> Vec<ChatSession> {
@@ -1314,6 +1226,7 @@ fn imported_session(path: &Path) -> Result<ChatSession> {
         turn_count: archive.messages.len(),
         size_bytes: meta.len(),
         imported: true,
+        subagent: false,
         trash_manifest: None,
     })
 }
@@ -1350,6 +1263,7 @@ fn kiro_session(path: &Path) -> Result<ChatSession> {
         turn_count: kiro_turn_count(&jsonl),
         size_bytes: file_meta.len() + jsonl_meta.map(|m| m.len()).unwrap_or_default(),
         imported: false,
+        subagent: str_field(&meta, &["session_created_reason"]) == Some("subagent"),
         trash_manifest: None,
     })
 }
@@ -1394,10 +1308,9 @@ fn trashed_session(manifest_path: &Path) -> Result<ChatSession> {
             .or_else(|| meta.as_ref().map(fs::Metadata::len))
             .unwrap_or_default(),
         imported: manifest.imported.unwrap_or(false),
+        subagent: false,
         trash_manifest: Some(manifest_path.to_path_buf()),
     };
-    // Only re-parse the whole archive when the manifest lacks a title; doing
-    // it unconditionally re-reads every trashed session on each scan.
     let manifest_has_meta = manifest
         .title
         .as_deref()
@@ -1476,6 +1389,7 @@ fn jsonl_session(provider: ChatProvider, root: &Path, path: &Path) -> Result<Cha
         turn_count: parsed.turn_count,
         size_bytes: meta.len(),
         imported: false,
+        subagent: false,
         trash_manifest: None,
     })
 }
@@ -1500,8 +1414,6 @@ fn parse_jsonl_meta(provider: ChatProvider, path: &Path, root: &Path) -> Result<
     Ok(meta_parsed)
 }
 
-/// Rescans run after every chat-tab action and re-parse every session file
-/// end-to-end just for title/count. Cache by (path, mtime, length).
 type MetaCache = HashMap<(ChatProvider, PathBuf), (std::time::Duration, u64, SessionMeta)>;
 
 fn meta_cache() -> &'static std::sync::Mutex<MetaCache> {
@@ -1585,6 +1497,7 @@ fn jsonl_dir_session(
         turn_count: parsed.turn_count,
         size_bytes: size,
         imported: false,
+        subagent: false,
         trash_manifest: None,
     })
 }
@@ -1612,8 +1525,6 @@ fn load_jsonl_archive(session: &ChatSession) -> Result<ChatArchive> {
             raw_events.push(value);
         }
     }
-    // Codex rollouts echo every turn twice (role-bearing `response_item` plus
-    // an `event_msg` marker). When authoritative copies exist, drop the echoes.
     let has_authoritative = messages.iter().any(|(_, marker)| !marker);
     let messages: Vec<ChatMessage> = messages
         .into_iter()
@@ -1622,18 +1533,7 @@ fn load_jsonl_archive(session: &ChatSession) -> Result<ChatArchive> {
         })
         .map(|(message, _)| message)
         .collect();
-    Ok(ChatArchive {
-        schema_version: ARCHIVE_VERSION,
-        source_provider: session.provider,
-        source_session_id: session.id.clone(),
-        title: session.title.clone(),
-        project_path: session.project_path.clone(),
-        created_at: session.created_at.clone(),
-        updated_at: Some(session.updated_at.clone()),
-        messages,
-        tool_calls: tools,
-        raw_events,
-    })
+    Ok(archive_from(session, messages, tools, raw_events))
 }
 
 fn load_kiro_archive(session: &ChatSession) -> Result<ChatArchive> {
@@ -1645,9 +1545,9 @@ fn load_kiro_archive(session: &ChatSession) -> Result<ChatArchive> {
     let jsonl = meta_path.with_extension("jsonl");
     let mut messages = Vec::new();
     let mut tools = Vec::new();
+    let mut tool_ids: HashMap<String, usize> = HashMap::new();
     let mut raw_events = Vec::new();
 
-    // Preserve session_state so imported sessions can be resumed by Kiro.
     if let Ok(meta_str) = fs::read_to_string(&meta_path) {
         if let Ok(meta_val) = serde_json::from_str::<Value>(&meta_str) {
             if let Some(state) = meta_val.get("session_state") {
@@ -1665,24 +1565,11 @@ fn load_kiro_archive(session: &ChatSession) -> Result<ChatArchive> {
             if let Some(message) = kiro_message_from_event(&value) {
                 messages.push(message);
             }
-            if let Some(tool) = kiro_tool_from_event(&value) {
-                tools.push(tool);
-            }
+            kiro_collect_tools(&value, &mut tool_ids, &mut tools);
             raw_events.push(value);
         }
     }
-    Ok(ChatArchive {
-        schema_version: ARCHIVE_VERSION,
-        source_provider: session.provider,
-        source_session_id: session.id.clone(),
-        title: session.title.clone(),
-        project_path: session.project_path.clone(),
-        created_at: session.created_at.clone(),
-        updated_at: Some(session.updated_at.clone()),
-        messages,
-        tool_calls: tools,
-        raw_events,
-    })
+    Ok(archive_from(session, messages, tools, raw_events))
 }
 
 fn update_meta_from_event(_provider: ChatProvider, value: &Value, meta: &mut SessionMeta) {
@@ -1717,7 +1604,6 @@ fn update_meta_from_event(_provider: ChatProvider, value: &Value, meta: &mut Ses
         .map(short_title);
     }
     if let Some(role) = str_field(event, &["role"]) {
-        // Context dumps injected as developer/system turns are not conversation.
         if !matches!(role, "system" | "developer") {
             meta.role_turns += 1;
         }
@@ -1750,15 +1636,10 @@ fn tool_title(value: &Value) -> Option<&str> {
         .and_then(|v| str_field(v, &["title", "summary"]))
 }
 
-/// Extract a chat message from a JSONL event. The bool reports whether the
-/// role was inferred from a typed marker (`event_msg`) rather than an explicit
-/// `role` field — Codex rollouts carry both encodings for the same turn.
 fn message_from_event(value: &Value) -> Option<(ChatMessage, bool)> {
     let event = value.get("payload").unwrap_or(value);
     let payload_type = str_field(event, &["type"]).or_else(|| str_field(value, &["type"]));
     let (role, from_marker) = match str_field(event, &["role"]) {
-        // Context dumps injected as system/developer turns are not chat; they
-        // stay in raw_events for lossless restore.
         Some("system" | "developer") => return None,
         Some(role) => (role, false),
         None => match payload_type? {
@@ -1790,31 +1671,112 @@ fn message_from_event(value: &Value) -> Option<(ChatMessage, bool)> {
 }
 
 fn kiro_message_from_event(value: &Value) -> Option<ChatMessage> {
-    let kind = str_field(value, &["kind"])?;
-    let role = match kind {
+    let role = match str_field(value, &["kind"])? {
         "Prompt" => "user",
         "AssistantMessage" => "assistant",
-        "ToolResults" => "tool",
         _ => return None,
     };
     let data = value.get("data").unwrap_or(value);
     let text = data
         .get("content")
-        .and_then(text_from_value)
+        .map(kiro_text_from_content)
         .unwrap_or_default();
-    if text.trim().is_empty() {
+    if text.trim().is_empty() && kiro_tool_use_blocks(data).next().is_none() {
         return None;
     }
     Some(ChatMessage {
         role: role.into(),
-        timestamp: str_field(data, &["timestamp"]).map(ToOwned::to_owned),
+        timestamp: kiro_event_timestamp(data),
         text,
     })
 }
 
+fn kiro_event_timestamp(data: &Value) -> Option<String> {
+    let value = data
+        .get("meta")
+        .and_then(|meta| meta.get("timestamp"))
+        .or_else(|| data.get("timestamp"))?;
+    let secs = match value.as_i64() {
+        Some(secs) => secs,
+        None => parse_epoch_millis(value.as_str()?)? / 1000,
+    };
+    Some(fmt_iso(secs.max(0) as u64))
+}
+
+fn kiro_text_from_content(content: &Value) -> String {
+    let Some(blocks) = content.as_array() else {
+        return text_from_value(content).unwrap_or_default();
+    };
+    blocks
+        .iter()
+        .filter(|block| !matches!(str_field(block, &["kind"]), Some("toolUse" | "toolResult")))
+        .filter_map(|block| block.get("data").and_then(text_from_value))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn kiro_tool_use_blocks(data: &Value) -> impl Iterator<Item = &Value> {
+    data.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| str_field(block, &["kind"]) == Some("toolUse"))
+        .filter_map(|block| block.get("data"))
+}
+
+fn kiro_collect_tools(
+    value: &Value,
+    calls: &mut HashMap<String, usize>,
+    tools: &mut Vec<ChatToolCall>,
+) {
+    let kind = str_field(value, &["kind"]);
+    let data = value.get("data").unwrap_or(value);
+    if kind == Some("AssistantMessage") {
+        for block in kiro_tool_use_blocks(data) {
+            if let Some(id) = str_field(block, &["toolUseId"]) {
+                calls.insert(id.to_string(), tools.len());
+            }
+            tools.push(ChatToolCall {
+                name: str_field(block, &["name"]).unwrap_or("tool").into(),
+                timestamp: kiro_event_timestamp(data),
+                summary: block
+                    .get("input")
+                    .map(summarize_tool)
+                    .unwrap_or_else(|| "tool call".into()),
+            });
+        }
+    } else if kind == Some("ToolResults") {
+        let blocks = data
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        for block in blocks {
+            if str_field(block, &["kind"]) != Some("toolResult") {
+                continue;
+            }
+            let Some(result) = block.get("data") else {
+                continue;
+            };
+            let outcome = result.get("content").and_then(text_from_value);
+            match str_field(result, &["toolUseId"]).and_then(|id| calls.get(id)) {
+                Some(&index) => {
+                    if let Some(outcome) = outcome {
+                        tools[index].summary = outcome;
+                    }
+                }
+                None => tools.push(ChatToolCall {
+                    name: "tool".into(),
+                    timestamp: kiro_event_timestamp(data),
+                    summary: outcome.unwrap_or_else(|| "tool results".into()),
+                }),
+            }
+        }
+    }
+}
+
 fn tool_from_event(value: &Value) -> Option<ChatToolCall> {
     let event = value.get("payload").unwrap_or(value);
-    // Claude nests tool_use blocks inside message.content arrays.
     let nested = event
         .get("message")
         .and_then(|message| message.get("content"))
@@ -1842,21 +1804,6 @@ fn tool_from_event(value: &Value) -> Option<ChatToolCall> {
             .or_else(|| str_field(value, &["timestamp"]))
             .map(ToOwned::to_owned),
         summary: summarize_tool(tool),
-    })
-}
-
-fn kiro_tool_from_event(value: &Value) -> Option<ChatToolCall> {
-    if str_field(value, &["kind"]) != Some("ToolResults") {
-        return None;
-    }
-    let data = value.get("data")?;
-    Some(ChatToolCall {
-        name: "tool".into(),
-        timestamp: str_field(data, &["timestamp"]).map(ToOwned::to_owned),
-        summary: data
-            .get("results")
-            .map(summarize_tool)
-            .unwrap_or_else(|| "tool results".into()),
     })
 }
 
@@ -1901,18 +1848,14 @@ fn available_restore_path(path: &Path) -> PathBuf {
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chat");
-    let ext = path.extension().and_then(|s| s.to_str());
-    for n in 2usize.. {
-        let name = match ext {
-            Some(ext) => format!("{stem}-restored-{n}.{ext}"),
-            None => format!("{stem}-restored-{n}"),
-        };
-        let candidate = parent.join(name);
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    unreachable!("infinite loop always returns")
+    let suffix = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map_or(String::new(), |ext| format!(".{ext}"));
+    (2u32..)
+        .map(|n| parent.join(format!("{stem}-restored-{n}{suffix}")))
+        .find(|candidate| !candidate.exists())
+        .expect("the candidate sequence is infinite")
 }
 
 fn project_label_from_path(provider: ChatProvider, _root: &Path, path: &Path) -> String {
@@ -1921,7 +1864,7 @@ fn project_label_from_path(provider: ChatProvider, _root: &Path, path: &Path) ->
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
-            .map(|s| s.replace('-', std::path::MAIN_SEPARATOR_STR))
+            .map(decode_claude_project_slug)
             .unwrap_or_else(|| "Claude project".into()),
         _ => path
             .parent()
@@ -1936,13 +1879,53 @@ fn first_string(value: Option<&Value>) -> Option<&str> {
         .and_then(|arr| arr.iter().find_map(Value::as_str))
 }
 
-fn kiro_sessions_dir() -> Result<PathBuf> {
-    kiro_sessions_dir_from(env::var_os("KIRO_HOME").filter(|value| !value.is_empty()))
+fn decode_claude_project_slug(slug: &str) -> String {
+    fn render(slug: &str, keep_word_hyphens: bool) -> String {
+        let sep = std::path::MAIN_SEPARATOR;
+        let (drive, rest) = match slug.as_bytes() {
+            [letter, b'-', ..] if letter.is_ascii_alphabetic() => {
+                (format!("{}:", *letter as char), &slug[2..])
+            }
+            _ => (String::new(), slug),
+        };
+        let mut out = drive;
+        let mut first_run = true;
+        let mut chars = rest.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '-' {
+                out.push(c);
+                continue;
+            }
+            let mut run = 1usize;
+            while chars.peek() == Some(&'-') {
+                chars.next();
+                run += 1;
+            }
+            if !first_run && keep_word_hyphens && run == 1 {
+                out.push('-');
+            } else {
+                out.push(sep);
+            }
+            first_run = false;
+        }
+        out
+    }
+
+    let relaxed = render(slug, true);
+    if std::path::Path::new(&relaxed).is_dir()
+        || !std::path::Path::new(&render(slug, false)).is_dir()
+    {
+        return relaxed;
+    }
+    render(slug, false)
 }
 
-fn kiro_sessions_dir_from(override_home: Option<std::ffi::OsString>) -> Result<PathBuf> {
+fn kiro_sessions_dir() -> Result<PathBuf> {
+    kiro_sessions_dir_from(crate::provider::env_path("KIRO_HOME"))
+}
+
+fn kiro_sessions_dir_from(override_home: Option<PathBuf>) -> Result<PathBuf> {
     let base = override_home
-        .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".kiro")))
         .ok_or_else(|| anyhow!("cannot resolve Kiro home"))?;
     Ok(base.join("sessions").join("cli"))
@@ -1954,8 +1937,6 @@ fn restore_claude_native(archive: &ChatArchive, project_dir: Option<&Path>) -> R
         .map(|p| p.to_string_lossy().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| archive.project_path.clone());
-    // Claude stores sessions under a slug of the project path with path
-    // separators replaced by '-' (e.g. D:\AI\FFmpeg-TUI -> D--AI-FFmpeg-TUI).
     let project_id = claude_project_slug(&cwd);
     let dir = home.join("projects").join(&project_id);
     fs::create_dir_all(&dir)?;
@@ -1965,9 +1946,6 @@ fn restore_claude_native(archive: &ChatArchive, project_dir: Option<&Path>) -> R
     let mut log = String::new();
     if archive.raw_events.is_empty() {
         let now = fmt_iso(unix_now());
-        // Every real Claude Code turn line threads to its predecessor via
-        // parentUuid and carries isSidechain/userType; without the chain the
-        // resumed conversation cannot be ordered.
         let mut previous_uuid: Option<String> = None;
         for (index, msg) in archive.messages.iter().enumerate() {
             let ts = msg.timestamp.as_deref().unwrap_or(&now);
@@ -2004,7 +1982,6 @@ fn restore_claude_native(archive: &ChatArchive, project_dir: Option<&Path>) -> R
     Ok(path)
 }
 
-/// Slug-encode a project path the way Claude Code names `projects/` folders.
 fn claude_project_slug(cwd: &str) -> String {
     let slug: String = cwd
         .chars()
@@ -2020,8 +1997,6 @@ fn claude_project_slug(cwd: &str) -> String {
     }
 }
 
-/// Derive the `proj_<slug>` id ZCode's current schema uses for per-project
-/// grouping (observed: `D:\AI\AgentSwitch` -> `proj_d-ai-agentswitch`).
 fn opencode_project_id(directory: &str) -> String {
     let slug: String = directory
         .chars()
@@ -2045,8 +2020,6 @@ fn restore_kiro_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Res
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| archive.project_path.clone());
     let now = fmt_iso(unix_now());
-
-    // Extract preserved session_state from raw_events if available.
     let session_state = archive.raw_events.iter()
         .find_map(|v| v.get("__agentswitch_kiro_meta")?.get("session_state").cloned())
         .unwrap_or_else(|| serde_json::json!({"version":"v1","conversation_metadata":{"user_turn_metadatas":[],"user_turn_start_request":null,"last_request":null}}));
@@ -2072,22 +2045,28 @@ fn restore_kiro_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Res
                 "tool" => "ToolResults",
                 _ => continue,
             };
-            // Real Kiro events identify each turn with a message_id and a
-            // meta.timestamp (unix seconds).
             let timestamp = msg
                 .timestamp
                 .as_deref()
                 .and_then(parse_epoch_millis)
                 .map(|ms| ms / 1000)
                 .unwrap_or(now_secs);
+            let block_kind = if kind == "ToolResults" {
+                "toolResult"
+            } else {
+                "text"
+            };
+            let mut data = serde_json::json!({
+                "message_id": gen_uuid(),
+                "content": [{"kind": block_kind, "data": msg.text}],
+            });
+            if kind == "Prompt" {
+                data["meta"] = serde_json::json!({"timestamp": timestamp});
+            }
             let ev = serde_json::json!({
                 "version": "v1",
                 "kind": kind,
-                "data": {
-                    "message_id": gen_uuid(),
-                    "content": [{"kind": "text", "data": msg.text}],
-                    "meta": {"timestamp": timestamp},
-                }
+                "data": data,
             });
             log.push_str(&serde_json::to_string(&ev)?);
             log.push('\n');
@@ -2106,8 +2085,6 @@ fn restore_kiro_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Res
 }
 
 fn restore_codex_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Result<PathBuf> {
-    // Honor CODEX_HOME exactly like the scanner does; writing into ~/.codex
-    // while the user's real store lives elsewhere made imports vanish.
     let home = codex_home().ok_or_else(|| anyhow!("no home dir"))?;
     let cwd = project_dir
         .map(|p| p.to_string_lossy().to_string())
@@ -2115,8 +2092,7 @@ fn restore_codex_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Re
         .unwrap_or_else(|| archive.project_path.clone());
     let id = gen_uuid();
     let now_iso = fmt_iso(unix_now());
-    // date subdir YYYY/MM/DD
-    let date_part = &now_iso[..10]; // "YYYY-MM-DD"
+    let date_part = &now_iso[..10];
     let parts: Vec<&str> = date_part.split('-').collect();
     let dir = home
         .join("sessions")
@@ -2125,17 +2101,13 @@ fn restore_codex_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Re
         .join(parts[2]);
     fs::create_dir_all(&dir)?;
 
-    let ts_file = now_iso[..19].replace(':', "-"); // for filename
+    let ts_file = now_iso[..19].replace(':', "-");
     let filename = format!("rollout-{ts_file}-{id}.jsonl");
     let rollout_path = dir.join(&filename);
 
     let mut log = String::new();
     let mut registered_id = id.clone();
     if archive.raw_events.is_empty() {
-        // Codex resumes a thread by parsing its own strict schemas: a full
-        // SessionMeta line (missing fields make the whole rollout unparseable)
-        // plus response_item messages, with event_msg echoes alongside like
-        // live sessions carry.
         let meta_line = serde_json::json!({
             "timestamp": &now_iso,
             "type": "session_meta",
@@ -2160,7 +2132,6 @@ fn restore_codex_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Re
         for (msg_index, msg) in archive.messages.iter().enumerate() {
             let (role, content_type, event_type) = match msg.role.as_str() {
                 "user" => ("user", "input_text", "user_message"),
-                // Real Codex rollouts label assistant turns "agent_message".
                 "assistant" => ("assistant", "output_text", "agent_message"),
                 _ => continue,
             };
@@ -2190,7 +2161,6 @@ fn restore_codex_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Re
             log.push_str(&serde_json::to_string(ev)?);
             log.push('\n');
         }
-        // A replayed native rollout carries its own canonical thread id.
         for ev in &archive.raw_events {
             if ev.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
                 if let Some(found) = ev
@@ -2206,7 +2176,6 @@ fn restore_codex_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Re
     }
     atomic_write(&rollout_path, log.as_bytes())?;
 
-    // Append to session_index.jsonl
     let index_path = home.join("session_index.jsonl");
     let entry = serde_json::json!({"id": &registered_id, "thread_name": &archive.title, "updated_at": &now_iso});
     let mut f = fs::OpenOptions::new()
@@ -2232,9 +2201,6 @@ fn restore_codex_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Re
     Ok(rollout_path)
 }
 
-/// Newest `state_N.sqlite` in CODEX_HOME. Codex lists `/resume` threads from
-/// this database without scanning the sessions directory, so a converted
-/// rollout must also get a row here or Codex never shows it.
 fn codex_state_db_path() -> Option<PathBuf> {
     let home = codex_home()?;
     let mut best: Option<(u32, PathBuf)> = None;
@@ -2259,8 +2225,6 @@ fn codex_state_db_path() -> Option<PathBuf> {
     best.map(|(_, path)| path)
 }
 
-/// Codex normalizes Windows cwds to verbatim (`\\?\`) form before storing them
-/// in its state database; match that so the row behaves like a native one.
 fn codex_state_cwd(cwd: &str) -> String {
     if cfg!(windows) && !cwd.starts_with("\\\\?\\") && Path::new(cwd).is_absolute() {
         format!("\\\\?\\{cwd}")
@@ -2277,10 +2241,6 @@ fn truncate_chars(text: &str, max: usize) -> String {
     }
 }
 
-/// Register a converted/imported rollout in Codex's state database so it
-/// appears in `/resume`. Column values mirror what Codex's own extractor
-/// writes for CLI-authored sessions. INSERT OR IGNORE never modifies an
-/// existing row; missing state databases mean an older Codex that scans disk.
 #[allow(clippy::too_many_arguments)]
 fn codex_state_register(
     rollout_path: &Path,
@@ -2304,7 +2264,7 @@ fn codex_state_register(
     let result = (|| -> Result<()> {
         conn.execute(
             "INSERT OR IGNORE INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, first_user_message, preview, recency_at, recency_at_ms, created_at_ms, updated_at_ms, thread_source) \
-             VALUES (?1, ?2, ?3, ?4, 'cli', 'openai', ?5, ?6, '{\"type\":\"read-only\"}', 'never', ?7, ?7, ?4, ?8, ?9, ?4, 'user')",
+             VALUES (?1, ?2, ?3, ?4, 'cli', 'openai', ?5, ?6, '{\"type\":\"read-only\"}', 'never', ?7, ?7, ?4, ?8, ?9, ?8, 'user')",
             rusqlite::params![
                 session_id,
                 rollout_path.to_string_lossy(),
@@ -2319,18 +2279,9 @@ fn codex_state_register(
         )?;
         Ok(())
     })();
-    match result {
-        Ok(()) => conn.execute_batch("COMMIT")?,
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(error);
-        }
-    }
-    Ok(())
+    finish_tx(&conn, result)
 }
 
-/// Best-effort row removal when a Codex rollout leaves the store (Trash,
-/// permanent delete); a leftover row would point `/resume` at a missing file.
 fn codex_state_unregister(rollout_path: &Path) {
     let Some(db_path) = codex_state_db_path() else {
         return;
@@ -2353,9 +2304,6 @@ fn restore_opencode_native(
     insert_opencode_session(db_path, archive, project_dir, None, None, None)
 }
 
-/// Insert a chat as session/message/part rows. Shared by native import and by
-/// trash-restore, which passes the original session id and timestamps so a
-/// restored chat keeps its identity.
 fn insert_opencode_session(
     db_path: &Path,
     archive: &ChatArchive,
@@ -2368,8 +2316,6 @@ fn insert_opencode_session(
     conn.busy_timeout(std::time::Duration::from_secs(3))?;
     let requested = session_id.filter(|id| !id.is_empty());
     let id = match requested {
-        // A stale row with the same id (e.g. the harness recreated the chat)
-        // must not swallow the restore; fall back to a fresh id.
         Some(requested)
             if conn
                 .query_row(
@@ -2393,14 +2339,8 @@ fn insert_opencode_session(
     let created_ms = created_ms
         .or_else(|| archive.created_at.as_deref().and_then(parse_epoch_millis))
         .unwrap_or(now_ms);
-    // One transaction: a half-imported session in a live provider database is
-    // worse than a failed import.
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<()> {
-        // Current ZCode schemas group sessions under a projects row keyed
-        // `proj_<slug>`; mirror that instead of a foreign "imported" tag so
-        // the chat shows up wherever ZCode lists per-project sessions. The
-        // optional columns only exist on newer schemas, so probe first.
         let tables = sqlite_tables(&conn)?;
         let session_columns = sqlite_columns(&conn, "session")?;
         let project_id = if dir.is_empty() {
@@ -2420,8 +2360,6 @@ fn insert_opencode_session(
                 )?;
             }
         }
-        // Adopt the store's own app version so the row does not stand out;
-        // fall back to "1" on an empty database.
         let version: String = conn
             .query_row(
                 "SELECT version FROM session ORDER BY time_updated DESC LIMIT 1",
@@ -2475,8 +2413,6 @@ fn insert_opencode_session(
                 "INSERT OR IGNORE INTO message (id, session_id, time_created, time_updated, data) VALUES (?1,?2,?3,?4,?5)",
                 rusqlite::params![&msg_id, &id, now_ms + i as i64, now_ms + i as i64, &data],
             )?;
-            // Browsers read message text from part rows; a bare message blob
-            // would show up as an empty turn.
             let part_id = format!("{msg_id}-part-0");
             let part_data = serde_json::json!({"type": "text", "text": &msg.text}).to_string();
             conn.execute(
@@ -2486,18 +2422,10 @@ fn insert_opencode_session(
         }
         Ok(())
     })();
-    match result {
-        Ok(()) => conn.execute_batch("COMMIT")?,
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(error);
-        }
-    }
+    finish_tx(&conn, result)?;
     Ok(db_path.to_path_buf())
 }
 
-/// Put a trashed database chat back into its provider's SQLite store,
-/// preferring the database it was deleted from.
 fn restore_db_session_from_trash(
     manifest: &DeleteManifest,
     manifest_path: &Path,
@@ -2531,7 +2459,6 @@ fn restore_db_session_from_trash(
     Ok(db_path)
 }
 
-/// ZCode sessions live in the same session/message/part schema OpenCode uses.
 fn restore_zcode_native(
     archive: &ChatArchive,
     project_dir: Option<&Path>,
@@ -2540,8 +2467,6 @@ fn restore_zcode_native(
     restore_opencode_native(archive, project_dir, db_path)
 }
 
-/// Accepts raw epoch seconds/millis and the "unix:<seconds>" labels this app
-/// writes; anything else fails instead of silently becoming "now".
 fn parse_epoch_millis(label: &str) -> Option<i64> {
     if let Some(raw) = label.strip_prefix("unix:") {
         return raw.parse::<i64>().ok().map(|secs| secs * 1000);
@@ -2557,8 +2482,6 @@ fn parse_epoch_millis(label: &str) -> Option<i64> {
 }
 
 fn gen_uuid() -> String {
-    // Real v4 randomness: these ids are written into provider stores where a
-    // predictable, hash-derived id could collide with or impersonate sessions.
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -2601,12 +2524,7 @@ fn kiro_turn_count(path: &Path) -> usize {
     };
     jsonl_lines(file)
         .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-        .filter(|value| {
-            matches!(
-                str_field(value, &["kind"]),
-                Some("Prompt" | "AssistantMessage")
-            )
-        })
+        .filter_map(|value| kiro_message_from_event(&value))
         .count()
 }
 
@@ -2655,13 +2573,9 @@ fn text_from_value(value: &Value) -> Option<String> {
     }
 }
 
-/// Codex store root: `$CODEX_HOME` when set, else `~/.codex`. Shared by the
-/// scanner, title index, and native restore so they always agree.
 fn codex_home() -> Option<PathBuf> {
-    if let Some(custom) = env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(custom));
-    }
-    dirs::home_dir().map(|home| home.join(".codex"))
+    crate::provider::env_path("CODEX_HOME")
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
 }
 
 fn codex_titles() -> HashMap<String, String> {
@@ -2809,6 +2723,22 @@ mod tests {
     use std::io::Read;
 
     #[test]
+    fn claude_project_labels_keep_word_hyphens() {
+        let sep = std::path::MAIN_SEPARATOR;
+        // Runs of two or more hyphens always decode to separators, and both
+        // interpretations agree, so this holds on every machine.
+        assert_eq!(
+            decode_claude_project_slug("D--AI--AgentSwitch"),
+            format!("D:{sep}AI{sep}AgentSwitch")
+        );
+        // Neither interpretation exists on disk, so the word-hyphen reading wins.
+        assert_eq!(
+            decode_claude_project_slug("Q--No-Such-Dir"),
+            format!("Q:{sep}No-Such-Dir")
+        );
+    }
+
+    #[test]
     fn parses_codex_jsonl_metadata_and_messages() {
         let dir = temp_test_dir("codex-jsonl");
         let file = dir.join("rollout-abc.jsonl");
@@ -2897,7 +2827,7 @@ mod tests {
             let session = jsonl_session(ChatProvider::Codex, &dir, &file).unwrap();
             soft_delete(&session).unwrap();
             assert!(!file.exists());
-            let trash = scan_trash();
+            let trash = scan_trash(None);
             assert_eq!(trash.len(), 1);
             assert_eq!(trash[0].title, session.title);
             assert_eq!(trash[0].project_path, session.project_path);
@@ -2906,9 +2836,9 @@ mod tests {
             assert!(file.exists());
             let session = jsonl_session(ChatProvider::Codex, &dir, &file).unwrap();
             soft_delete(&session).unwrap();
-            let trash = scan_trash();
+            let trash = scan_trash(None);
             delete_trash_forever(&trash[0]).unwrap();
-            assert!(scan_trash().is_empty());
+            assert!(scan_trash(None).is_empty());
         });
     }
 
@@ -2916,9 +2846,6 @@ mod tests {
         with_env_vars(&[(name, value)], run)
     }
 
-    /// Set several env vars for one closure. The env mutex is not reentrant,
-    /// so tests needing two vars at once must use this instead of nesting
-    /// `with_env_var` calls, which would deadlock.
     fn with_env_vars<T>(vars: &[(&str, &Path)], run: impl FnOnce() -> T) -> T {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
@@ -2961,13 +2888,140 @@ mod tests {
                 + r#"{"version":1,"kind":"AssistantMessage","data":{"message_id":"a1","content":[{"kind":"text","data":"hello back"}]}}"#,
         )
         .unwrap();
-        let sessions = with_env_var("KIRO_HOME", &kiro_home, || scan_kiro(Path::new("D:\\AI")));
+        let sessions = with_env_var("KIRO_HOME", &kiro_home, scan_kiro);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title, "Kiro title");
         assert_eq!(sessions[0].turn_count, 2);
+        assert!(!sessions[0].subagent);
         let archive = load_archive(&sessions[0]).unwrap();
         assert_eq!(archive.messages.len(), 2);
         assert_eq!(archive.messages[0].text, "hello kiro");
+    }
+
+    #[test]
+    fn kiro_sessions_surface_globally_and_badge_subagents() {
+        let dir = temp_test_dir("kiro-global");
+        let cli = dir.join(".kiro").join("sessions").join("cli");
+        fs::create_dir_all(&cli).unwrap();
+        let id = "11111111-2222-3333-4444-555555555555";
+        fs::write(
+            cli.join(format!("{id}.json")),
+            format!(
+                r#"{{"session_id":"{id}","cwd":"C:\\elsewhere","created_at":"2026-05-01T00:00:00Z","updated_at":"2026-05-01T00:01:00Z","title":"Main chat","session_created_reason":"user","session_state":{{}}}}"#
+            ),
+        )
+        .unwrap();
+        let sub_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        fs::write(
+            cli.join(format!("{sub_id}.json")),
+            format!(
+                r#"{{"session_id":"{sub_id}","cwd":"C:\\elsewhere","created_at":"2026-05-01T00:02:00Z","updated_at":"2026-05-01T00:03:00Z","title":"Helper chat","session_created_reason":"subagent","session_state":{{}}}}"#
+            ),
+        )
+        .unwrap();
+        for sid in [id, sub_id] {
+            fs::write(
+                cli.join(format!("{sid}.jsonl")),
+                r#"{"version":1,"kind":"Prompt","data":{"message_id":"u1","content":[{"kind":"text","data":"hi"}]}}"#,
+            )
+            .unwrap();
+        }
+        let sessions = with_env_var("KIRO_HOME", &dir.join(".kiro"), scan_kiro);
+        assert_eq!(sessions.len(), 2);
+        let by_id: std::collections::HashMap<_, _> = sessions
+            .iter()
+            .map(|s| (s.id.as_str(), s.subagent))
+            .collect();
+        assert!(!by_id[id]);
+        assert!(by_id[sub_id]);
+    }
+
+    #[test]
+    fn kiro_tool_use_blocks_become_tool_calls_with_outcomes() {
+        let dir = temp_test_dir("kiro-tools");
+        let cli = dir.join(".kiro").join("sessions").join("cli");
+        fs::create_dir_all(&cli).unwrap();
+        let id = "11111111-2222-3333-4444-555555555555";
+        fs::write(
+            cli.join(format!("{id}.json")),
+            format!(
+                r#"{{"session_id":"{id}","cwd":"D:\\AI","created_at":"2026-05-01T00:00:00Z","updated_at":"2026-05-01T00:01:00Z","title":"Tool chat","session_state":{{}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            cli.join(format!("{id}.jsonl")),
+            r#"{"kind":"Prompt","data":{"message_id":"u1","content":[{"kind":"text","data":"list files"}],"meta":{"timestamp":1787510770}}}"#
+                .to_string()
+                + "\n"
+                + r#"{"kind":"AssistantMessage","data":{"message_id":"a1","content":[{"kind":"toolUse","data":{"toolUseId":"toolu_1","name":"glob","input":{"pattern":"*.rs"}}}]}}"#
+                + "\n"
+                + r#"{"kind":"ToolResults","data":{"message_id":"t1","content":[{"kind":"toolResult","data":{"toolUseId":"toolu_1","content":[{"kind":"json","data":["main.rs"]}]}}]}}"#
+                + "\n"
+                + r#"{"kind":"AssistantMessage","data":{"message_id":"a2","content":[{"kind":"text","data":"found main.rs"}]}}"#,
+        )
+        .unwrap();
+
+        let sessions = with_env_var("KIRO_HOME", &dir.join(".kiro"), scan_kiro);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].turn_count, 3);
+        let archive = load_archive(&sessions[0]).unwrap();
+        assert_eq!(archive.messages.len(), sessions[0].turn_count);
+        assert!(archive.messages[1].text.trim().is_empty());
+        assert_eq!(archive.messages[2].text, "found main.rs");
+        assert_eq!(archive.tool_calls.len(), 1);
+        let call = &archive.tool_calls[0];
+        assert_eq!(call.name, "glob");
+        assert!(
+            call.summary.contains("main.rs"),
+            "outcome replaces the input summary: {}",
+            call.summary
+        );
+    }
+
+    #[test]
+    fn failed_kiro_trash_moves_session_files_back() {
+        let dir = temp_test_dir("kiro-rollback");
+        let kiro_home = dir.join(".kiro");
+        let cli = kiro_home.join("sessions").join("cli");
+        fs::create_dir_all(&cli).unwrap();
+        let id = "11111111-2222-3333-4444-555555555555";
+        fs::write(
+            cli.join(format!("{id}.json")),
+            format!(
+                r#"{{"session_id":"{id}","cwd":"D:\\AI","created_at":"2026-05-01T00:00:00Z","updated_at":"2026-05-01T00:01:00Z","title":"Rollback chat","session_state":{{}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            cli.join(format!("{id}.jsonl")),
+            r#"{"kind":"Prompt","data":{"message_id":"u1","content":[{"kind":"text","data":"hi"}]}}"#,
+        )
+        .unwrap();
+        fs::write(cli.join(format!("{id}.lock")), "lock").unwrap();
+        let data = dir.join("data");
+
+        with_env_vars(
+            &[("KIRO_HOME", &kiro_home), ("AGENT_SWITCH_DATA_DIR", &data)],
+            || {
+                let session = scan_kiro().remove(0);
+                let stem = safe_file_stem(&format!("{}-{}", session.id, session.title));
+                let trash_dir = trash_dir().join("kiro");
+                fs::create_dir_all(trash_dir.join(format!("{stem}.delete.json"))).unwrap();
+
+                assert!(soft_delete(&session).is_err());
+                assert!(
+                    scan_trash(None).is_empty(),
+                    "a failed trash must not leave a discoverable manifest"
+                );
+                for ext in ["json", "jsonl", "lock"] {
+                    assert!(
+                        cli.join(format!("{id}.{ext}")).exists(),
+                        "{ext} was rolled back to its origin"
+                    );
+                }
+            },
+        );
     }
 
     #[test]
@@ -2993,7 +3047,7 @@ mod tests {
         )
         .unwrap();
 
-        let sessions = with_env_var("KIRO_HOME", &kiro_home, || scan_kiro(Path::new("D:\\orig")));
+        let sessions = with_env_var("KIRO_HOME", &kiro_home, scan_kiro);
         assert_eq!(sessions.len(), 1);
 
         let archive_path = dir.join("kiro-export.agentswitch-chat.json");
@@ -3041,6 +3095,26 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn empty_or_relative_home_overrides_fall_back_to_defaults() {
+        let home = dirs::home_dir().unwrap();
+        with_env_vars(
+            &[
+                ("KIRO_HOME", Path::new("")),
+                ("CLAUDE_CONFIG_DIR", Path::new("")),
+                ("CODEX_HOME", Path::new("relative/path")),
+            ],
+            || {
+                assert_eq!(
+                    kiro_sessions_dir().unwrap(),
+                    home.join(".kiro").join("sessions").join("cli")
+                );
+                assert_eq!(claude_home().unwrap(), home.join(".claude"));
+                assert_eq!(codex_home().unwrap(), home.join(".codex"));
+            },
+        );
     }
 
     #[test]
@@ -3205,13 +3279,10 @@ mod tests {
             &file,
             r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"dup1","cwd":"D:/work/dup"}}"#.to_string()
                 + "\n"
-                // authoritative role-bearing record
                 + r#"{"timestamp":"2026-05-01T00:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"build it"}]}}"#
                 + "\n"
-                // UI echo of the same turn
                 + r#"{"timestamp":"2026-05-01T00:01:01Z","type":"event_msg","payload":{"type":"user_message","message":"build it"}}"#
                 + "\n"
-                // developer context must not count as a turn
                 + r#"{"timestamp":"2026-05-01T00:01:02Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"context dump"}]}}"#,
         )
         .unwrap();
@@ -3278,8 +3349,6 @@ mod tests {
                 first["message"]["content"][0]["text"],
                 "hello from the archive"
             );
-            // Real Claude Code lines thread via parentUuid and mark user
-            // turns; without the chain a resumed conversation cannot order.
             assert_eq!(
                 first["parentUuid"],
                 serde_json::Value::Null,
@@ -3296,7 +3365,6 @@ mod tests {
 
     #[test]
     fn timestamp_sort_key_orders_unix_and_iso_labels() {
-        // 2026-06-05T00:00:00Z == 1780617600
         assert!(timestamp_sort_key("unix:1780617700") > timestamp_sort_key("2026-06-05T00:00:00Z"));
         assert!(timestamp_sort_key("unix:1780617500") < timestamp_sort_key("2026-06-05T00:00:00Z"));
         assert!(
@@ -3483,9 +3551,6 @@ mod tests {
 
         let archive_path = dir.join("claude.agentswitch-chat.json");
         export_session(&sessions[0], &archive_path).unwrap();
-
-        // Import into a second, empty Claude home and verify the restored
-        // session lands under the slug directory Claude Code actually reads.
         let home_b = dir.join("home-b");
         let restored = with_env_var("CLAUDE_CONFIG_DIR", &home_b, || {
             import_archive(&archive_path, None).unwrap()
@@ -3533,7 +3598,6 @@ mod tests {
             import_archive(&archive_path, None).unwrap();
         });
 
-        // The restored rollout must land under CODEX_HOME, not ~/.codex.
         let found: Vec<PathBuf> = WalkDir::new(home_b.join("sessions"))
             .into_iter()
             .filter_map(|e| e.ok())
@@ -3559,8 +3623,6 @@ mod tests {
         let dir = temp_test_dir("zip-roundtrip");
         let data = dir.join("data");
         with_env_var("AGENT_SWITCH_DATA_DIR", &data, || {
-            // Two archives for Antigravity — a provider whose native chat store
-            // is encrypted, so imports must stay neutral AgentSwitch archives.
             let make_archive = |id: &str, text: &str| ChatArchive {
                 schema_version: ARCHIVE_VERSION,
                 source_provider: ChatProvider::Antigravity,
@@ -3609,16 +3671,11 @@ mod tests {
                 scanned.iter().map(|s| s.provider).collect::<Vec<_>>(),
                 vec![ChatProvider::Antigravity, ChatProvider::Antigravity]
             );
-            // Nothing was ever written into an Antigravity-native location.
             let archive = load_archive(&scanned[0]).unwrap();
             assert_eq!(archive.source_provider, ChatProvider::Antigravity);
         });
     }
 
-    /// Proves the full Claude -> Codex migration against the REAL stores on
-    /// this machine: converts one live Claude chat into ~/.codex with native
-    /// rollout lines AND registers it in Codex's state database, so `/resume`
-    /// lists it. Run explicitly: `cargo test -- --ignored`.
     #[test]
     #[ignore = "writes into the local Claude Code and Codex stores"]
     fn live_convert_claude_chat_to_codex_resume() {
@@ -3642,8 +3699,6 @@ mod tests {
         }
     }
 
-    /// Proves discovery + export against the real `~/.claude` store on this
-    /// machine (read-only). Run explicitly: `cargo test -- --ignored`.
     #[test]
     #[ignore = "requires the local Claude Code store"]
     fn live_claude_real_store_scan_and_export() {
@@ -3672,9 +3727,6 @@ mod tests {
         let _ = fs::remove_file(&target);
     }
 
-    /// Proves ZCode chat browsing against the real database on this machine.
-    /// The DB is snapshotted to temp first so the running ZCode instance is
-    /// never touched. Run explicitly: `cargo test -- --ignored`.
     #[test]
     #[ignore = "requires the local ZCode database"]
     fn live_zcode_real_db_snapshot_scan_and_load() {
@@ -3687,7 +3739,6 @@ mod tests {
             eprintln!("no live ZCode db; skipping");
             return;
         }
-        // Snapshot db (+ WAL sidecars) so we read a consistent copy.
         let dir = temp_test_dir("live-zcode");
         for suffix in ["", "-wal", "-shm"] {
             let source = PathBuf::from(format!("{}{suffix}", db.display()));
@@ -3712,7 +3763,6 @@ mod tests {
         );
         assert_eq!(archive.source_provider, ChatProvider::Zcode);
 
-        // Full round trip into a scratch DB snapshot: export then re-import.
         let archive_path = dir.join("live-zcode.agentswitch-chat.json");
         export_session(first, &archive_path).unwrap();
         let imported = with_env_var("ZCODE_DB", &snapshot, || {
@@ -3764,9 +3814,6 @@ mod tests {
             vec![("user", "hello claude"), ("assistant", "hi there")]
         );
 
-        // Schema isolation: raw_events carry the SOURCE harness's layout, so
-        // every line in the new rollout must be Codex-native, never a leaked
-        // Claude {"type":"user"} event.
         let raw = fs::read_to_string(&written).unwrap();
         for line in raw.lines() {
             let ev: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -3778,8 +3825,6 @@ mod tests {
                 "non-Codex schema leaked into converted rollout: {line}"
             );
         }
-        // The meta line must satisfy Codex's full SessionMeta contract or its
-        // own parser rejects the rollout entirely.
         let first: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
         assert_eq!(first["type"], "session_meta");
         assert_eq!(first["payload"]["session_id"], first["payload"]["id"]);
@@ -3788,7 +3833,6 @@ mod tests {
         assert_eq!(first["payload"]["thread_source"], "user");
         assert_eq!(first["payload"]["history_mode"], "legacy");
 
-        // The source chat is left untouched.
         let original = with_env_var("CLAUDE_CONFIG_DIR", &home_a, scan_claude);
         assert_eq!(original.len(), 1);
     }
@@ -3860,7 +3904,6 @@ mod tests {
         assert_eq!(archive.messages.len(), 1);
         assert_eq!(archive.messages[0].text, "migrate me");
 
-        // Source database still holds exactly its own session.
         assert_eq!(with_env_var("OPENCODE_DB", &src_db, scan_opencode).len(), 1);
     }
 
@@ -3878,9 +3921,9 @@ mod tests {
             turn_count: 0,
             size_bytes: 0,
             imported: false,
+            subagent: false,
             trash_manifest: None,
         };
-        // Antigravity on either side is refused: its chats are encrypted.
         let error = convert_session(&make(ChatProvider::Antigravity), ChatProvider::Codex)
             .err()
             .unwrap();
@@ -3889,7 +3932,6 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("encrypted"));
-        // Converting a chat into the provider it already lives in is refused.
         assert!(convert_session(&make(ChatProvider::Claude), ChatProvider::Claude).is_err());
 
         assert_eq!(
@@ -3917,11 +3959,9 @@ mod tests {
         .unwrap();
         let source = with_env_var("CLAUDE_CONFIG_DIR", &home_a, || scan_claude().remove(0));
 
-        // Migration step 1: export harness A's chat to a file.
         let exported = dir.join("claude.demo.agentswitch-chat.json");
         export_session(&source, &exported).unwrap();
 
-        // Migration step 2: convert the file so it belongs to harness B.
         let (converted, skipped) = convert_archive_file(&exported, ChatProvider::Codex).unwrap();
         assert_eq!(skipped, 0);
         assert!(converted
@@ -3938,7 +3978,6 @@ mod tests {
         );
         assert_eq!(retagged.messages.len(), 2);
 
-        // Migration step 3: import the converted file, choosing the project.
         let codex_home = dir.join("codex-home");
         let chosen_project = dir.join("chosen-project");
         fs::create_dir_all(&chosen_project).unwrap();
@@ -3996,8 +4035,6 @@ mod tests {
         assert_eq!(skipped, 0);
         assert!(converted.to_string_lossy().ends_with("-codex.zip"));
 
-        // Every archive entry in the converted ZIP is Codex-tagged and free of
-        // source-harness raw events.
         let mut out = ZipArchive::new(File::open(&converted).unwrap()).unwrap();
         let mut seen = 0;
         for i in 0..out.len() {
@@ -4015,7 +4052,6 @@ mod tests {
         }
         assert_eq!(seen, 2);
 
-        // The converted ZIP imports into a fresh Codex home like any export.
         let codex_home = dir.join("codex-home");
         let report =
             with_env_var("CODEX_HOME", &codex_home, || import_zip(&converted, None)).unwrap();
@@ -4130,8 +4166,6 @@ mod tests {
         with_env_vars(
             &[("AGENT_SWITCH_DATA_DIR", &data), ("ZCODE_DB", &db_path)],
             || {
-                // The harness itself holds the database open while it runs; an
-                // idle open connection must not stop a trash operation.
                 let held = Connection::open(&db_path).unwrap();
                 let _count: i64 = held
                     .query_row("SELECT COUNT(*) FROM session", [], |row| row.get(0))
@@ -4140,9 +4174,8 @@ mod tests {
                 let session = scan_zcode().remove(0);
                 soft_delete(&session).unwrap();
 
-                // Rows are gone from the provider store; the chat lives in Trash.
                 assert!(scan_zcode().is_empty());
-                let trash = scan_trash();
+                let trash = scan_trash(None);
                 assert_eq!(trash.len(), 1);
                 assert_eq!(trash[0].provider, ChatProvider::Zcode);
                 assert_eq!(trash[0].id, "sess_abc");
@@ -4152,7 +4185,6 @@ mod tests {
                 assert_eq!(archived.messages[1].text, "first answer");
                 drop(held);
 
-                // Restore re-inserts the same session with its original identity.
                 restore_from_trash(&trash[0]).unwrap();
                 let restored = scan_zcode();
                 assert_eq!(restored.len(), 1);
@@ -4162,7 +4194,7 @@ mod tests {
                 let back = load_archive(&restored[0]).unwrap();
                 assert_eq!(back.messages.len(), 2);
                 assert_eq!(back.messages[0].text, "first question");
-                assert!(scan_trash().is_empty());
+                assert!(scan_trash(None).is_empty());
             },
         );
     }
@@ -4215,7 +4247,7 @@ mod tests {
                 let session = scan_opencode().remove(0);
                 soft_delete(&session).unwrap();
                 assert!(scan_opencode().is_empty());
-                let trash = scan_trash();
+                let trash = scan_trash(None);
                 assert_eq!(trash.len(), 1);
                 assert_eq!(trash[0].title, "Legacy chat");
                 let archived = load_archive(&trash[0]).unwrap();
@@ -4225,7 +4257,6 @@ mod tests {
         );
     }
 
-    /// DDL mirrors the real `threads` table Codex ships in state_N.sqlite.
     fn codex_threads_db_fixture(path: &Path) {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
@@ -4272,6 +4303,40 @@ mod tests {
         )
         .unwrap();
         conn.close().unwrap();
+    }
+
+    #[test]
+    fn failed_codex_registration_keeps_trash_manifest() {
+        let dir = temp_test_dir("codex-failed-register");
+        let codex_home = dir.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        codex_threads_db_fixture(&codex_home.join("state_5.sqlite"));
+        let data = dir.join("data");
+
+        with_env_vars(
+            &[
+                ("CODEX_HOME", &codex_home),
+                ("AGENT_SWITCH_DATA_DIR", &data),
+            ],
+            || {
+                let sessions_dir = codex_home.join("sessions");
+                fs::create_dir_all(&sessions_dir).unwrap();
+                write_sample_jsonl(&sessions_dir, "rollout-x", dir.to_string_lossy().as_ref());
+                let session = scan_codex().remove(0);
+
+                soft_delete(&session).unwrap();
+                let trash = scan_trash(None);
+                assert_eq!(trash.len(), 1);
+                let manifest_path = trash[0].trash_manifest.clone().unwrap();
+
+                fs::write(codex_home.join("state_5.sqlite"), b"not a database").unwrap();
+                assert!(
+                    restore_from_trash(&trash[0]).is_err(),
+                    "restore must surface the registration failure"
+                );
+                assert!(manifest_path.exists(), "manifest survives a half-restore");
+            },
+        );
     }
 
     #[test]
@@ -4322,7 +4387,6 @@ mod tests {
                     rows
                 };
 
-                // The converted chat is listed by Codex's resume database...
                 let rows = thread_rows();
                 assert_eq!(rows.len(), 1, "converted rollout is indexed");
                 assert_eq!(
@@ -4332,17 +4396,94 @@ mod tests {
                 );
                 assert_eq!(rows[0].2, "cli");
 
-                // Trashing the chat removes the row; restoring re-registers it.
                 let session = scan_codex().remove(0);
                 soft_delete(&session).unwrap();
                 assert!(thread_rows().is_empty(), "trashed chat leaves /resume");
-                let trash = scan_trash();
+                let trash = scan_trash(None);
                 assert_eq!(trash.len(), 1);
                 restore_from_trash(&trash[0]).unwrap();
                 assert!(converted_path.exists());
                 let rows = thread_rows();
                 assert_eq!(rows.len(), 1, "restored chat is listed again");
                 assert_eq!(PathBuf::from(&rows[0].0), converted_path);
+                let conn = Connection::open(&db_path).unwrap();
+                let (secs, ms): (i64, i64) = conn
+                    .query_row("SELECT updated_at, updated_at_ms FROM threads", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .unwrap();
+                drop(conn);
+                assert!(
+                    ms > secs,
+                    "updated_at_ms ({ms}) must exceed updated_at ({secs})"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn restoring_imported_codex_archive_skips_state_database() {
+        let dir = temp_test_dir("codex-imported-restore");
+        let codex_home = dir.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        codex_threads_db_fixture(&codex_home.join("state_5.sqlite"));
+        let data = dir.join("data");
+
+        let archive = ChatArchive {
+            schema_version: 1,
+            source_provider: ChatProvider::Codex,
+            source_session_id: "imported-session".into(),
+            title: "Imported chat".into(),
+            project_path: dir.to_string_lossy().to_string(),
+            created_at: Some("2026-05-01T00:00:00Z".into()),
+            updated_at: Some("2026-05-01T00:01:00Z".into()),
+            messages: vec![crate::chat::ChatMessage {
+                role: "user".into(),
+                timestamp: None,
+                text: "hello imported".into(),
+            }],
+            tool_calls: vec![],
+            raw_events: vec![],
+        };
+        let imports = with_env_var("AGENT_SWITCH_DATA_DIR", &data, imports_dir);
+        fs::create_dir_all(&imports).unwrap();
+        let archive_path = imports.join("codex-imported.agentswitch-chat.json");
+        fs::write(
+            &archive_path,
+            serde_json::to_string_pretty(&archive).unwrap(),
+        )
+        .unwrap();
+
+        with_env_vars(
+            &[
+                ("CODEX_HOME", &codex_home),
+                ("AGENT_SWITCH_DATA_DIR", &data),
+            ],
+            || {
+                let session = scan_imported().remove(0);
+                soft_delete(&session).unwrap();
+                let trash = scan_trash(None);
+                assert_eq!(trash.len(), 1);
+
+                let db_path = codex_home.join("state_5.sqlite");
+                let thread_count = || {
+                    let conn = Connection::open(&db_path).unwrap();
+                    let count: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
+                        .unwrap();
+                    drop(conn);
+                    count
+                };
+                assert_eq!(thread_count(), 0);
+
+                restore_from_trash(&trash[0]).unwrap();
+
+                assert_eq!(
+                    thread_count(),
+                    0,
+                    "imported archive restore must not touch Codex's threads table"
+                );
+                assert!(archive_path.exists(), "archive file is restored");
             },
         );
     }
@@ -4353,8 +4494,6 @@ mod tests {
         let db_path = dir.join("db.sqlite");
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
-            // Columns mirror the live ZCode store (0.16.x): extra NOT NULL
-            // columns carry defaults, projects/project_roots back project ids.
             "CREATE TABLE schema_migration (id TEXT PRIMARY KEY);
              CREATE TABLE projects (
                 id TEXT PRIMARY KEY,
@@ -4437,12 +4576,8 @@ mod tests {
                         },
                     )
                     .unwrap();
-                // Conversion carries the source chat's project over, slugged
-                // into ZCode's `proj_<slug>` scheme.
                 assert_eq!(row.0, "proj_d--ai-demo");
                 assert_eq!(row.1, "0.16.3", "adopts the store's app version");
-                // path mirrors directory, which conversion carries from the
-                // source chat's own project (D:\AI\Demo).
                 assert_eq!(row.2.as_deref(), Some(r"D:\AI\Demo"));
                 assert_eq!(row.3, "interactive");
                 assert_eq!(row.4, "generated");
@@ -4508,14 +4643,17 @@ mod tests {
             let meta_timestamp = event["data"]["meta"]["timestamp"]
                 .as_i64()
                 .expect("meta.timestamp unix seconds present");
-            // 2026-05-01T00:00:00Z == 1777593600
             assert_eq!(meta_timestamp, 1777593600);
+            let sessions = scan_kiro();
+            assert_eq!(sessions.len(), 1);
+            let archive = load_archive(&sessions[0]).unwrap();
+            assert_eq!(
+                archive.messages[0].timestamp.as_deref(),
+                Some("2026-05-01T00:00:00Z")
+            );
         });
     }
 
-    /// Env var + store location each provider reads and writes, so matrix
-    /// combos can point source and target at isolated fixtures (every
-    /// provider uses a different variable, so pairs never collide).
     fn provider_env(dir: &std::path::Path, provider: ChatProvider) -> (&'static str, PathBuf) {
         match provider {
             ChatProvider::Claude => ("CLAUDE_CONFIG_DIR", dir.join("claude-home")),
@@ -4527,8 +4665,6 @@ mod tests {
         }
     }
 
-    /// Minimal session/message/part schema both OpenCode and ZCode loaders
-    /// and writers work against.
     const SESSION_SCHEMA_MINIMAL: &str = "
         CREATE TABLE session (
             id TEXT PRIMARY KEY,
@@ -4556,8 +4692,6 @@ mod tests {
             data TEXT NOT NULL
         );";
 
-    /// An empty but existing store — the db resolvers require the file to
-    /// exist, exactly like a harness that has run at least once.
     fn create_empty_session_db(path: &std::path::Path) {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(SESSION_SCHEMA_MINIMAL).unwrap();
@@ -4584,8 +4718,6 @@ mod tests {
         conn.close().unwrap();
     }
 
-    /// Build a real-shaped store for `provider` inside `dir`; returns the
-    /// (first, second) turn texts the loader must recover.
     fn build_source_store(
         dir: &std::path::Path,
         provider: ChatProvider,
@@ -4657,23 +4789,17 @@ mod tests {
         }
     }
 
-    fn scan_provider(provider: ChatProvider, project: &str) -> Vec<ChatSession> {
+    fn scan_provider(provider: ChatProvider, _project: &str) -> Vec<ChatSession> {
         match provider {
             ChatProvider::Claude => scan_claude(),
             ChatProvider::Codex => scan_codex(),
-            // Kiro lists sessions per project; the converted chat carries the
-            // source session's project path.
-            ChatProvider::Kiro => scan_kiro(Path::new(project)),
+            ChatProvider::Kiro => scan_kiro(),
             ChatProvider::OpenCode => scan_opencode(),
             ChatProvider::Zcode => scan_zcode(),
             ChatProvider::Antigravity => unreachable!("excluded from conversions"),
         }
     }
 
-    /// The full grid: every provider converts into every other (20 directed
-    /// pairs, Antigravity excluded) through the real loaders and writers, and
-    /// each converted chat is discoverable in the target store with both
-    /// turns intact.
     #[test]
     fn every_provider_pair_converts_and_lands_discoverable() {
         let providers = [
@@ -4701,7 +4827,6 @@ mod tests {
                 with_env_vars(
                     &[(source_var, &source_path), (target_var, &target_path)],
                     || {
-                        // Kiro sources list under their fixture project.
                         let source_project = if source == ChatProvider::Kiro {
                             r"D:\AI"
                         } else {

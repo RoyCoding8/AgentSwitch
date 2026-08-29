@@ -79,7 +79,6 @@ pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResu
                     ui.painter()
                         .rect_filled(r, CornerRadius::same(4), theme::BG_HOVER);
                 }
-                // toggle indicator
                 let enabled = item.state.is_enabled();
                 let circ_center = egui::pos2(r.left() + 18.0, r.center().y);
                 let circ_color = if enabled {
@@ -95,7 +94,6 @@ pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResu
                         Stroke::new(1.0_f32, theme::GREEN),
                     );
                 }
-                // name
                 let name_color = if enabled {
                     theme::TEXT_PRIMARY
                 } else {
@@ -108,8 +106,6 @@ pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResu
                     theme::body_font(),
                     name_color,
                 );
-                // path (right side); keep a clear gutter so the "edit" link
-                // below never overlaps it and steals the click
                 let path_str = item.path.to_string_lossy();
                 let short = if path_str.len() > 28 {
                     let start = path_str
@@ -129,7 +125,6 @@ pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResu
                     theme::small_font(),
                     theme::TEXT_DIM,
                 );
-                // edit link for editable items
                 if item.editable {
                     let edit_rect = egui::Rect::from_center_size(
                         egui::pos2(r.right() - 20.0, r.center().y + 8.0),

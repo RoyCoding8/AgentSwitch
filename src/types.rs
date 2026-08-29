@@ -4,8 +4,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookLoc {
-    /// Slash-separated object path from the config root to the event maps,
-    /// e.g. "hooks" for Claude-style files or "hooks/events" for ZCode.
     pub section: String,
     pub event: String,
     pub order: usize,
@@ -226,13 +224,11 @@ pub enum FilterKind {
     Specific(ItemKind),
 }
 
-/// Look up the first matching key in a JSON value and return it as &str.
 pub fn str_field<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(|v| v.as_str()))
 }
 
-/// Parse a string as JSON, falling back to a JSON string literal.
 pub fn parse_json_or_string(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.into()))
 }

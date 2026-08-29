@@ -86,14 +86,11 @@ pub fn shared() -> &'static RealCliProbe {
 }
 
 impl RealCliProbe {
-    /// Cache-only lookup so UI code never blocks on a subprocess.
     pub fn probe_cached(&self, name: &str) -> Option<ProbeResult> {
         self.cache.lock().unwrap().get(name).cloned()
     }
 }
 
-/// Kick off CLI detection on a background thread; `probe_cached` picks the
-/// results up once they land instead of freezing first-frame rendering.
 pub fn warm_up(names: &[&'static str]) {
     static STARTED: OnceLock<()> = OnceLock::new();
     if STARTED.set(()).is_err() {
@@ -129,8 +126,6 @@ fn run(
         .stderr(Stdio::piped());
     hide_window(command);
     let mut child = command.spawn().context("start CLI probe")?;
-    // Drain both pipes concurrently: waiting for exit first would deadlock any
-    // child that fills the OS pipe buffer before exiting.
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
     let stdout_handle = std::thread::spawn(move || read_output(stdout_pipe));

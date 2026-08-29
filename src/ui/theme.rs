@@ -22,29 +22,23 @@ pub fn apply(ctx: &egui::Context) {
     vis.window_fill = BG_DARK;
     vis.faint_bg_color = BG_HOVER;
     vis.extreme_bg_color = Color32::from_rgb(0x10, 0x10, 0x14);
-    // non-interactive
     vis.widgets.noninteractive.bg_fill = BG_PANEL;
     vis.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     vis.widgets.noninteractive.bg_stroke = Stroke::new(0.5_f32, BORDER);
-    // inactive (buttons at rest)
     vis.widgets.inactive.bg_fill = BTN_BG;
     vis.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     vis.widgets.inactive.bg_stroke = Stroke::new(0.5_f32, BORDER);
     vis.widgets.inactive.corner_radius = CornerRadius::same(4);
-    // hovered
     vis.widgets.hovered.bg_fill = BTN_HOVER;
     vis.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     vis.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, TEXT_ACCENT);
     vis.widgets.hovered.corner_radius = CornerRadius::same(4);
-    // active (pressed)
     vis.widgets.active.bg_fill = BTN_ACTIVE;
     vis.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     vis.widgets.active.corner_radius = CornerRadius::same(4);
-    // selection
     vis.selection.bg_fill = Color32::from_rgba_premultiplied(0x50, 0x80, 0xC0, 0x60);
     vis.selection.stroke = Stroke::new(1.0_f32, TEXT_ACCENT);
     vis.window_stroke = Stroke::new(1.0_f32, BORDER);
-    // override text color globally for visibility
     vis.override_text_color = Some(TEXT_PRIMARY);
 
     let mut style = Style {
@@ -64,4 +58,11 @@ pub fn body_font() -> FontId {
 }
 pub fn small_font() -> FontId {
     FontId::proportional(12.0)
+}
+
+pub fn card_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(BG_DARK)
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(8))
 }

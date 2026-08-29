@@ -21,7 +21,6 @@ pub fn show(
         });
         ui.add_space(8.0);
 
-        // scope tabs
         ui.horizontal(|ui| {
             for (s, label) in [(Scope::Project, "Project"), (Scope::Global, "Global")] {
                 let active = *scope == s;
@@ -39,7 +38,6 @@ pub fn show(
         });
         ui.add_space(4.0);
 
-        // workspace path
         ui.horizontal(|ui| {
             let path_text = if workspace.len() > 28 {
                 let start = workspace

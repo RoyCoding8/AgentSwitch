@@ -2,7 +2,7 @@ use crate::{
     hook_diag::{HookFilter, HookRow},
     ui::theme,
 };
-use egui::{CornerRadius, RichText, Ui};
+use egui::{RichText, Ui};
 use std::path::PathBuf;
 
 #[derive(Default)]
@@ -80,69 +80,65 @@ fn tabs(ui: &mut Ui, rows: &[HookRow], filter: &mut HookFilter) {
 }
 
 fn card(ui: &mut Ui, r: &HookRow, action: &mut HookAction) {
-    egui::Frame::NONE
-        .fill(theme::BG_DARK)
-        .corner_radius(CornerRadius::same(4))
-        .inner_margin(egui::Margin::same(8))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
+    theme::card_frame().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(&r.handler)
+                    .font(theme::body_font())
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let state = if r.state.is_enabled() {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                };
                 ui.label(
-                    RichText::new(&r.handler)
-                        .font(theme::body_font())
-                        .color(theme::TEXT_PRIMARY),
+                    RichText::new(format!("{} · #{}", r.scope_label(), r.order))
+                        .font(theme::small_font())
+                        .color(theme::TEXT_ACCENT),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let state = if r.state.is_enabled() {
-                        "Enabled"
+                ui.label(RichText::new(state).font(theme::small_font()).color(
+                    if r.state.is_enabled() {
+                        theme::GREEN
                     } else {
-                        "Disabled"
-                    };
-                    ui.label(
-                        RichText::new(format!("{} · #{}", r.scope_label(), r.order))
-                            .font(theme::small_font())
-                            .color(theme::TEXT_ACCENT),
-                    );
-                    ui.label(RichText::new(state).font(theme::small_font()).color(
-                        if r.state.is_enabled() {
-                            theme::GREEN
-                        } else {
-                            theme::TEXT_DIM
-                        },
-                    ));
-                });
-            });
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
-                bit(ui, "matcher", &r.matcher);
-                bit(ui, "handler", &r.handler_kind);
-                bit(ui, "behavior", &r.behavior);
-                bit(ui, "exec", &r.execution);
-                bit(
-                    ui,
-                    "timeout",
-                    &r.timeout
-                        .map(|t| format!("{t}s"))
-                        .unwrap_or_else(|| "-".into()),
-                );
-            });
-            for w in &r.warnings {
-                ui.label(
-                    RichText::new(format!("! {w}"))
-                        .font(theme::small_font())
-                        .color(theme::YELLOW),
-                );
-            }
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(r.path.to_string_lossy())
-                        .font(theme::small_font())
-                        .color(theme::TEXT_DIM),
-                );
-                if ui.small_button("Open config").clicked() {
-                    action.open = Some(r.path.clone());
-                }
+                        theme::TEXT_DIM
+                    },
+                ));
             });
         });
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            bit(ui, "matcher", &r.matcher);
+            bit(ui, "handler", &r.handler_kind);
+            bit(ui, "behavior", &r.behavior);
+            bit(ui, "exec", &r.execution);
+            bit(
+                ui,
+                "timeout",
+                &r.timeout
+                    .map(|t| format!("{t}s"))
+                    .unwrap_or_else(|| "-".into()),
+            );
+        });
+        for w in &r.warnings {
+            ui.label(
+                RichText::new(format!("! {w}"))
+                    .font(theme::small_font())
+                    .color(theme::YELLOW),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(r.path.to_string_lossy())
+                    .font(theme::small_font())
+                    .color(theme::TEXT_DIM),
+            );
+            if ui.small_button("Open config").clicked() {
+                action.open = Some(r.path.clone());
+            }
+        });
+    });
 }
 
 fn bit(ui: &mut Ui, k: &str, v: &str) {

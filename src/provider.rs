@@ -69,12 +69,10 @@ pub fn cli_names(id: ProviderId) -> &'static [&'static str] {
     }
 }
 
-fn env_path(name: &str) -> Option<PathBuf> {
+pub fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        // A relative override would silently resolve against wherever the GUI
-        // was launched from, which is never what the user meant.
         .filter(|path| path.is_absolute())
 }
 

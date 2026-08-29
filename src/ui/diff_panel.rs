@@ -3,7 +3,7 @@ use crate::{
     types::ItemKind,
     ui::theme,
 };
-use egui::{CornerRadius, RichText, Ui};
+use egui::{RichText, Ui};
 use std::path::PathBuf;
 
 #[derive(Default)]
@@ -81,51 +81,47 @@ fn filter_tabs(ui: &mut Ui, rows: &[DiffRow], filter: &mut DiffFilter) {
 }
 
 fn row_card(ui: &mut Ui, row: &DiffRow, action: &mut DiffAction) {
-    egui::Frame::NONE
-        .fill(theme::BG_DARK)
-        .corner_radius(CornerRadius::same(4))
-        .inner_margin(egui::Margin::same(8))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
+    theme::card_frame().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(&row.name)
+                    .font(theme::body_font())
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new(&row.name)
-                        .font(theme::body_font())
-                        .color(theme::TEXT_PRIMARY),
+                    RichText::new(row.status.label())
+                        .font(theme::small_font())
+                        .color(status_color(row.status)),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(row.status.label())
-                            .font(theme::small_font())
-                            .color(status_color(row.status)),
-                    );
-                });
-            });
-            if !row.warnings.is_empty() {
-                ui.add_space(2.0);
-                for warning in &row.warnings {
-                    ui.label(
-                        RichText::new(format!("! {warning}"))
-                            .font(theme::small_font())
-                            .color(theme::YELLOW),
-                    );
-                }
-            }
-            if !row.notes.is_empty() {
-                ui.add_space(2.0);
-                for note in &row.notes {
-                    ui.label(
-                        RichText::new(note)
-                            .font(theme::small_font())
-                            .color(theme::TEXT_DIM),
-                    );
-                }
-            }
-            ui.add_space(4.0);
-            ui.columns(2, |cols| {
-                side(&mut cols[0], "Project", row.project.as_ref(), action);
-                side(&mut cols[1], "Global", row.global.as_ref(), action);
             });
         });
+        if !row.warnings.is_empty() {
+            ui.add_space(2.0);
+            for warning in &row.warnings {
+                ui.label(
+                    RichText::new(format!("! {warning}"))
+                        .font(theme::small_font())
+                        .color(theme::YELLOW),
+                );
+            }
+        }
+        if !row.notes.is_empty() {
+            ui.add_space(2.0);
+            for note in &row.notes {
+                ui.label(
+                    RichText::new(note)
+                        .font(theme::small_font())
+                        .color(theme::TEXT_DIM),
+                );
+            }
+        }
+        ui.add_space(4.0);
+        ui.columns(2, |cols| {
+            side(&mut cols[0], "Project", row.project.as_ref(), action);
+            side(&mut cols[1], "Global", row.global.as_ref(), action);
+        });
+    });
 }
 
 fn side(ui: &mut Ui, label: &str, side: Option<&DiffSide>, action: &mut DiffAction) {

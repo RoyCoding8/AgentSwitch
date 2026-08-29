@@ -14,7 +14,6 @@ pub enum ChatProvider {
 }
 
 impl ChatProvider {
-    /// Every provider in scan order.
     pub const ALL: &'static [ChatProvider] = &[
         Self::Claude,
         Self::Codex,
@@ -71,6 +70,7 @@ pub struct ChatSession {
     pub turn_count: usize,
     pub size_bytes: u64,
     pub imported: bool,
+    pub subagent: bool,
     pub trash_manifest: Option<PathBuf>,
 }
 

@@ -2,7 +2,7 @@ use crate::{
     chat::{self, ChatSession},
     ui::theme,
 };
-use egui::{Button, CornerRadius, RichText, TextEdit, Ui};
+use egui::{Button, RichText, TextEdit, Ui};
 use std::collections::HashSet;
 
 #[derive(Default)]
@@ -19,24 +19,19 @@ pub struct ChatAction {
     pub toggle_trash: bool,
 }
 
-/// Two-step confirmation for irreversible deletes: the first click arms a
-/// pending request that must be confirmed on the next frame.
-/// Two-step confirmation id for irreversible deletes; the pending request is
-/// stored in egui memory so it survives between frames.
 pub fn show(
     ui: &mut Ui,
     sessions: &[ChatSession],
     selected: &mut HashSet<String>,
     search: &mut String,
     trash_mode: bool,
-    // Pending irreversible delete, owned by the app so it survives frames.
-    delete_confirm: &mut Option<(Vec<usize>, bool)>,
+    delete_confirm: &mut Option<(Vec<String>, bool)>,
 ) -> ChatAction {
     let mut action = ChatAction::default();
     if !trash_mode {
         *delete_confirm = None;
     }
-    let mut request_arm: Option<(Vec<usize>, bool)> = None;
+    let mut request_arm: Option<(Vec<String>, bool)> = None;
     let visible = visible_indices(sessions, search);
     let selected_indices = selected_indices(sessions, selected);
     ui.horizontal_wrapped(|ui| {
@@ -89,9 +84,10 @@ pub fn show(
         }
         ui.separator();
         if trash_mode {
+            let armed = delete_confirm.is_some();
             if ui
                 .add_enabled(
-                    !selected_indices.is_empty(),
+                    !selected_indices.is_empty() && !armed,
                     Button::new("Restore selected"),
                 )
                 .clicked()
@@ -100,21 +96,21 @@ pub fn show(
             }
             if ui
                 .add_enabled(
-                    !selected_indices.is_empty() && delete_confirm.is_none(),
+                    !selected_indices.is_empty() && !armed,
                     Button::new("Delete selected forever"),
                 )
                 .clicked()
             {
-                request_arm = Some((selected_indices.clone(), false));
+                request_arm = Some((keys_for(sessions, &selected_indices), false));
             }
             if ui
                 .add_enabled(
-                    !visible.is_empty() && delete_confirm.is_none(),
+                    !visible.is_empty() && !armed,
                     Button::new("Empty visible trash"),
                 )
                 .clicked()
             {
-                request_arm = Some((visible.clone(), true));
+                request_arm = Some((keys_for(sessions, &visible), true));
             }
         } else {
             if ui
@@ -139,7 +135,6 @@ pub fn show(
                     .map(|s| s.provider)
                     .collect();
                 for target in chat::conversion_targets() {
-                    // A provider every selected chat already uses would be a no-op.
                     if !providers.is_empty() && providers.iter().all(|p| *p == target) {
                         continue;
                     }
@@ -160,25 +155,25 @@ pub fn show(
                 .color(theme::TEXT_DIM),
         );
     });
-    // Irreversible deletes need an explicit second click.
     if let Some(request) = request_arm {
         *delete_confirm = Some(request);
     }
-    if let Some((indices, empty_all)) = delete_confirm.clone() {
+    if let Some((keys, empty_all)) = delete_confirm.clone() {
+        let targets = resolve_keys(sessions, &keys);
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!(
                     "Permanently delete {} chat(s)? This cannot be undone.",
-                    indices.len()
+                    keys.len()
                 ))
                 .font(theme::small_font())
                 .color(theme::YELLOW),
             );
             if ui.button("Yes, delete forever").clicked() {
                 if empty_all {
-                    action.empty_visible = indices;
+                    action.empty_visible = targets;
                 } else {
-                    action.delete_forever = indices;
+                    action.delete_forever = targets;
                 }
                 *delete_confirm = None;
             }
@@ -256,57 +251,60 @@ fn row(
 ) {
     let key = chat::session_key(session);
     let mut checked = selected.contains(&key);
-    egui::Frame::NONE
-        .fill(theme::BG_DARK)
-        .corner_radius(CornerRadius::same(4))
-        .inner_margin(egui::Margin::same(8))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.checkbox(&mut checked, "").changed() {
-                    if checked {
-                        selected.insert(key.clone());
-                    } else {
-                        selected.remove(&key);
-                    }
+    theme::card_frame().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut checked, "").changed() {
+                if checked {
+                    selected.insert(key.clone());
+                } else {
+                    selected.remove(&key);
                 }
+            }
+            ui.label(
+                RichText::new(&session.title)
+                    .font(theme::body_font())
+                    .color(theme::TEXT_PRIMARY),
+            );
+            if session.subagent {
                 ui.label(
-                    RichText::new(&session.title)
-                        .font(theme::body_font())
-                        .color(theme::TEXT_PRIMARY),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(if session.imported {
-                            "Imported"
-                        } else {
-                            "Local"
-                        })
+                    RichText::new("subagent")
                         .font(theme::small_font())
-                        .color(if session.imported {
-                            theme::TEXT_ACCENT
-                        } else {
-                            theme::TEXT_DIM
-                        }),
-                    );
-                });
-            });
-            ui.horizontal_wrapped(|ui| {
-                if allow_convert && session.provider != crate::chat::ChatProvider::Antigravity {
-                    ui.menu_button("Convert…", |ui| {
-                        for target in chat::convertible_targets(session.provider) {
-                            if ui.button(target.label()).clicked() {
-                                ui.close_menu();
-                                action.convert.push((idx, target));
-                            }
-                        }
-                    });
-                }
-                bit(ui, "updated", &session.updated_at);
-                bit(ui, "turns", &session.turn_count.to_string());
-                bit(ui, "size", &size_label(session.size_bytes));
-                bit(ui, "source", source_label(session));
+                        .color(theme::TEXT_ACCENT),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(if session.imported {
+                        "Imported"
+                    } else {
+                        "Local"
+                    })
+                    .font(theme::small_font())
+                    .color(if session.imported {
+                        theme::TEXT_ACCENT
+                    } else {
+                        theme::TEXT_DIM
+                    }),
+                );
             });
         });
+        ui.horizontal_wrapped(|ui| {
+            if allow_convert && session.provider != crate::chat::ChatProvider::Antigravity {
+                ui.menu_button("Convert…", |ui| {
+                    for target in chat::convertible_targets(session.provider) {
+                        if ui.button(target.label()).clicked() {
+                            ui.close_menu();
+                            action.convert.push((idx, target));
+                        }
+                    }
+                });
+            }
+            bit(ui, "updated", &session.updated_at);
+            bit(ui, "turns", &session.turn_count.to_string());
+            bit(ui, "size", &size_label(session.size_bytes));
+            bit(ui, "source", source_label(session));
+        });
+    });
 }
 
 fn visible_indices(sessions: &[ChatSession], search: &str) -> Vec<usize> {
@@ -323,6 +321,24 @@ fn selected_indices(sessions: &[ChatSession], selected: &HashSet<String>) -> Vec
         .iter()
         .enumerate()
         .filter(|(_, s)| selected.contains(&chat::session_key(s)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn keys_for(sessions: &[ChatSession], indices: &[usize]) -> Vec<String> {
+    indices
+        .iter()
+        .filter_map(|&i| sessions.get(i))
+        .map(chat::session_key)
+        .collect()
+}
+
+fn resolve_keys(sessions: &[ChatSession], keys: &[String]) -> Vec<usize> {
+    let wanted: HashSet<&String> = keys.iter().collect();
+    sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| wanted.contains(&chat::session_key(s)))
         .map(|(i, _)| i)
         .collect()
 }
@@ -352,5 +368,41 @@ fn size_label(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(id: &str, path: &str) -> ChatSession {
+        ChatSession {
+            id: id.into(),
+            title: id.into(),
+            provider: chat::ChatProvider::Kiro,
+            project_path: path.into(),
+            created_at: None,
+            updated_at: String::new(),
+            source_path: Some(std::path::PathBuf::from(path)),
+            source_kind: chat::ChatSourceKind::KiroCli,
+            turn_count: 0,
+            size_bytes: 0,
+            imported: false,
+            subagent: false,
+            trash_manifest: None,
+        }
+    }
+
+    #[test]
+    fn resolve_keys_drops_sessions_removed_by_rescan() {
+        let a = session("a", "C:\\a.json");
+        let b = session("b", "C:\\b.json");
+        let c = session("c", "C:\\c.json");
+        let before = vec![a.clone(), b.clone(), c.clone()];
+        let keys = keys_for(&before, &[0, 2]);
+
+        let after = vec![b.clone(), c.clone()];
+        let targets = resolve_keys(&after, &keys);
+        assert_eq!(targets, vec![1]);
     }
 }

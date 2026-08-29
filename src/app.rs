@@ -34,8 +34,7 @@ pub struct App {
     chat_selection: HashSet<String>,
     chat_search: String,
     chat_trash_mode: bool,
-    /// Armed "delete forever" request awaiting confirmation.
-    chat_delete_confirm: Option<(Vec<usize>, bool)>,
+    chat_delete_confirm: Option<(Vec<String>, bool)>,
     filter: FilterKind,
     view: View,
     editor: EditorState,
@@ -94,7 +93,6 @@ impl App {
             .iter()
             .map(|&id| (id, scanner::provider_exists(id, &root, self.scope)))
             .collect();
-        // auto-select first detected
         if self.selected_provider.is_none()
             || !self
                 .providers
@@ -103,8 +101,6 @@ impl App {
         {
             self.selected_provider = self.providers.iter().find(|(_, d)| *d).map(|(id, _)| *id);
         }
-        // A stale kind filter would render "No items found" over a list that
-        // actually has entries of other kinds.
         self.filter = FilterKind::All;
         self.rescan_items();
     }
@@ -128,8 +124,6 @@ impl App {
             Some(id) => hook_diag::build(id, &self.workspace),
             None => vec![],
         };
-        // Keep the user's diff/hook filters across rescans; resetting them on
-        // every toggle made selections silently revert.
         if !self
             .diff_rows
             .iter()
@@ -152,8 +146,9 @@ impl App {
         } else {
             None
         };
-        self.chat_sessions = chat::scan_all(&self.workspace, filter);
-        self.chat_trash = chat::scan_trash();
+        self.chat_delete_confirm = None;
+        self.chat_sessions = chat::scan_all(filter);
+        self.chat_trash = chat::scan_trash(filter);
         let keys: HashSet<_> = self
             .chat_sessions
             .iter()
@@ -185,7 +180,6 @@ impl eframe::App for App {
             self.first_frame = false;
         }
 
-        // browse dialog
         if self.browse_requested {
             self.browse_requested = false;
             if let Some(path) = rfd::FileDialog::new().pick_folder() {
@@ -198,7 +192,6 @@ impl eframe::App for App {
         let old_scope = self.scope;
         let old_provider = self.selected_provider;
 
-        // sidebar
         egui::SidePanel::left("sidebar")
             .min_width(170.0)
             .max_width(200.0)
@@ -218,7 +211,6 @@ impl eframe::App for App {
                 );
             });
 
-        // bottom status
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::NONE
@@ -236,7 +228,6 @@ impl eframe::App for App {
                 }
             });
 
-        // main content
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
@@ -441,7 +432,6 @@ impl eframe::App for App {
                 }
             });
 
-        // refresh on scope/provider change
         if self.scope != old_scope {
             self.refresh();
             if self.view == View::Chats {
@@ -454,7 +444,6 @@ impl eframe::App for App {
                 self.rescan_chats();
             }
         }
-        // Prevent being stuck in a view with no way to navigate away
         if self.selected_provider.is_none()
             && matches!(self.view, View::Items | View::Hooks | View::Diff)
         {
@@ -486,10 +475,10 @@ impl App {
                 }
                 self.view = View::Items;
             }
-            let title = if self.chat_trash_mode {
-                format!("{} Chats Trash", provider_label)
-            } else {
-                format!("{} Chats", provider_label)
+            let title = match (self.chat_trash_mode, self.selected_provider) {
+                (true, Some(provider)) => format!("{} Chats Trash", provider.label()),
+                (true, None) => "All Providers Chats Trash".into(),
+                (false, _) => format!("{} Chats", provider_label),
             };
             ui.label(
                 egui::RichText::new(title)
@@ -498,25 +487,19 @@ impl App {
             );
         });
         ui_panel.add_space(4.0);
-        let action = if self.chat_trash_mode {
-            ui::chat_panel::show(
-                ui_panel,
-                &self.chat_trash,
-                &mut self.chat_selection,
-                &mut self.chat_search,
-                true,
-                &mut self.chat_delete_confirm,
-            )
+        let list = if self.chat_trash_mode {
+            &self.chat_trash
         } else {
-            ui::chat_panel::show(
-                ui_panel,
-                &self.chat_sessions,
-                &mut self.chat_selection,
-                &mut self.chat_search,
-                false,
-                &mut self.chat_delete_confirm,
-            )
+            &self.chat_sessions
         };
+        let action = ui::chat_panel::show(
+            ui_panel,
+            list,
+            &mut self.chat_selection,
+            &mut self.chat_search,
+            self.chat_trash_mode,
+            &mut self.chat_delete_confirm,
+        );
         if action.toggle_trash {
             self.chat_delete_confirm = None;
         }
@@ -650,16 +633,8 @@ impl App {
             ));
         }
         if !action.trash.is_empty() {
-            let mut ok = 0usize;
-            let mut failed = 0usize;
-            let mut errors: Vec<String> = Vec::new();
-            for idx in action.trash {
-                match self.chat_sessions.get(idx).map(chat::soft_delete) {
-                    Some(Ok(())) => ok += 1,
-                    Some(Err(error)) => record_failure(&mut errors, &mut failed, error),
-                    None => failed += 1,
-                }
-            }
+            let (ok, failed, errors) =
+                batch_over(&self.chat_sessions, action.trash, chat::soft_delete);
             self.chat_selection.clear();
             self.rescan_chats();
             self.status_msg = Some(format!(
@@ -704,23 +679,13 @@ impl App {
             self.status_msg = Some(message);
         }
         if !action.delete_forever.is_empty() || !action.empty_visible.is_empty() {
-            // Merge both sources so a future UI change can never silently drop
-            // one half of the request.
             let mut indices: Vec<usize> = Vec::new();
             indices.extend(action.delete_forever);
             indices.extend(action.empty_visible);
             indices.sort_unstable();
             indices.dedup();
-            let mut ok = 0usize;
-            let mut failed = 0usize;
-            let mut errors: Vec<String> = Vec::new();
-            for idx in indices {
-                match self.chat_trash.get(idx).map(chat::delete_trash_forever) {
-                    Some(Ok(())) => ok += 1,
-                    Some(Err(error)) => record_failure(&mut errors, &mut failed, error),
-                    None => failed += 1,
-                }
-            }
+            let (ok, failed, errors) =
+                batch_over(&self.chat_trash, indices, chat::delete_trash_forever);
             self.chat_selection.clear();
             self.rescan_chats();
             self.status_msg = Some(format!(
@@ -753,8 +718,22 @@ fn truncate_error(error: anyhow::Error) -> String {
     }
 }
 
-/// Count a failure and remember its reason so batch actions can explain what
-/// went wrong instead of only reporting "N failed".
+fn batch_over(
+    list: &[ChatSession],
+    indices: Vec<usize>,
+    act: fn(&ChatSession) -> anyhow::Result<()>,
+) -> (usize, usize, Vec<String>) {
+    let (mut ok, mut failed, mut errors) = (0usize, 0usize, Vec::new());
+    for idx in indices {
+        match list.get(idx).map(act) {
+            Some(Ok(())) => ok += 1,
+            Some(Err(error)) => record_failure(&mut errors, &mut failed, error),
+            None => failed += 1,
+        }
+    }
+    (ok, failed, errors)
+}
+
 fn record_failure(errors: &mut Vec<String>, failed: &mut usize, error: anyhow::Error) {
     *failed += 1;
     let text = truncate_error(error);

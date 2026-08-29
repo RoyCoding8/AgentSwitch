@@ -5,8 +5,6 @@ use crate::ui::theme;
 use egui::{RichText, Ui};
 
 pub fn show(ui: &mut Ui, items: &[ConfigItem], providers: &[(ProviderId, bool)]) {
-    // Prime the cache in the background; rendering below only reads it so a
-    // hanging CLI can never freeze the frame.
     let all_cli_names: Vec<&'static str> = ProviderId::ALL
         .iter()
         .flat_map(|id| provider::cli_names(*id).iter().copied())

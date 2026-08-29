@@ -7,13 +7,10 @@ pub struct EditorState {
     pub content: String,
     pub original: String,
     pub dirty: bool,
-    /// Set when a save or open fails so the panel can show it inline.
     pub error: Option<String>,
 }
 
 impl EditorState {
-    /// Loads `path` for editing. Fails without touching the current document
-    /// when it holds unsaved changes or the file cannot be read.
     pub fn open(&mut self, path: PathBuf) -> Result<()> {
         if self.dirty && Some(&path) != self.path.as_ref() {
             return Err(anyhow::anyhow!(
@@ -37,7 +34,6 @@ impl EditorState {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
-        // Refuse to clobber edits made outside the app after we opened.
         let on_disk =
             std::fs::read(&path).with_context(|| format!("re-reading {}", path.display()))?;
         if on_disk != self.original.as_bytes() {
@@ -114,7 +110,6 @@ mod tests {
         assert!(editor.save().is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed elsewhere");
 
-        // After reverting to what is on disk, saving works again.
         std::fs::write(&path, "original").unwrap();
         editor.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");

@@ -90,8 +90,6 @@ pub fn move_path(source: &Path, target: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(rename_error) => {
             let staged = staged_path(target);
-            // A previous failed attempt may have left a stale staging tree;
-            // merging into it would weaken the copy verification below.
             cleanup(&staged);
             let copy_result = if source.is_dir() {
                 copy_dir(source, &staged)
@@ -100,17 +98,7 @@ pub fn move_path(source: &Path, target: &Path) -> Result<()> {
                     .map(|_| ())
                     .map_err(anyhow::Error::from)
             };
-            if let Err(error) = copy_result {
-                cleanup(&staged);
-                return Err(error).with_context(|| {
-                    format!(
-                        "move {} to {} after rename failed: {rename_error}",
-                        source.display(),
-                        target.display()
-                    )
-                });
-            }
-            if let Err(error) = verify_copy(source, &staged) {
+            if let Err(error) = copy_result.and_then(|()| verify_copy(source, &staged)) {
                 cleanup(&staged);
                 return Err(error).with_context(|| {
                     format!(
@@ -174,8 +162,6 @@ fn staged_path(target: &Path) -> PathBuf {
 
 fn copy_dir(source: &Path, target: &Path) -> Result<()> {
     fs::create_dir_all(target)?;
-    // follow_links(false): a symlink loop inside a config tree must not
-    // recurse forever; symlinked files are copied by content below.
     for entry in walkdir::WalkDir::new(source)
         .follow_links(false)
         .min_depth(1)
@@ -197,8 +183,6 @@ fn copy_dir(source: &Path, target: &Path) -> Result<()> {
 
 fn verify_copy(source: &Path, target: &Path) -> Result<()> {
     if source.is_dir() {
-        // Entry-count comparison passes when a copy truncates one file and
-        // creates an extra one; compare every file's relative path and length.
         let files = |root: &Path| -> Result<std::collections::HashMap<String, u64>> {
             let mut map = std::collections::HashMap::new();
             for entry in walkdir::WalkDir::new(root).follow_links(false).min_depth(1) {
