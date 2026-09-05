@@ -48,9 +48,28 @@ pub fn toggle_item(item: &mut ConfigItem) -> Result<()> {
     Ok(())
 }
 
+pub fn sidecar_path(path: &std::path::Path) -> std::path::PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.agentswitch"))
+}
+
 fn toggle_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     match item.provider {
-        ProviderId::Antigravity => return toggle_antigravity_hook(item, loc),
+        ProviderId::Antigravity if loc.section.is_empty() => {
+            return toggle_antigravity_hook(item, loc)
+        }
+        ProviderId::Kiro
+            if item
+                .path
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n == "hooks") =>
+        {
+            return toggle_kiro_hook_file(item, loc)
+        }
         ProviderId::Zcode => return toggle_zcode_hook(item, loc),
         _ => {}
     }
@@ -83,104 +102,212 @@ fn toggle_zcode_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
 fn toggle_antigravity_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     let snapshot = Snapshot::read(&item.path)?;
     let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
-    let hooks = doc
-        .get_mut("hooks")
+    let def = doc
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("configuration root is not an object"))?
+        .get_mut(&loc.hook_name)
         .and_then(|v| v.as_object_mut())
-        .ok_or_else(|| anyhow::anyhow!("no hooks object"))?;
-    let disabled = hooks
-        .entry("disabled")
-        .or_insert_with(|| serde_json::json!([]));
-    let arr = disabled
-        .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("disabled not array"))?;
-    let scoped_name = format!("{}:{}", loc.event, loc.hook_name);
-    if item.state.is_enabled() {
-        arr.retain(|v| v.as_str() != Some(loc.hook_name.as_str()));
-        if !arr.iter().any(|v| v.as_str() == Some(&scoped_name)) {
-            arr.push(serde_json::Value::String(scoped_name));
-        }
-        item.state = ItemState::Disabled;
+        .ok_or_else(|| anyhow::anyhow!("hook '{}' no longer exists", loc.hook_name))?;
+    let enable = !item.state.is_enabled();
+    if enable {
+        def.remove("enabled");
     } else {
-        arr.retain(|v| {
-            v.as_str() != Some(&scoped_name) && v.as_str() != Some(loc.hook_name.as_str())
-        });
-        item.state = ItemState::Enabled;
+        def.insert("enabled".into(), serde_json::Value::Bool(false));
     }
     snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    item.state = if enable {
+        ItemState::Enabled
+    } else {
+        ItemState::Disabled
+    };
+    Ok(())
+}
+
+fn toggle_kiro_hook_file(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
+    let snapshot = Snapshot::read(&item.path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
+    let arr = doc
+        .get_mut("hooks")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("hooks is not an array"))?;
+    let enable = !item.state.is_enabled();
+    let matches: Vec<usize> = arr
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| (kiro_entry_fingerprint(e) == loc.fingerprint).then_some(i))
+        .collect();
+    let index = match matches.as_slice() {
+        [i] => *i,
+        [] => anyhow::bail!("hook no longer exists in {}", item.path.display()),
+        _ => *matches.iter().find(|&&i| i == loc.order).ok_or_else(|| {
+            anyhow::anyhow!("hook identity is ambiguous in {}", item.path.display())
+        })?,
+    };
+    let obj = arr[index]
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("hook entry is not an object"))?;
+    if enable {
+        obj.remove("enabled");
+    } else {
+        obj.insert("enabled".into(), serde_json::Value::Bool(false));
+    }
+    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    item.state = if enable {
+        ItemState::Enabled
+    } else {
+        ItemState::Disabled
+    };
     Ok(())
 }
 
 fn toggle_hook_stash(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
+    if item.state.is_enabled() {
+        stash_hook(item, loc)
+    } else {
+        unstash_hook(item, loc)
+    }
+}
+
+fn stash_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     let snapshot = Snapshot::read(&item.path)?;
     let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
-    if item.state.is_enabled() {
-        let mut entry = remove_hook(&mut doc, &loc.section, &loc.event, &loc.fingerprint)?;
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("_agentswitch_order".into(), serde_json::json!(loc.order));
-        }
-        ensure_array(&mut doc, "_agentswitch_disabled", &loc.event)?.push(entry);
-        item.state = ItemState::Disabled;
-    } else {
-        let real_event = loc.event.strip_prefix("_stashed_").unwrap_or(&loc.event);
-        let mut entry = remove_hook(
-            &mut doc,
-            "_agentswitch_disabled",
-            real_event,
-            &loc.fingerprint,
-        )?;
+    let mut entry = remove_hook(
+        &mut doc,
+        &loc.section,
+        &loc.event,
+        &loc.fingerprint,
+        Some(loc.order),
+    )?;
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("_agentswitch_order".into(), serde_json::json!(loc.order));
+    }
+    let sidecar = Snapshot::read_or(&sidecar_path(&item.path), b"{}")?;
+    let mut stash: serde_json::Value = serde_json::from_str(sidecar.text()?)?;
+    ensure_array(&mut stash, "", &loc.event)?.push(entry);
+    sidecar.commit(serde_json::to_string_pretty(&stash)?.as_bytes())?;
+    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    item.state = ItemState::Disabled;
+    Ok(())
+}
+
+fn unstash_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
+    let real_event = loc.event.strip_prefix("_stashed_").unwrap_or(&loc.event);
+    let stash_path = sidecar_path(&item.path);
+    let sidecar = Snapshot::read_or(&stash_path, b"{}")?;
+    let mut stash: serde_json::Value = serde_json::from_str(sidecar.text()?)?;
+    if let Ok(mut entry) = remove_hook(&mut stash, "", real_event, &loc.fingerprint, None) {
         let original_order = entry
             .get("_agentswitch_order")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(loc.order as u64) as usize;
-        let stashed_orders: Vec<usize> = doc
-            .get("_agentswitch_disabled")
-            .and_then(|stash| stash.get(real_event))
+            .unwrap_or(loc.order as u64);
+        if let Some(obj) = entry.as_object_mut() {
+            obj.remove("_agentswitch_order");
+        }
+        let other_orders: Vec<u64> = stash
+            .get(real_event)
             .and_then(serde_json::Value::as_array)
             .map_or(vec![], |entries| {
                 entries
                     .iter()
-                    .chain(std::iter::once(&entry))
                     .filter_map(|e| e.get("_agentswitch_order"))
                     .filter_map(serde_json::Value::as_u64)
-                    .map(|o| o as usize)
+                    .chain(std::iter::once(original_order))
                     .collect()
             });
-        if let Some(obj) = entry.as_object_mut() {
-            obj.remove("_agentswitch_order");
-        }
+        let snapshot = Snapshot::read(&item.path)?;
+        let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
         let arr = array_at_mut(&mut doc, &loc.section, real_event)?;
-        let mut index = arr.len();
-        for (current, _) in arr.iter().enumerate() {
-            let mut original = current;
-            loop {
-                let shifted = current + stashed_orders.iter().filter(|&&o| o <= original).count();
-                if shifted == original {
-                    break;
-                }
-                original = shifted;
-            }
-            if original > original_order {
-                index = current;
-                break;
-            }
-        }
+        let index = restore_index(arr, original_order as usize, &other_orders);
         arr.insert(index, entry);
-        let stash_is_empty = doc
+        drop_empty_stash(&mut stash);
+        sidecar.commit(serde_json::to_string_pretty(&stash)?.as_bytes())?;
+        if stash.as_object().is_some_and(|o| o.is_empty()) {
+            let _ = std::fs::remove_file(&stash_path);
+        }
+        snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+        item.state = ItemState::Enabled;
+        return Ok(());
+    }
+    restore_from_legacy_stash(item, loc, real_event)
+}
+
+fn restore_from_legacy_stash(item: &mut ConfigItem, loc: &HookLoc, real_event: &str) -> Result<()> {
+    let snapshot = Snapshot::read(&item.path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
+    let mut entry = remove_hook(
+        &mut doc,
+        "_agentswitch_disabled",
+        real_event,
+        &loc.fingerprint,
+        None,
+    )?;
+    let original_order = entry
+        .get("_agentswitch_order")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(loc.order as u64) as usize;
+    let other_orders: Vec<u64> = doc
+        .get("_agentswitch_disabled")
+        .and_then(|stash| stash.get(real_event))
+        .and_then(serde_json::Value::as_array)
+        .map_or(vec![], |entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("_agentswitch_order"))
+                .filter_map(serde_json::Value::as_u64)
+                .chain(std::iter::once(original_order as u64))
+                .collect()
+        });
+    if let Some(obj) = entry.as_object_mut() {
+        obj.remove("_agentswitch_order");
+    }
+    let arr = array_at_mut(&mut doc, &loc.section, real_event)?;
+    let index = restore_index(arr, original_order, &other_orders);
+    arr.insert(index, entry);
+    if let Some(obj) = doc.as_object_mut() {
+        let empty = obj
             .get("_agentswitch_disabled")
             .and_then(|v| v.as_object())
-            .is_some_and(|obj| {
-                obj.values()
+            .is_some_and(|stash| {
+                stash
+                    .values()
                     .all(|v| v.as_array().is_some_and(|a| a.is_empty()))
             });
-        if stash_is_empty {
-            doc.as_object_mut()
-                .ok_or_else(|| anyhow::anyhow!("configuration root is not an object"))?
-                .remove("_agentswitch_disabled");
+        if empty {
+            obj.remove("_agentswitch_disabled");
         }
-        item.state = ItemState::Enabled;
     }
     snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    item.state = ItemState::Enabled;
     Ok(())
+}
+
+fn restore_index(arr: &[serde_json::Value], original_order: usize, other_orders: &[u64]) -> usize {
+    let mut index = arr.len();
+    for (current, _) in arr.iter().enumerate() {
+        let mut original = current;
+        loop {
+            let shifted = current
+                + other_orders
+                    .iter()
+                    .filter(|&&o| o <= original as u64)
+                    .count();
+            if shifted == original {
+                break;
+            }
+            original = shifted;
+        }
+        if original > original_order {
+            index = current;
+            break;
+        }
+    }
+    index
+}
+
+fn drop_empty_stash(stash: &mut serde_json::Value) {
+    if let Some(obj) = stash.as_object_mut() {
+        obj.retain(|_, v| v.as_array().is_some_and(|a| !a.is_empty()));
+    }
 }
 
 fn remove_hook(
@@ -188,6 +315,7 @@ fn remove_hook(
     section: &str,
     event: &str,
     fingerprint: &str,
+    prefer_order: Option<usize>,
 ) -> Result<serde_json::Value> {
     let identity = |entry: &serde_json::Value| {
         let mut stripped = entry.clone();
@@ -205,8 +333,31 @@ fn remove_hook(
     match matches.as_slice() {
         [index] => Ok(arr.remove(*index)),
         [] => anyhow::bail!("hook no longer exists in {section}.{event}"),
-        _ => anyhow::bail!("hook identity is ambiguous in {section}.{event}"),
+        _ => {
+            if let Some(order) = prefer_order {
+                if matches.contains(&order) {
+                    return Ok(arr.remove(order));
+                }
+            }
+            anyhow::bail!("hook identity is ambiguous in {section}.{event}")
+        }
     }
+}
+
+pub(crate) fn stash_entry_fingerprint(entry: &serde_json::Value) -> String {
+    let mut stripped = entry.clone();
+    if let Some(object) = stripped.as_object_mut() {
+        object.remove("_agentswitch_order");
+    }
+    hook_fingerprint(&stripped)
+}
+
+pub(crate) fn kiro_entry_fingerprint(entry: &serde_json::Value) -> String {
+    let mut stripped = entry.clone();
+    if let Some(object) = stripped.as_object_mut() {
+        object.remove("enabled");
+    }
+    hook_fingerprint(&stripped)
 }
 
 pub(crate) fn zcode_entry_fingerprint(entry: &serde_json::Value) -> String {
@@ -524,9 +675,9 @@ mod tests {
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 0);
-        let stashed = doc["_agentswitch_disabled"]["PreToolUse"]
-            .as_array()
-            .unwrap();
+        let stash: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(sidecar_path(&path)).unwrap()).unwrap();
+        let stashed = stash["PreToolUse"].as_array().unwrap();
         let stripped: Vec<_> = stashed
             .iter()
             .map(|entry| {
@@ -541,17 +692,44 @@ mod tests {
     }
 
     #[test]
-    fn malformed_stash_returns_error_instead_of_panicking() {
+    fn malformed_sidecar_fails_the_disable_without_touching_the_config() {
         let entry = serde_json::json!({"hooks":[{"command":"first"}]});
         let path = temp_file(
             "malformed",
+            &serde_json::json!({"hooks":{"PreToolUse":[entry.clone()]}}).to_string(),
+        );
+        std::fs::write(sidecar_path(&path), "broken").unwrap();
+        let mut item = hook_item(path.clone(), &entry, "first");
+        assert!(toggle_item(&mut item).is_err());
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["hooks"]["PreToolUse"].as_array().unwrap().len(),
+            1,
+            "config must stay untouched when the sidecar is unwritable"
+        );
+    }
+
+    #[test]
+    fn legacy_in_file_stash_is_still_reenableable() {
+        let entry = serde_json::json!({"hooks":[{"command":"first"}]});
+        let path = temp_file(
+            "legacy-stash",
             &serde_json::json!({
-                "hooks":{"PreToolUse":[entry.clone()]},
+                "hooks":{"PreToolUse":[]},
                 "_agentswitch_disabled":"broken"
             })
             .to_string(),
         );
         let mut item = hook_item(path, &entry, "first");
+        item.state = ItemState::Disabled;
+        item.hook_loc = Some(HookLoc {
+            section: "hooks".into(),
+            event: "_stashed_PreToolUse".into(),
+            order: 0,
+            hook_name: "first".into(),
+            fingerprint: hook_fingerprint(&entry),
+        });
         let error = toggle_item(&mut item).unwrap_err().to_string();
         assert!(error.contains("_agentswitch_disabled is not an object"));
     }

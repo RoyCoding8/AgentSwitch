@@ -1,6 +1,6 @@
 [package]
 name = "agent-switch"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2021"
 rust-version = "1.75"
 description = "Unified AI agent configuration manager"

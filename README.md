@@ -20,16 +20,33 @@ Native desktop GUI for managing AI coding-agent configuration across providers. 
 
 | Provider | Instruction File | Skills | Hooks | MCP | Native Chats |
 |---|---|---|---|---|---|
-| Claude Code | `CLAUDE.md` | `.claude/skills/` | `.claude/settings*.json` | Project `.mcp.json`; approval lists in settings | Best-effort JSONL (internal format) |
-| Codex CLI | `AGENTS.md` | `.codex/skills/`, `.agents/skills/` | `config.toml`, `hooks.json` | `config.toml` `mcp_servers` | Best-effort JSONL (internal format) |
-| Antigravity CLI (`agy`) | `GEMINI.md`, `AGENTS.md` | `.agents/skills/`, global `skills/` | `.agents/hooks.json` | `.agents/mcp_config.json` | Not supported (encrypted/internal) |
-| Kiro | Steering documents | Steering, Specs, Agents | Agent JSON | `settings/mcp.json` | JSON + JSONL ACP sessions |
+| Claude Code | `CLAUDE.md` | `.claude/skills/` | `.claude/settings*.json` (stash to sidecar) | Project `.mcp.json`; approval lists in settings | Best-effort JSONL (internal format) |
+| Codex CLI | `AGENTS.md` | `.codex/skills/`, `.agents/skills/` | `hooks.json` (stash to sidecar); `config.toml` inline hooks read-only | `config.toml` `mcp_servers` | Best-effort JSONL (internal format) |
+| Antigravity CLI (`agy`) | `GEMINI.md`, `AGENTS.md` | `.agents/skills/`, global `skills/` | `.agents/hooks.json` (native per-definition `enabled` flag) | `.agents/mcp_config.json` | Not supported (encrypted/internal) |
+| Kiro | Steering documents | Steering, Specs, Agents | `.kiro/hooks/*.json` (native per-hook `enabled` flag); legacy agent-config hooks stashed | `settings/mcp.json` | JSON + JSONL ACP sessions |
 | OpenCode | `AGENTS.md` | `.opencode/skills/` plus `.agents/`/`.claude/` compatibility | Plugins | `opencode.json` | SQLite with schema detection |
 | ZCode | `AGENTS.md` (workspace) / `~/.zcode/AGENTS.md` (user) | `.zcode/skills/`, `.agents/skills/` | `hooks.events` in `.zcode/config.json` / `~/.zcode/cli/config.json` (native per-entry `enabled` flag) | `mcp.servers` in the same configs (fallback `.agents/mcp.json`) | SQLite (`~/.zcode/cli/db/db.sqlite`) |
 
-> ZCode support follows z.ai's official configuration guide: user scope lives under `~/.zcode` (override with `ZCODE_HOME`), workspace scope under `<repo>/.zcode`. Hook entries are toggled through ZCode's own documented per-entry `enabled: false` flag; MCP servers are disabled by stashing them out of `mcp.servers`, since that is the key ZCode reads. Chat browsing reads the OpenCode-compatible session/message/part database ZCode ships at `~/.zcode/cli/db/db.sqlite` (override with `ZCODE_DB`).
+<details>
+<summary>How hook toggling works per provider</summary>
 
-> **Chat conversion** moves sessions between harnesses in two ways. *Direct:* pick a chat and use **Convert…** to write it straight into another installed harness's native store. *File-based migration:* export from harness A to an archive file, run **Convert archive…** on that file (single JSON or multi-chat ZIP), then use **Import** on the converted file and choose the project folder — the chat lands as a first-class session of harness B. This works even after harness A is uninstalled, since conversion operates purely on the exported file. Conversions always re-synthesize target-native events from AgentSwitch's normalized archive; source-harness event lines are never copied across formats, because each harness only parses its own schema. Converted chats are made discoverable by each harness's own mechanism — e.g. Codex sessions get a full native `session_meta` rollout **and a row in Codex's state database** (`state_N.sqlite` `threads`), since `/resume` lists from SQLite rather than scanning disk. Antigravity is never a conversion source or target because its chats are encrypted inside the CLI.
+Hook toggling follows each provider's documented configuration. Claude Code has no per-hook disable setting, and its settings schema rejects unknown keys, so disabled hook entries are moved to a `<config>.agentswitch` sidecar next to the settings file — the settings file itself stays schema-clean — and restored to their original position on re-enable (stashes written by older versions inside `_agentswitch_disabled` keys are still listed and re-enabled). Codex `hooks.json` uses the same sidecar stash; Codex has no per-hook disable flag (only the global `features.hooks` toggle). Antigravity `hooks.json` maps hook names to definitions with a native per-definition `enabled: false` flag, which AgentSwitch toggles directly. Kiro CLI 3.0 hooks live in `.kiro/hooks/*.json` with a native per-hook `enabled` flag; embedded hooks in legacy `agents/*.json` configs use the sidecar stash.
+
+</details>
+
+<details>
+<summary>ZCode scope and storage notes</summary>
+
+ZCode support follows z.ai's official configuration guide: user scope lives under `~/.zcode` (override with `ZCODE_HOME`), workspace scope under `<repo>/.zcode`. Hook entries are toggled through ZCode's own documented per-entry `enabled: false` flag; MCP servers are disabled by stashing them out of `mcp.servers`, since that is the key ZCode reads. Chat browsing reads the OpenCode-compatible session/message/part database ZCode ships at `~/.zcode/cli/db/db.sqlite` (override with `ZCODE_DB`).
+
+</details>
+
+<details>
+<summary>Chat conversion details</summary>
+
+**Chat conversion** moves sessions between harnesses in two ways. *Direct:* pick a chat and use **Convert…** to write it straight into another installed harness's native store. *File-based migration:* export from harness A to an archive file, run **Convert archive…** on that file (single JSON or multi-chat ZIP), then use **Import** on the converted file and choose the project folder — the chat lands as a first-class session of harness B. This works even after harness A is uninstalled, since conversion operates purely on the exported file. Conversions always re-synthesize target-native events from AgentSwitch's normalized archive; source-harness event lines are never copied across formats, because each harness only parses its own schema. Converted chats are made discoverable by each harness's own mechanism — e.g. Codex sessions get a full native `session_meta` rollout **and a row in Codex's state database** (`state_N.sqlite` `threads`), since `/resume` lists from SQLite rather than scanning disk. Antigravity is never a conversion source or target because its chats are encrypted inside the CLI.
+
+</details>
 
 ## Install
 

@@ -385,10 +385,12 @@ fn collect_hook_items(
                 event: format!("{}{}", event_prefix, event),
                 order,
                 hook_name: hook_name.unwrap_or_else(|| matcher.to_string()),
-                fingerprint: if provider == ProviderId::Zcode {
-                    crate::toggler::zcode_entry_fingerprint(entry)
-                } else {
-                    json_fingerprint(entry)
+                fingerprint: match provider {
+                    ProviderId::Zcode => crate::toggler::zcode_entry_fingerprint(entry),
+                    _ if event_prefix == "_stashed_" => {
+                        crate::toggler::stash_entry_fingerprint(entry)
+                    }
+                    _ => json_fingerprint(entry),
                 },
             };
             let mut item = ConfigItem::new(display, ItemKind::Hook, path.to_owned(), provider);
@@ -400,6 +402,27 @@ fn collect_hook_items(
             }
             out.push(item);
         }
+    }
+    out
+}
+
+fn scan_stash_doc(path: &Path, provider: ProviderId, section_path: &str) -> Vec<ConfigItem> {
+    let mut out = vec![];
+    let stash_path = crate::toggler::sidecar_path(path);
+    let Some(doc) = read_json(&stash_path) else {
+        return out;
+    };
+    if let Some(stashed) = doc.as_object() {
+        let mapped = stashed.iter().map(|(e, v)| (e.clone(), v.clone()));
+        out.extend(collect_hook_items(
+            mapped,
+            path,
+            provider,
+            section_path,
+            &[],
+            "_stashed_",
+            true,
+        ));
     }
     out
 }
@@ -442,6 +465,118 @@ fn scan_hook_entries(
             true,
         ));
     }
+    out.extend(scan_stash_doc(path, provider, section_path));
+    out
+}
+
+fn scan_antigravity_hooks(path: &Path) -> Vec<ConfigItem> {
+    let mut out = vec![];
+    let Some(doc) = read_json(path) else {
+        return out;
+    };
+    let Some(root) = doc.as_object() else {
+        return out;
+    };
+    for (name, def) in root {
+        if name == "disabled" || name == "hooks" {
+            continue;
+        }
+        let Some(def) = def.as_object() else {
+            continue;
+        };
+        let Some(event) = def
+            .keys()
+            .find(|k| def.get(*k).is_some_and(|v| v.is_array()))
+        else {
+            continue;
+        };
+        let mut item = ConfigItem::new(
+            name.clone(),
+            ItemKind::Hook,
+            path.to_owned(),
+            ProviderId::Antigravity,
+        );
+        item.editable = false;
+        item.detail = Some(json_detail(&serde_json::Value::Object(def.clone())));
+        if def.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+            item.state = ItemState::Disabled;
+        }
+        item.hook_loc = Some(HookLoc {
+            section: String::new(),
+            event: event.clone(),
+            order: 0,
+            hook_name: name.clone(),
+            fingerprint: hook_def_fingerprint(&serde_json::Value::Object(def.clone())),
+        });
+        out.push(item);
+    }
+    out
+}
+
+fn hook_def_fingerprint(def: &serde_json::Value) -> String {
+    let mut stripped = def.clone();
+    if let Some(obj) = stripped.as_object_mut() {
+        obj.remove("enabled");
+    }
+    json_fingerprint(&stripped)
+}
+
+fn scan_kiro_hook_file(path: &Path) -> Vec<ConfigItem> {
+    let mut out = vec![];
+    let Some(doc) = read_json(path) else {
+        return out;
+    };
+    let Some(entries) = doc.get("hooks").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for (order, entry) in entries.iter().enumerate() {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        let trigger = obj.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
+        let name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|n| !n.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| format!("hook {}", order + 1));
+        let mut item = ConfigItem::new(name, ItemKind::Hook, path.to_owned(), ProviderId::Kiro);
+        item.editable = false;
+        item.detail = Some(json_detail(entry));
+        if obj.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+            item.state = ItemState::Disabled;
+        }
+        item.hook_loc = Some(HookLoc {
+            section: "hooks".into(),
+            event: trigger.into(),
+            order,
+            hook_name: obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .into(),
+            fingerprint: crate::toggler::kiro_entry_fingerprint(entry),
+        });
+        out.push(item);
+    }
+    out
+}
+
+fn scan_kiro_hook_files(d: &Path) -> Vec<ConfigItem> {
+    let mut out = vec![];
+    let Ok(rd) = std::fs::read_dir(d.join("hooks")) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = p.file_name().unwrap_or_default().to_string_lossy();
+        if name.ends_with(".json") || name.ends_with(".kiro.hook") {
+            out.extend(scan_kiro_hook_file(&p));
+        }
+    }
     out
 }
 
@@ -451,19 +586,6 @@ fn json_at<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a serde_json:
         current = current.get(segment)?;
     }
     Some(current)
-}
-
-fn read_antigravity_disabled_names(path: &Path) -> Vec<String> {
-    let Some(doc) = read_json(path) else {
-        return vec![];
-    };
-    doc.get("hooks")
-        .and_then(|hooks| hooks.get("disabled"))
-        .and_then(|value| value.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|value| value.as_str().map(String::from))
-        .collect()
 }
 
 fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
@@ -636,14 +758,19 @@ fn scan_antigravity(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         ProviderId::Antigravity,
     ));
     let hooks_path = d.join("hooks.json");
-    let disabled_names = read_antigravity_disabled_names(&hooks_path);
-    items.extend(scan_hook_entries(
-        &hooks_path,
-        ProviderId::Antigravity,
-        "hooks",
-        &disabled_names,
-        false,
-    ));
+    let legacy_wrapper = read_json(&hooks_path)
+        .is_some_and(|doc| doc.get("hooks").and_then(|v| v.as_object()).is_some());
+    if legacy_wrapper {
+        items.extend(scan_hook_entries(
+            &hooks_path,
+            ProviderId::Antigravity,
+            "hooks",
+            &[],
+            false,
+        ));
+    } else {
+        items.extend(scan_antigravity_hooks(&hooks_path));
+    }
     items
 }
 
@@ -688,6 +815,7 @@ fn scan_kiro(root: &Path, scope: Scope) -> Vec<ConfigItem> {
             }
         }
     }
+    items.extend(scan_kiro_hook_files(&d));
     items.extend(scan_json_keys(
         &d.join("settings").join("mcp.json"),
         "mcpServers",
@@ -971,54 +1099,242 @@ mod tests {
         std::fs::create_dir_all(&agents).unwrap();
         std::fs::write(
             agents.join("hooks.json"),
-            r#"{"hooks":{
-                "PreToolUse":[{"matcher":"Bash","hooks":[{"command":"check"}]}],
-                "PostToolUse":[{"matcher":"Bash","hooks":[{"command":"check"}]}],
-                "disabled":["PreToolUse:check"]
-            }}"#,
+            r#"{
+                "safety-gate": {
+                    "enabled": false,
+                    "PreToolUse": [{"matcher": "Bash", "hooks": [{"command": "check"}]}]
+                },
+                "linter": {
+                    "PostToolUse": [{"matcher": "Bash", "hooks": [{"command": "check"}]}]
+                }
+            }"#,
         )
         .unwrap();
 
         let items = scan_provider(ProviderId::Antigravity, &root, Scope::Project);
-        let hooks: Vec<_> = items
+        let gate = items
             .iter()
-            .filter(|item| item.kind == ItemKind::Hook)
-            .collect();
-        assert_eq!(hooks.len(), 2, "both events list their hook");
-        for hook in hooks {
-            let expected = if hook
-                .hook_loc
-                .as_ref()
-                .is_some_and(|loc| loc.event == "PreToolUse")
-            {
-                ItemState::Disabled
-            } else {
-                ItemState::Enabled
-            };
-            assert_eq!(hook.state, expected, "only the PreToolUse copy is disabled");
-        }
+            .find(|item| item.kind == ItemKind::Hook && item.name == "safety-gate")
+            .expect("documented hook definition listed");
+        assert_eq!(gate.state, ItemState::Disabled, "enabled:false honored");
+        assert_eq!(gate.hook_loc.as_ref().unwrap().event, "PreToolUse");
+        let linter = items
+            .iter()
+            .find(|item| item.kind == ItemKind::Hook && item.name == "linter")
+            .expect("second definition listed");
+        assert_eq!(linter.state, ItemState::Enabled);
     }
 
     #[test]
-    fn antigravity_legacy_bare_names_still_disable() {
-        let root = temp_dir("antigravity-legacy");
+    fn antigravity_documented_hook_toggles_survive_a_rescan() {
+        let root = temp_dir("antigravity-roundtrip");
         let agents = root.join(".agents");
         std::fs::create_dir_all(&agents).unwrap();
+        let hooks_path = agents.join("hooks.json");
         std::fs::write(
-            agents.join("hooks.json"),
-            r#"{"hooks":{
-                "PreToolUse":[{"matcher":"Bash","hooks":[{"command":"check"}]}],
-                "disabled":["check"]
-            }}"#,
+            &hooks_path,
+            r#"{"safety-gate":{"PreToolUse":[{"matcher":"Bash","hooks":[{"command":"check"}]}]}}"#,
         )
         .unwrap();
 
-        let items = scan_provider(ProviderId::Antigravity, &root, Scope::Project);
-        let hook = items
+        let mut item = scan_provider(ProviderId::Antigravity, &root, Scope::Project)
+            .into_iter()
+            .find(|item| item.kind == ItemKind::Hook)
+            .expect("hook discovered");
+        assert_eq!(item.state, ItemState::Enabled);
+
+        crate::toggler::toggle_item(&mut item).unwrap();
+        let rescanned = scan_provider(ProviderId::Antigravity, &root, Scope::Project)
+            .into_iter()
+            .find(|item| item.kind == ItemKind::Hook)
+            .expect("hook still listed");
+        assert_eq!(rescanned.state, ItemState::Disabled);
+
+        let mut item = rescanned;
+        crate::toggler::toggle_item(&mut item).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert!(
+            doc["safety-gate"].get("enabled").is_none(),
+            "re-enable must remove the flag instead of writing enabled:true"
+        );
+        assert_eq!(
+            doc["safety-gate"]["PreToolUse"][0]["hooks"][0]["command"], "check",
+            "definition content survives both directions"
+        );
+    }
+
+    #[test]
+    fn claude_hook_disable_rescan_enable_round_trip() {
+        let root = temp_dir("claude-roundtrip");
+        let claude = root.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let entry =
+            serde_json::json!({"matcher":"Bash","hooks":[{"type":"command","command":"lint"}]});
+        std::fs::write(
+            &settings,
+            serde_json::json!({"hooks":{"PreToolUse":[entry.clone()]}}).to_string(),
+        )
+        .unwrap();
+
+        let mut item = scan_provider(ProviderId::Claude, &root, Scope::Project)
+            .into_iter()
+            .find(|i| i.kind == ItemKind::Hook)
+            .expect("hook discovered");
+        crate::toggler::toggle_item(&mut item).unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(
+            doc.get("_agentswitch_disabled").is_none(),
+            "settings.json must stay free of agentswitch keys for schema validation"
+        );
+        let mut rescanned = scan_provider(ProviderId::Claude, &root, Scope::Project)
+            .into_iter()
+            .find(|i| i.kind == ItemKind::Hook)
+            .expect("stashed hook stays listed after rescan");
+        assert_eq!(rescanned.state, ItemState::Disabled);
+
+        crate::toggler::toggle_item(&mut rescanned).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            doc["hooks"]["PreToolUse"][0], entry,
+            "entry restored verbatim"
+        );
+        assert!(
+            !sidecar_path_exists(&settings),
+            "sidecar removed once empty"
+        );
+    }
+
+    #[test]
+    fn codex_hooks_json_disable_rescan_enable_round_trip() {
+        let root = temp_dir("codex-roundtrip");
+        let codex = root.join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let hooks_path = codex.join("hooks.json");
+        let entry =
+            serde_json::json!({"matcher":"Bash","hooks":[{"type":"command","command":"gate"}]});
+        std::fs::write(
+            &hooks_path,
+            serde_json::json!({"description":"d","hooks":{"PreToolUse":[entry.clone()]}})
+                .to_string(),
+        )
+        .unwrap();
+
+        let mut item = scan_provider(ProviderId::Codex, &root, Scope::Project)
+            .into_iter()
+            .find(|i| i.kind == ItemKind::Hook)
+            .expect("hook discovered");
+        crate::toggler::toggle_item(&mut item).unwrap();
+        let mut rescanned = scan_provider(ProviderId::Codex, &root, Scope::Project)
+            .into_iter()
+            .find(|i| i.kind == ItemKind::Hook)
+            .expect("stashed hook stays listed after rescan");
+        assert_eq!(rescanned.state, ItemState::Disabled);
+        crate::toggler::toggle_item(&mut rescanned).unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert_eq!(doc["hooks"]["PreToolUse"][0], entry);
+        assert!(!sidecar_path_exists(&hooks_path));
+    }
+
+    #[test]
+    fn kiro_native_hook_file_toggles_enabled_flag() {
+        let root = temp_dir("kiro-roundtrip");
+        let kiro = root.join(".kiro");
+        std::fs::create_dir_all(kiro.join("hooks")).unwrap();
+        let hook_file = kiro.join("hooks").join("lint-on-save.json");
+        std::fs::write(
+            &hook_file,
+            r#"{"version":"v1","hooks":[
+                {"name":"lint-on-save","trigger":"PostFileSave","matcher":"\\.ts$",
+                 "action":{"type":"command","command":"npm run lint"},"enabled":true},
+                {"name":"format-on-save","trigger":"PostFileSave",
+                 "action":{"type":"command","command":"prettier --write {{filePath}}"}}
+            ]}"#,
+        )
+        .unwrap();
+
+        let mut items = scan_provider(ProviderId::Kiro, &root, Scope::Project)
+            .into_iter()
+            .filter(|i| i.kind == ItemKind::Hook)
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 2, "both array entries listed");
+        let lint = items
+            .iter_mut()
+            .find(|i| i.name == "lint-on-save")
+            .expect("named hook listed");
+        assert_eq!(lint.state, ItemState::Enabled);
+        assert_eq!(lint.hook_loc.as_ref().unwrap().event, "PostFileSave");
+
+        crate::toggler::toggle_item(lint).unwrap();
+        let mut rescanned = scan_provider(ProviderId::Kiro, &root, Scope::Project)
+            .into_iter()
+            .filter(|i| i.kind == ItemKind::Hook)
+            .collect::<Vec<_>>();
+        let lint = rescanned
+            .iter_mut()
+            .find(|i| i.name == "lint-on-save")
+            .expect("hook still listed");
+        assert_eq!(
+            lint.state,
+            ItemState::Disabled,
+            "rescan honors enabled:false"
+        );
+        crate::toggler::toggle_item(lint).unwrap();
+        let fmt = rescanned
             .iter()
-            .find(|item| item.kind == ItemKind::Hook && item.name == "check")
-            .expect("hook must be listed");
-        assert_eq!(hook.state, ItemState::Disabled, "legacy bare name honored");
+            .find(|i| i.name == "format-on-save")
+            .expect("second hook listed");
+        assert_eq!(fmt.state, ItemState::Enabled, "missing enabled defaults on");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hook_file).unwrap()).unwrap();
+        assert!(doc["hooks"][0].get("enabled").is_none());
+        assert!(doc["hooks"][1].get("enabled").is_none());
+    }
+
+    fn sidecar_path_exists(config: &Path) -> bool {
+        crate::toggler::sidecar_path(config).exists()
+    }
+
+    #[test]
+    fn legacy_in_file_stash_still_shows_and_reenables_after_rescan() {
+        let root = temp_dir("legacy-roundtrip");
+        let claude = root.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let entry =
+            serde_json::json!({"matcher":"Bash","hooks":[{"type":"command","command":"old"}]});
+        let stashed = serde_json::json!({
+            "_agentswitch_order": 0,
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "old"}]
+        });
+        std::fs::write(
+            &settings,
+            serde_json::json!({
+                "hooks":{"PreToolUse":[]},
+                "_agentswitch_disabled":{"PreToolUse":[stashed]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut item = scan_provider(ProviderId::Claude, &root, Scope::Project)
+            .into_iter()
+            .find(|i| i.kind == ItemKind::Hook)
+            .expect("legacy stashed hook listed");
+        assert_eq!(item.state, ItemState::Disabled);
+        crate::toggler::toggle_item(&mut item).unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(doc["hooks"]["PreToolUse"][0], entry);
+        assert!(doc.get("_agentswitch_disabled").is_none());
     }
 
     #[test]
