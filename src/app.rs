@@ -138,6 +138,11 @@ impl App {
         {
             self.hook_filter = hook_diag::HookFilter::All;
         }
+        if let FilterKind::Specific(kind) = self.filter {
+            if !self.items.iter().any(|item| item.kind == kind) {
+                self.filter = FilterKind::All;
+            }
+        }
     }
 
     fn rescan_chats(&mut self) {
@@ -704,7 +709,11 @@ fn open_path(path: &std::path::Path) -> std::io::Result<()> {
     } else {
         std::process::Command::new("xdg-open").arg(path).spawn()
     };
-    result.map(|_| ())
+    result.map(|mut child| {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    })
 }
 
 fn truncate_error(error: anyhow::Error) -> String {

@@ -62,13 +62,14 @@ pub fn show(ui: &mut Ui, editor: &mut EditorState) {
             });
         });
         match editor.error.as_deref() {
-            Some("__confirm_close__") => {
+            Some("__confirm_close__") if editor.dirty => {
                 ui.label(
                     RichText::new("Unsaved changes — close anyway?")
                         .font(theme::small_font())
                         .color(theme::YELLOW),
                 );
             }
+            Some("__confirm_close__") | None => {}
             Some(message) => {
                 ui.label(
                     RichText::new(message)
@@ -76,7 +77,6 @@ pub fn show(ui: &mut Ui, editor: &mut EditorState) {
                         .color(theme::YELLOW),
                 );
             }
-            None => {}
         }
         ui.separator();
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {

@@ -107,17 +107,7 @@ pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResu
                     name_color,
                 );
                 let path_str = item.path.to_string_lossy();
-                let short = if path_str.len() > 28 {
-                    let start = path_str
-                        .char_indices()
-                        .rev()
-                        .nth(24)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    format!("...{}", &path_str[start..])
-                } else {
-                    path_str.to_string()
-                };
+                let short = super::tail_ellipsis(&path_str, 28);
                 ui.painter().text(
                     egui::pos2(r.right() - 52.0, r.center().y - 6.0),
                     egui::Align2::RIGHT_TOP,

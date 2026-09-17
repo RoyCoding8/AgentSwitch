@@ -60,6 +60,9 @@ pub enum ProviderId {
     Kiro,
     OpenCode,
     Zcode,
+    Junie,
+    Muse,
+    Grok,
 }
 
 impl ProviderId {
@@ -70,6 +73,9 @@ impl ProviderId {
         Self::Kiro,
         Self::OpenCode,
         Self::Zcode,
+        Self::Junie,
+        Self::Muse,
+        Self::Grok,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -79,6 +85,9 @@ impl ProviderId {
             Self::Kiro => "Kiro",
             Self::OpenCode => "OpenCode",
             Self::Zcode => "ZCode",
+            Self::Junie => "Junie CLI",
+            Self::Muse => "Muse Code",
+            Self::Grok => "Grok Build",
         }
     }
     pub fn color(self) -> egui::Color32 {
@@ -89,6 +98,9 @@ impl ProviderId {
             Self::Kiro => egui::Color32::from_rgb(0x7B, 0x61, 0xFF),
             Self::OpenCode => egui::Color32::from_rgb(0xFF, 0x6B, 0x35),
             Self::Zcode => egui::Color32::from_rgb(0x3D, 0xB4, 0xE4),
+            Self::Junie => egui::Color32::from_rgb(0xF3, 0x2B, 0x7F),
+            Self::Muse => egui::Color32::from_rgb(0x00, 0x64, 0xE0),
+            Self::Grok => egui::Color32::from_rgb(0x94, 0xA3, 0xB8),
         }
     }
 }
@@ -151,7 +163,7 @@ impl ConfigItem {
         let editable = matches!(
             kind,
             ItemKind::InstructionFile | ItemKind::Rule | ItemKind::SteeringRule
-        ) && kind != ItemKind::Plugin;
+        );
         let state = if path.extension() == Some(OsStr::new("disabled"))
             || path.parent().and_then(|parent| parent.extension()) == Some(OsStr::new("disabled"))
         {

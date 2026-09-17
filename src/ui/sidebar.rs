@@ -39,17 +39,7 @@ pub fn show(
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            let path_text = if workspace.len() > 28 {
-                let start = workspace
-                    .char_indices()
-                    .rev()
-                    .nth(24)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                format!("...{}", &workspace[start..])
-            } else {
-                workspace.to_string()
-            };
+            let path_text = super::tail_ellipsis(workspace, 28);
             ui.label(
                 RichText::new(path_text)
                     .font(theme::small_font())

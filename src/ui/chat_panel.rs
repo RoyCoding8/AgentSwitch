@@ -33,7 +33,7 @@ pub fn show(
     }
     let mut request_arm: Option<(Vec<String>, bool)> = None;
     let visible = visible_indices(sessions, search);
-    let selected_indices = selected_indices(sessions, selected);
+    let selected_indices = selected_indices(sessions, selected, search);
     ui.horizontal_wrapped(|ui| {
         if ui.button("Import").clicked() {
             action.import = true;
@@ -316,11 +316,17 @@ fn visible_indices(sessions: &[ChatSession], search: &str) -> Vec<usize> {
         .collect()
 }
 
-fn selected_indices(sessions: &[ChatSession], selected: &HashSet<String>) -> Vec<usize> {
+fn selected_indices(
+    sessions: &[ChatSession],
+    selected: &HashSet<String>,
+    search: &str,
+) -> Vec<usize> {
     sessions
         .iter()
         .enumerate()
-        .filter(|(_, s)| selected.contains(&chat::session_key(s)))
+        .filter(|(_, s)| {
+            selected.contains(&chat::session_key(s)) && chat::metadata_matches(s, search)
+        })
         .map(|(i, _)| i)
         .collect()
 }
@@ -358,6 +364,7 @@ fn source_label(session: &ChatSession) -> &'static str {
         chat::ChatSourceKind::ImportedArchive => "archive",
         chat::ChatSourceKind::KiroCli => "kiro-cli",
         chat::ChatSourceKind::OpenCodeDb => "opencode-db",
+        chat::ChatSourceKind::GrokDir => "grok-session",
     }
 }
 
@@ -404,5 +411,24 @@ mod tests {
         let after = vec![b.clone(), c.clone()];
         let targets = resolve_keys(&after, &keys);
         assert_eq!(targets, vec![1]);
+    }
+
+    #[test]
+    fn bulk_selection_is_limited_to_the_visible_search_matches() {
+        let a = session("alpha", "C:\\alpha.json");
+        let b = session("beta", "C:\\beta.json");
+        let sessions = vec![a, b];
+        let mut selected = HashSet::new();
+        for s in &sessions {
+            selected.insert(chat::session_key(s));
+        }
+
+        let chosen = selected_indices(&sessions, &selected, "beta");
+        assert_eq!(
+            chosen,
+            vec![1],
+            "hidden rows must not be hit by bulk actions"
+        );
+        assert_eq!(selected_indices(&sessions, &selected, "").len(), 2);
     }
 }

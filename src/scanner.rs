@@ -11,6 +11,9 @@ pub fn scan_provider(id: ProviderId, root: &Path, scope: Scope) -> Vec<ConfigIte
         ProviderId::Kiro => scan_kiro(root, scope),
         ProviderId::OpenCode => scan_opencode(root, scope),
         ProviderId::Zcode => scan_zcode(root, scope),
+        ProviderId::Junie => scan_junie(root, scope),
+        ProviderId::Muse => scan_muse(root, scope),
+        ProviderId::Grok => scan_grok(root, scope),
     })
 }
 
@@ -19,7 +22,11 @@ pub fn provider_exists(id: ProviderId, root: &Path, scope: Scope) -> bool {
     let shared_project_path = scope == Scope::Project
         && matches!(
             id,
-            ProviderId::Codex | ProviderId::Antigravity | ProviderId::Zcode
+            ProviderId::Codex
+                | ProviderId::Antigravity
+                | ProviderId::Zcode
+                | ProviderId::OpenCode
+                | ProviderId::Muse
         )
         && root.join(".agents").is_dir();
     configured
@@ -33,7 +40,12 @@ pub fn provider_dir(id: ProviderId, root: &Path, scope: Scope) -> anyhow::Result
     provider::provider_dir(id, root, scope)
 }
 
-fn collect_md(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
+fn collect_dir(
+    dir: &Path,
+    kind: ItemKind,
+    provider: ProviderId,
+    keep: impl Fn(&Path, &str) -> bool,
+) -> Vec<ConfigItem> {
     let mut out = vec![];
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -43,7 +55,7 @@ fn collect_md(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<ConfigIte
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            if p.is_file() && (name.ends_with(".md") || name.ends_with(".md.disabled")) {
+            if keep(&p, &name) {
                 out.push(ConfigItem::new(name, kind, p, provider));
             }
         }
@@ -51,43 +63,34 @@ fn collect_md(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<ConfigIte
     out
 }
 
+fn collect_md(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
+    collect_dir(dir, kind, provider, |p, name| {
+        p.is_file() && (name.ends_with(".md") || name.ends_with(".md.disabled"))
+    })
+}
+
 fn collect_subdirs(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
-    let mut out = vec![];
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                let name = p
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                out.push(ConfigItem::new(name, kind, p, provider));
-            }
-        }
-    }
-    out
+    collect_dir(dir, kind, provider, |p, _| p.is_dir())
+}
+
+fn disabled_dir(dir: &Path) -> PathBuf {
+    let mut dis_dir = dir.to_path_buf();
+    dis_dir.set_file_name(format!(
+        "{}.disabled",
+        dir.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    dis_dir
 }
 
 fn collect_md_both(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
     let mut out = collect_md(dir, kind, provider);
-    let mut dis_dir = dir.to_path_buf();
-    if let Some(name) = dir.file_name() {
-        dis_dir.set_file_name(format!("{}.disabled", name.to_string_lossy()));
-        out.extend(collect_md(&dis_dir, kind, provider));
-    }
+    out.extend(collect_md(&disabled_dir(dir), kind, provider));
     out
 }
 
 fn collect_subdirs_both(dir: &Path, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
     let mut out = collect_subdirs(dir, kind, provider);
-    let mut dis_dir = dir.to_path_buf();
-    if let Some(name) = dir.file_name() {
-        let mut disabled_name = name.to_os_string();
-        disabled_name.push(".disabled");
-        dis_dir.set_file_name(disabled_name);
-        out.extend(collect_subdirs(&dis_dir, kind, provider));
-    }
+    out.extend(collect_subdirs(&disabled_dir(dir), kind, provider));
     out
 }
 
@@ -112,6 +115,39 @@ fn deduplicate_items(items: Vec<ConfigItem>) -> Vec<ConfigItem> {
             ))
         })
         .collect()
+}
+
+fn instruction_files(
+    scope: Scope,
+    root: &Path,
+    d: &Path,
+    names: &[&str],
+    provider: ProviderId,
+) -> Vec<ConfigItem> {
+    let base = if scope == Scope::Project { root } else { d };
+    let mut out = vec![];
+    for name in names {
+        out.extend(check_file(
+            base.join(name),
+            ItemKind::InstructionFile,
+            provider,
+        ));
+    }
+    out
+}
+
+fn shared_skills_items(scope: Scope, root: &Path, provider: ProviderId) -> Vec<ConfigItem> {
+    let dir = if scope == Scope::Project {
+        root.join(".agents").join("skills")
+    } else {
+        provider::home_dir()
+            .map(|home| home.join(".agents").join("skills"))
+            .unwrap_or_default()
+    };
+    if dir.as_os_str().is_empty() {
+        return vec![];
+    }
+    collect_subdirs_both(&dir, ItemKind::Skill, provider)
 }
 
 fn check_file(path: PathBuf, kind: ItemKind, provider: ProviderId) -> Vec<ConfigItem> {
@@ -188,13 +224,15 @@ fn scan_json_keys(path: &Path, key: &str, kind: ItemKind, provider: ProviderId) 
                 };
                 item.editable = false;
                 item.toggle_spec = Some(match (provider, key) {
-                    (ProviderId::OpenCode, "mcp" | "agent") => ToggleSpec::JsonFlag {
-                        section: key.to_string(),
-                        name: name.clone(),
-                        flag: "enabled".into(),
-                        enabled_value: true,
-                        disabled_value: false,
-                    },
+                    (ProviderId::OpenCode, "mcp" | "agent") | (ProviderId::Muse, "mcp_servers") => {
+                        ToggleSpec::JsonFlag {
+                            section: key.to_string(),
+                            name: name.clone(),
+                            flag: "enabled".into(),
+                            enabled_value: true,
+                            disabled_value: false,
+                        }
+                    }
                     (ProviderId::Antigravity | ProviderId::Kiro, "mcpServers") => {
                         ToggleSpec::JsonFlag {
                             section: key.to_string(),
@@ -204,10 +242,6 @@ fn scan_json_keys(path: &Path, key: &str, kind: ItemKind, provider: ProviderId) 
                             disabled_value: true,
                         }
                     }
-                    (ProviderId::Claude, "mcpServers") => ToggleSpec::JsonStash {
-                        section: key.to_string(),
-                        name: name.clone(),
-                    },
                     _ => ToggleSpec::JsonStash {
                         section: key.to_string(),
                         name: name.clone(),
@@ -299,6 +333,21 @@ fn scan_toml_mcp(path: &Path, provider: ProviderId) -> Vec<ConfigItem> {
     out
 }
 
+fn hook_names(event: &str, entry: &serde_json::Value) -> (String, String) {
+    let matcher = entry.get("matcher").and_then(|v| v.as_str()).unwrap_or("*");
+    let hook_name = entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .and_then(|a| a.first())
+        .and_then(|h| h.get("name").or_else(|| h.get("command")))
+        .and_then(|n| n.as_str())
+        .map(String::from);
+    let display = hook_name
+        .clone()
+        .unwrap_or_else(|| format!("{}: {}", event, matcher));
+    (display, hook_name.unwrap_or_else(|| matcher.to_string()))
+}
+
 fn scan_toml_hooks(path: &Path, provider: ProviderId) -> Vec<ConfigItem> {
     let mut out = vec![];
     let Some(doc) = read_toml(path) else {
@@ -312,28 +361,18 @@ fn scan_toml_hooks(path: &Path, provider: ProviderId) -> Vec<ConfigItem> {
         if event.ends_with("managed_dir") {
             continue;
         }
-        let arr = match entries.as_array() {
-            Some(a) => a,
-            _ => continue,
+        let Some(arr) = entries.as_array() else {
+            continue;
         };
         for (order, entry) in arr.iter().enumerate() {
-            let matcher = entry.get("matcher").and_then(|v| v.as_str()).unwrap_or("*");
-            let hook_name = entry
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .and_then(|a| a.first())
-                .and_then(|h| h.get("name").or_else(|| h.get("command")))
-                .and_then(|n| n.as_str())
-                .map(String::from);
-            let display = hook_name
-                .clone()
-                .unwrap_or_else(|| format!("{}: {}", event, matcher));
+            let json_entry = toml_to_json(entry);
+            let (display, hook_name) = hook_names(event, &json_entry);
             let loc = HookLoc {
                 section: "hooks".into(),
                 event: event.clone(),
                 order,
-                hook_name: hook_name.unwrap_or_else(|| matcher.to_string()),
-                fingerprint: json_fingerprint(&toml_to_json(entry)),
+                hook_name,
+                fingerprint: json_fingerprint(&json_entry),
             };
             let mut item = ConfigItem::new(display, ItemKind::Hook, path.to_owned(), provider);
             item.hook_loc = Some(loc);
@@ -350,7 +389,6 @@ fn collect_hook_items(
     path: &Path,
     provider: ProviderId,
     section_path: &str,
-    disabled_names: &[String],
     event_prefix: &str,
     force_disabled: bool,
 ) -> Vec<ConfigItem> {
@@ -361,36 +399,21 @@ fn collect_hook_items(
             _ => continue,
         };
         for (order, entry) in arr.iter().enumerate() {
-            let matcher = entry.get("matcher").and_then(|v| v.as_str()).unwrap_or("*");
-            let hook_name = entry
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .and_then(|a| a.first())
-                .and_then(|h| h.get("name").or_else(|| h.get("command")))
-                .and_then(|n| n.as_str())
-                .map(String::from);
-            let display = hook_name
-                .clone()
-                .unwrap_or_else(|| format!("{}: {}", event, matcher));
+            let (display, hook_name) = hook_names(&event, entry);
             let entry_flag_disabled = provider == ProviderId::Zcode
                 && entry.get("enabled").and_then(|v| v.as_bool()) == Some(false);
-            let is_disabled = force_disabled
-                || entry_flag_disabled
-                || hook_name.as_ref().is_some_and(|n| {
-                    disabled_names.contains(n)
-                        || disabled_names.contains(&format!("{}:{}", event, n))
-                });
+            let is_disabled = force_disabled || entry_flag_disabled;
             let loc = HookLoc {
                 section: section_path.to_string(),
                 event: format!("{}{}", event_prefix, event),
                 order,
-                hook_name: hook_name.unwrap_or_else(|| matcher.to_string()),
-                fingerprint: match provider {
-                    ProviderId::Zcode => crate::toggler::zcode_entry_fingerprint(entry),
-                    _ if event_prefix == "_stashed_" => {
-                        crate::toggler::stash_entry_fingerprint(entry)
-                    }
-                    _ => json_fingerprint(entry),
+                hook_name,
+                fingerprint: if event_prefix == "_stashed_" {
+                    crate::toggler::stash_entry_fingerprint(entry)
+                } else if provider == ProviderId::Zcode {
+                    crate::toggler::zcode_entry_fingerprint(entry)
+                } else {
+                    json_fingerprint(entry)
                 },
             };
             let mut item = ConfigItem::new(display, ItemKind::Hook, path.to_owned(), provider);
@@ -419,7 +442,6 @@ fn scan_stash_doc(path: &Path, provider: ProviderId, section_path: &str) -> Vec<
             path,
             provider,
             section_path,
-            &[],
             "_stashed_",
             true,
         ));
@@ -431,7 +453,6 @@ fn scan_hook_entries(
     path: &Path,
     provider: ProviderId,
     section_path: &str,
-    disabled_names: &[String],
     force_disabled: bool,
 ) -> Vec<ConfigItem> {
     let mut out = vec![];
@@ -448,7 +469,6 @@ fn scan_hook_entries(
             path,
             provider,
             section_path,
-            disabled_names,
             "",
             force_disabled,
         ));
@@ -460,7 +480,6 @@ fn scan_hook_entries(
             path,
             provider,
             section_path,
-            &[],
             "_stashed_",
             true,
         ));
@@ -592,13 +611,7 @@ fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     let Ok(d) = provider_dir(ProviderId::Claude, root, scope) else {
         return vec![];
     };
-    let mut items = vec![];
-    let instructions: &Path = if scope == Scope::Project { root } else { &d };
-    items.extend(check_file(
-        instructions.join("CLAUDE.md"),
-        ItemKind::InstructionFile,
-        ProviderId::Claude,
-    ));
+    let mut items = instruction_files(scope, root, &d, &["CLAUDE.md"], ProviderId::Claude);
     items.extend(collect_subdirs_both(
         &d.join("skills"),
         ItemKind::Skill,
@@ -609,14 +622,14 @@ fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         ItemKind::Rule,
         ProviderId::Claude,
     ));
-    let settings = d.join("settings.json");
-    items.extend(scan_hook_entries(
-        &settings,
-        ProviderId::Claude,
-        "hooks",
-        &[],
-        false,
-    ));
+    for settings_name in ["settings.json", "settings.local.json"] {
+        items.extend(scan_hook_entries(
+            &d.join(settings_name),
+            ProviderId::Claude,
+            "hooks",
+            false,
+        ));
+    }
     let mcp_path = match scope {
         Scope::Project => root.join(".mcp.json"),
         Scope::Global => provider::home_dir()
@@ -625,6 +638,13 @@ fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     };
     let mut mcp_items = scan_json_keys(&mcp_path, "mcpServers", ItemKind::Mcp, ProviderId::Claude);
     if scope == Scope::Project {
+        let stash_disabled: std::collections::HashSet<String> = read_json(&mcp_path)
+            .and_then(|doc| {
+                doc.get("_disabled_mcpServers")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| obj.keys().cloned().collect())
+            })
+            .unwrap_or_default();
         let approval_path = d.join("settings.local.json");
         let approval_path = if approval_path.exists() {
             approval_path
@@ -637,6 +657,9 @@ fn scan_claude(root: &Path, scope: Scope) -> Vec<ConfigItem> {
             "disabledMcpjsonServers",
         );
         for item in &mut mcp_items {
+            if stash_disabled.contains(&item.name) {
+                continue;
+            }
             if approval.1.contains(&item.name) {
                 item.state = ItemState::Disabled;
             }
@@ -656,24 +679,9 @@ fn scan_codex(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     let Ok(d) = provider_dir(ProviderId::Codex, root, scope) else {
         return vec![];
     };
-    let mut items = vec![];
+    let mut items = instruction_files(scope, root, &d, &["AGENTS.md"], ProviderId::Codex);
     if scope == Scope::Project {
-        items.extend(check_file(
-            root.join("AGENTS.md"),
-            ItemKind::InstructionFile,
-            ProviderId::Codex,
-        ));
-        items.extend(collect_subdirs_both(
-            &root.join(".agents").join("skills"),
-            ItemKind::Skill,
-            ProviderId::Codex,
-        ));
-    } else {
-        items.extend(check_file(
-            d.join("AGENTS.md"),
-            ItemKind::InstructionFile,
-            ProviderId::Codex,
-        ));
+        items.extend(shared_skills_items(scope, root, ProviderId::Codex));
     }
     items.extend(collect_subdirs_both(
         &d.join("skills"),
@@ -693,13 +701,7 @@ fn scan_codex(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     }
     let hooks = d.join("hooks.json");
     if hooks.exists() {
-        items.extend(scan_hook_entries(
-            &hooks,
-            ProviderId::Codex,
-            "hooks",
-            &[],
-            false,
-        ));
+        items.extend(scan_hook_entries(&hooks, ProviderId::Codex, "hooks", false));
     }
     let hooks_dis = PathBuf::from(format!("{}.disabled", hooks.display()));
     if hooks_dis.exists() {
@@ -718,33 +720,16 @@ fn scan_antigravity(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     let Ok(d) = provider_dir(ProviderId::Antigravity, root, scope) else {
         return vec![];
     };
+    items.extend(instruction_files(
+        scope,
+        root,
+        &d,
+        &["GEMINI.md", "AGENTS.md"],
+        ProviderId::Antigravity,
+    ));
     if scope == Scope::Project {
-        items.extend(check_file(
-            root.join("GEMINI.md"),
-            ItemKind::InstructionFile,
-            ProviderId::Antigravity,
-        ));
-        items.extend(check_file(
-            root.join("AGENTS.md"),
-            ItemKind::InstructionFile,
-            ProviderId::Antigravity,
-        ));
-        items.extend(collect_subdirs_both(
-            &root.join(".agents").join("skills"),
-            ItemKind::Skill,
-            ProviderId::Antigravity,
-        ));
+        items.extend(shared_skills_items(scope, root, ProviderId::Antigravity));
     } else {
-        items.extend(check_file(
-            d.join("GEMINI.md"),
-            ItemKind::InstructionFile,
-            ProviderId::Antigravity,
-        ));
-        items.extend(check_file(
-            d.join("AGENTS.md"),
-            ItemKind::InstructionFile,
-            ProviderId::Antigravity,
-        ));
         items.extend(collect_subdirs_both(
             &d.join("skills"),
             ItemKind::Skill,
@@ -765,7 +750,6 @@ fn scan_antigravity(root: &Path, scope: Scope) -> Vec<ConfigItem> {
             &hooks_path,
             ProviderId::Antigravity,
             "hooks",
-            &[],
             false,
         ));
     } else {
@@ -798,22 +782,11 @@ fn scan_kiro(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     for (agents_dir, force_disabled) in
         [(d.join("agents"), false), (d.join("agents.disabled"), true)]
     {
-        if agents_dir.is_dir() {
-            if let Ok(rd) = std::fs::read_dir(&agents_dir) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                        items.extend(scan_hook_entries(
-                            &p,
-                            ProviderId::Kiro,
-                            "hooks",
-                            &[],
-                            force_disabled,
-                        ));
-                    }
-                }
-            }
-        }
+        items.extend(collect_hook_files(
+            &agents_dir,
+            ProviderId::Kiro,
+            force_disabled,
+        ));
     }
     items.extend(scan_kiro_hook_files(&d));
     items.extend(scan_json_keys(
@@ -829,38 +802,19 @@ fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     let Ok(d) = provider_dir(ProviderId::OpenCode, root, scope) else {
         return vec![];
     };
-    let mut items = vec![];
-    if scope == Scope::Project {
-        items.extend(check_file(
-            root.join("AGENTS.md"),
-            ItemKind::InstructionFile,
-            ProviderId::OpenCode,
-        ));
-    } else {
-        items.extend(check_file(
-            d.join("AGENTS.md"),
-            ItemKind::InstructionFile,
-            ProviderId::OpenCode,
-        ));
-    }
+    let mut items = instruction_files(scope, root, &d, &["AGENTS.md"], ProviderId::OpenCode);
     items.extend(collect_subdirs_both(
         &d.join("skills"),
         ItemKind::Skill,
         ProviderId::OpenCode,
     ));
     if scope == Scope::Project {
-        items.extend(collect_subdirs_both(
-            &root.join(".agents").join("skills"),
-            ItemKind::Skill,
-            ProviderId::OpenCode,
-        ));
+        items.extend(shared_skills_items(scope, root, ProviderId::OpenCode));
         items.extend(collect_subdirs_both(
             &root.join(".claude").join("skills"),
             ItemKind::Skill,
             ProviderId::OpenCode,
         ));
-    }
-    if scope == Scope::Project {
         items.extend(collect_md_both(
             &d.join("agent"),
             ItemKind::Agent,
@@ -937,34 +891,13 @@ fn scan_zcode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     let Ok(d) = provider_dir(ProviderId::Zcode, root, scope) else {
         return vec![];
     };
-    let mut items = vec![];
-    items.extend(check_file(
-        if scope == Scope::Project {
-            root.join("AGENTS.md")
-        } else {
-            d.join("AGENTS.md")
-        },
-        ItemKind::InstructionFile,
-        ProviderId::Zcode,
-    ));
+    let mut items = instruction_files(scope, root, &d, &["AGENTS.md"], ProviderId::Zcode);
     items.extend(collect_subdirs_both(
         &d.join("skills"),
         ItemKind::Skill,
         ProviderId::Zcode,
     ));
-    let shared_skills = match scope {
-        Scope::Project => root.join(".agents").join("skills"),
-        Scope::Global => provider::home_dir()
-            .map(|home| home.join(".agents").join("skills"))
-            .unwrap_or_default(),
-    };
-    if !shared_skills.as_os_str().is_empty() {
-        items.extend(collect_subdirs_both(
-            &shared_skills,
-            ItemKind::Skill,
-            ProviderId::Zcode,
-        ));
-    }
+    items.extend(shared_skills_items(scope, root, ProviderId::Zcode));
 
     let config_path = match scope {
         Scope::Project => {
@@ -1002,11 +935,163 @@ fn scan_zcode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
             &config_path,
             ProviderId::Zcode,
             "hooks/events",
-            &[],
             false,
         ));
     }
     items
+}
+
+fn scan_junie(root: &Path, scope: Scope) -> Vec<ConfigItem> {
+    let Ok(d) = provider_dir(ProviderId::Junie, root, scope) else {
+        return vec![];
+    };
+    let mut items = vec![];
+    if scope == Scope::Project {
+        items.extend(check_file(
+            d.join("AGENTS.md"),
+            ItemKind::InstructionFile,
+            ProviderId::Junie,
+        ));
+        items.extend(check_file(
+            root.join("AGENTS.md"),
+            ItemKind::InstructionFile,
+            ProviderId::Junie,
+        ));
+        items.extend(check_file(
+            d.join("playbook.md"),
+            ItemKind::InstructionFile,
+            ProviderId::Junie,
+        ));
+        items.extend(check_file(
+            d.join("guidelines.md"),
+            ItemKind::InstructionFile,
+            ProviderId::Junie,
+        ));
+        items.extend(collect_md_both(
+            &d.join("rules"),
+            ItemKind::Rule,
+            ProviderId::Junie,
+        ));
+        items.extend(collect_md_both(
+            &d.join("guidelines"),
+            ItemKind::Rule,
+            ProviderId::Junie,
+        ));
+    }
+    items.extend(collect_md_both(
+        &d.join("commands"),
+        ItemKind::Skill,
+        ProviderId::Junie,
+    ));
+    items.extend(collect_subdirs_both(
+        &d.join("skills"),
+        ItemKind::Skill,
+        ProviderId::Junie,
+    ));
+    items.extend(shared_skills_items(scope, root, ProviderId::Junie));
+    items.extend(scan_json_keys(
+        &d.join("mcp").join("mcp.json"),
+        "mcpServers",
+        ItemKind::Mcp,
+        ProviderId::Junie,
+    ));
+    if scope == Scope::Global {
+        items.extend(scan_hook_entries(
+            &d.join("config.json"),
+            ProviderId::Junie,
+            "hooks",
+            false,
+        ));
+    }
+    items
+}
+
+fn scan_muse(root: &Path, scope: Scope) -> Vec<ConfigItem> {
+    let Ok(d) = provider_dir(ProviderId::Muse, root, scope) else {
+        return vec![];
+    };
+    let mut items = vec![];
+    if scope == Scope::Project {
+        items.extend(check_file(
+            root.join("AGENTS.md"),
+            ItemKind::InstructionFile,
+            ProviderId::Muse,
+        ));
+        items.extend(check_file(
+            root.join(".agents").join("AGENTS.md"),
+            ItemKind::InstructionFile,
+            ProviderId::Muse,
+        ));
+        items.extend(scan_hook_entries(
+            &root.join(".muse").join("hooks.json"),
+            ProviderId::Muse,
+            "hooks",
+            false,
+        ));
+    } else {
+        items.extend(check_file(
+            d.join("AGENTS.md"),
+            ItemKind::InstructionFile,
+            ProviderId::Muse,
+        ));
+        items.extend(collect_subdirs_both(
+            &d.join("skills"),
+            ItemKind::Skill,
+            ProviderId::Muse,
+        ));
+        items.extend(scan_json_keys(
+            &d.join("settings.json"),
+            "mcp_servers",
+            ItemKind::Mcp,
+            ProviderId::Muse,
+        ));
+        items.extend(scan_hook_entries(
+            &d.join("settings.json"),
+            ProviderId::Muse,
+            "hooks",
+            false,
+        ));
+    }
+    items.extend(shared_skills_items(scope, root, ProviderId::Muse));
+    items
+}
+
+fn scan_grok(root: &Path, scope: Scope) -> Vec<ConfigItem> {
+    let Ok(d) = provider_dir(ProviderId::Grok, root, scope) else {
+        return vec![];
+    };
+    let mut items = instruction_files(scope, root, &d, &["AGENTS.md"], ProviderId::Grok);
+    items.extend(collect_md_both(
+        &d.join("rules"),
+        ItemKind::Rule,
+        ProviderId::Grok,
+    ));
+    items.extend(collect_subdirs_both(
+        &d.join("skills"),
+        ItemKind::Skill,
+        ProviderId::Grok,
+    ));
+    items.extend(scan_toml_mcp(&d.join("config.toml"), ProviderId::Grok));
+    items.extend(collect_hook_files(
+        &d.join("hooks"),
+        ProviderId::Grok,
+        false,
+    ));
+    items
+}
+
+fn collect_hook_files(dir: &Path, provider: ProviderId, force_disabled: bool) -> Vec<ConfigItem> {
+    let mut out = vec![];
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_file() && p.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            out.extend(scan_hook_entries(&p, provider, "hooks", force_disabled));
+        }
+    }
+    out
 }
 
 fn scan_json_keys_at(path: &Path, section_path: &str, provider: ProviderId) -> Vec<ConfigItem> {
@@ -1040,21 +1125,59 @@ fn scan_json_keys_at(path: &Path, section_path: &str, provider: ProviderId) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("agentswitch-scanner-{name}-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    #[test]
+    fn stash_disabled_project_mcp_restores_through_the_stash_spec() {
+        let root = crate::test_env::temp_dir("scanner-claude-stash-mcp");
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"_disabled_mcpServers":{"docs":{"command":"ctx"}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+
+        let items = scan_provider(ProviderId::Claude, &root, Scope::Project);
+        let docs = items
+            .iter()
+            .find(|item| item.kind == ItemKind::Mcp && item.name == "docs")
+            .unwrap();
+        assert_eq!(docs.state, ItemState::Disabled);
+        assert!(
+            matches!(docs.toggle_spec, Some(ToggleSpec::JsonStash { .. })),
+            "stash-parked servers must toggle through the stash, not the approval lists"
+        );
+        let mut docs = docs.clone();
+        crate::toggler::toggle_item(&mut docs).unwrap();
+        let mcp: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(mcp["mcpServers"]["docs"]["command"], "ctx");
+        assert!(mcp.get("_disabled_mcpServers").is_none());
+    }
+
+    #[test]
+    fn claude_hooks_in_settings_local_json_are_scanned() {
+        let root = crate::test_env::temp_dir("scanner-claude-local-hooks");
+        let claude = root.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.local.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"local-guard"}]}]}}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Claude, &root, Scope::Project);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.kind == ItemKind::Hook && item.name == "local-guard"),
+            "hooks declared in settings.local.json must appear in the scan"
+        );
     }
 
     #[test]
     fn claude_project_mcp_comes_from_dot_mcp_json() {
-        let root = temp_dir("claude-mcp");
+        let root = crate::test_env::temp_dir("scanner-claude-mcp");
         std::fs::write(
             root.join(".mcp.json"),
             r#"{"mcpServers":{"docs":{"type":"http","url":"https://example.test"}}}"#,
@@ -1079,7 +1202,7 @@ mod tests {
 
     #[test]
     fn antigravity_scans_project_hooks() {
-        let root = temp_dir("antigravity-project");
+        let root = crate::test_env::temp_dir("scanner-antigravity-project");
         let agents = root.join(".agents");
         std::fs::create_dir_all(&agents).unwrap();
         std::fs::write(
@@ -1094,7 +1217,7 @@ mod tests {
 
     #[test]
     fn antigravity_disabled_hooks_survive_a_rescan() {
-        let root = temp_dir("antigravity-state");
+        let root = crate::test_env::temp_dir("scanner-antigravity-state");
         let agents = root.join(".agents");
         std::fs::create_dir_all(&agents).unwrap();
         std::fs::write(
@@ -1127,7 +1250,7 @@ mod tests {
 
     #[test]
     fn antigravity_documented_hook_toggles_survive_a_rescan() {
-        let root = temp_dir("antigravity-roundtrip");
+        let root = crate::test_env::temp_dir("scanner-antigravity-roundtrip");
         let agents = root.join(".agents");
         std::fs::create_dir_all(&agents).unwrap();
         let hooks_path = agents.join("hooks.json");
@@ -1166,7 +1289,7 @@ mod tests {
 
     #[test]
     fn claude_hook_disable_rescan_enable_round_trip() {
-        let root = temp_dir("claude-roundtrip");
+        let root = crate::test_env::temp_dir("scanner-claude-roundtrip");
         let claude = root.join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
         let settings = claude.join("settings.json");
@@ -1211,7 +1334,7 @@ mod tests {
 
     #[test]
     fn codex_hooks_json_disable_rescan_enable_round_trip() {
-        let root = temp_dir("codex-roundtrip");
+        let root = crate::test_env::temp_dir("scanner-codex-roundtrip");
         let codex = root.join(".codex");
         std::fs::create_dir_all(&codex).unwrap();
         let hooks_path = codex.join("hooks.json");
@@ -1244,7 +1367,7 @@ mod tests {
 
     #[test]
     fn kiro_native_hook_file_toggles_enabled_flag() {
-        let root = temp_dir("kiro-roundtrip");
+        let root = crate::test_env::temp_dir("scanner-kiro-roundtrip");
         let kiro = root.join(".kiro");
         std::fs::create_dir_all(kiro.join("hooks")).unwrap();
         let hook_file = kiro.join("hooks").join("lint-on-save.json");
@@ -1303,7 +1426,7 @@ mod tests {
 
     #[test]
     fn legacy_in_file_stash_still_shows_and_reenables_after_rescan() {
-        let root = temp_dir("legacy-roundtrip");
+        let root = crate::test_env::temp_dir("scanner-legacy-roundtrip");
         let claude = root.join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
         let settings = claude.join("settings.json");
@@ -1339,7 +1462,7 @@ mod tests {
 
     #[test]
     fn hooks_on_different_events_with_the_same_name_stay_separate() {
-        let root = temp_dir("hook-dedup");
+        let root = crate::test_env::temp_dir("scanner-hook-dedup");
         let claude = root.join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
         std::fs::write(
@@ -1361,7 +1484,7 @@ mod tests {
 
     #[test]
     fn zcode_scans_config_skills_and_mcp() {
-        let root = temp_dir("zcode-scan");
+        let root = crate::test_env::temp_dir("scanner-zcode-scan");
         let zc = root.join(".zcode");
         std::fs::create_dir_all(zc.join("skills").join("reviewer")).unwrap();
         std::fs::write(
@@ -1404,7 +1527,7 @@ mod tests {
 
     #[test]
     fn zcode_mcp_fallback_only_applies_without_primary_servers() {
-        let root = temp_dir("zcode-fallback");
+        let root = crate::test_env::temp_dir("scanner-zcode-fallback");
         let zc = root.join(".zcode");
         std::fs::create_dir_all(&zc).unwrap();
         std::fs::write(zc.join("config.json"), r#"{"hooks":{"enabled":false}}"#).unwrap();
@@ -1443,7 +1566,7 @@ mod tests {
 
     #[test]
     fn zcode_stashed_servers_stay_listed_as_disabled() {
-        let root = temp_dir("zcode-stash");
+        let root = crate::test_env::temp_dir("scanner-zcode-stash");
         let zc = root.join(".zcode");
         std::fs::create_dir_all(&zc).unwrap();
         std::fs::write(
@@ -1469,8 +1592,271 @@ mod tests {
     }
 
     #[test]
+    fn junie_scans_skills_commands_rules_mcp_and_user_hooks() {
+        let root = crate::test_env::temp_dir("scanner-junie-scan");
+        let junie = root.join(".junie");
+        std::fs::create_dir_all(junie.join("skills").join("review")).unwrap();
+        std::fs::create_dir_all(junie.join("commands")).unwrap();
+        std::fs::create_dir_all(junie.join("rules")).unwrap();
+        std::fs::create_dir_all(junie.join("mcp")).unwrap();
+        std::fs::write(junie.join("AGENTS.md"), "guidelines").unwrap();
+        std::fs::write(junie.join("commands").join("deploy.md"), "deploy prompt").unwrap();
+        std::fs::write(junie.join("rules").join("style.md"), "style rules").unwrap();
+        std::fs::write(
+            junie.join("mcp").join("mcp.json"),
+            r#"{"mcpServers":{"ctx":{"command":"npx","args":["-y","ctx"]}}}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Junie, &root, Scope::Project);
+        assert!(items
+            .iter()
+            .any(|i| i.kind == ItemKind::InstructionFile && i.name == "AGENTS.md"));
+        assert!(items
+            .iter()
+            .any(|i| i.kind == ItemKind::Skill && i.name == "review"));
+        assert!(items
+            .iter()
+            .any(|i| i.kind == ItemKind::Skill && i.name == "deploy.md"));
+        assert!(items
+            .iter()
+            .any(|i| i.kind == ItemKind::Rule && i.name == "style.md"));
+        let ctx = items
+            .iter()
+            .find(|i| i.kind == ItemKind::Mcp && i.name == "ctx")
+            .unwrap();
+        assert_eq!(ctx.state, ItemState::Enabled);
+        assert!(matches!(
+            ctx.toggle_spec,
+            Some(ToggleSpec::JsonStash { .. })
+        ));
+
+        let global_items = scan_provider(ProviderId::Junie, &root, Scope::Global);
+        assert!(
+            !global_items
+                .iter()
+                .any(|i| i.kind == ItemKind::InstructionFile),
+            "Junie documents no global guideline files"
+        );
+    }
+
+    #[test]
+    fn junie_project_hooks_are_not_scanned_because_junie_ignores_them() {
+        let root = crate::test_env::temp_dir("scanner-junie-project-hooks");
+        let junie = root.join(".junie");
+        std::fs::create_dir_all(&junie).unwrap();
+        std::fs::write(
+            junie.join("config.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"repo-hook"}]}]}}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Junie, &root, Scope::Project);
+        assert!(
+            !items.iter().any(|i| i.kind == ItemKind::Hook),
+            "project-local Junie hooks are ignored by the CLI, so they must not be listed"
+        );
+    }
+
+    #[test]
+    fn junie_user_hooks_toggle_through_the_stash() {
+        let root = crate::test_env::temp_dir("scanner-junie-user-hooks");
+        let home = root.join("home");
+        let junie = home.join(".junie");
+        std::fs::create_dir_all(&junie).unwrap();
+        std::fs::write(
+            junie.join("config.json"),
+            r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"aws sso login"}]}]}}"#,
+        )
+        .unwrap();
+
+        crate::test_env::with_env_vars(&[("AGENT_SWITCH_HOME", &home)], || {
+            std::fs::create_dir_all(junie.join("commands")).unwrap();
+            std::fs::write(junie.join("commands").join("tide.md"), "global command").unwrap();
+            let items = scan_provider(ProviderId::Junie, &root, Scope::Global);
+            assert!(
+                items
+                    .iter()
+                    .any(|i| i.kind == ItemKind::Skill && i.name == "tide.md"),
+                "user-scope ~/.junie/commands must be scanned"
+            );
+            let hook = items
+                .iter()
+                .find(|i| i.kind == ItemKind::Hook && i.name == "aws sso login")
+                .unwrap()
+                .clone();
+            assert_eq!(hook.state, ItemState::Enabled);
+            let mut hook = hook;
+            crate::toggler::toggle_item(&mut hook).unwrap();
+            assert_eq!(hook.state, ItemState::Disabled);
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(junie.join("config.json")).unwrap())
+                    .unwrap();
+            assert!(
+                doc.pointer("/hooks/SessionStart").is_none(),
+                "hook entry must be stashed away"
+            );
+            let stash: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(junie.join("config.json.agentswitch")).unwrap(),
+            )
+            .unwrap();
+            assert!(stash.get("SessionStart").is_some());
+        });
+    }
+
+    #[test]
+    fn muse_scans_skills_settings_mcp_project_hooks_and_instructions() {
+        let root = crate::test_env::temp_dir("scanner-muse-scan");
+        let agents = root.join(".agents");
+        std::fs::create_dir_all(agents.join("skills").join("plan")).unwrap();
+        std::fs::create_dir_all(root.join(".muse")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "rules").unwrap();
+        std::fs::write(
+            root.join(".muse").join("hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"guard"}]}]}}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Muse, &root, Scope::Project);
+        assert!(items
+            .iter()
+            .any(|i| i.kind == ItemKind::InstructionFile && i.name == "AGENTS.md"));
+        assert!(items
+            .iter()
+            .any(|i| i.kind == ItemKind::Skill && i.name == "plan"));
+        assert!(items
+            .iter()
+            .any(|i| i.kind == ItemKind::Hook && i.name == "guard"));
+    }
+
+    #[test]
+    fn muse_user_settings_mcp_servers_toggle_and_report_state() {
+        let root = crate::test_env::temp_dir("scanner-muse-mcp");
+        let home = root.join("home");
+        let muse = home.join(".config").join("muse");
+        std::fs::create_dir_all(&muse).unwrap();
+        std::fs::write(
+            muse.join("settings.json"),
+            r#"{"schema_version":1,"mcp_servers":{"tools":{"transport":"stdio","command":"my-mcp","args":[],"enabled":true},"off":{"transport":"stdio","command":"x","args":[],"enabled":false}}}"#,
+        )
+        .unwrap();
+
+        crate::test_env::with_env_vars(&[("AGENT_SWITCH_HOME", &home)], || {
+            let items = scan_provider(ProviderId::Muse, &root, Scope::Global);
+            let tools = items
+                .iter()
+                .find(|i| i.kind == ItemKind::Mcp && i.name == "tools")
+                .unwrap()
+                .clone();
+            assert_eq!(tools.state, ItemState::Enabled);
+            let off = items
+                .iter()
+                .find(|i| i.kind == ItemKind::Mcp && i.name == "off")
+                .unwrap()
+                .clone();
+            assert_eq!(off.state, ItemState::Disabled);
+
+            let mut tools = tools;
+            crate::toggler::toggle_item(&mut tools).unwrap();
+            assert_eq!(tools.state, ItemState::Disabled);
+
+            let mut off = off;
+            crate::toggler::toggle_item(&mut off).unwrap();
+            assert_eq!(
+                off.state,
+                ItemState::Enabled,
+                "vendor-disabled server re-enables in place"
+            );
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(muse.join("settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                doc.pointer("/mcp_servers/tools/enabled"),
+                Some(&serde_json::json!(false))
+            );
+            assert_eq!(
+                doc.pointer("/mcp_servers/off/enabled"),
+                Some(&serde_json::json!(true))
+            );
+            assert!(doc.get("_disabled_mcp_servers").is_none());
+        });
+    }
+
+    #[test]
+    fn grok_scans_agents_md_rules_skills_toml_mcp_and_hook_files() {
+        let root = crate::test_env::temp_dir("scanner-grok-scan");
+        let grok = root.join(".grok");
+        std::fs::create_dir_all(grok.join("rules")).unwrap();
+        std::fs::create_dir_all(grok.join("skills").join("review")).unwrap();
+        std::fs::create_dir_all(grok.join("hooks")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "repo rules").unwrap();
+        std::fs::write(grok.join("rules").join("extra.md"), "extra").unwrap();
+        std::fs::write(
+            grok.join("config.toml"),
+            "[mcp_servers.filesystem]\ncommand = \"npx\"\nargs = [\"-y\", \"fs\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            grok.join("hooks").join("safety.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"safety-check","timeout":10}]}]}}"#,
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Grok, &root, Scope::Project);
+        assert!(items
+            .iter()
+            .any(|i| i.kind == ItemKind::InstructionFile && i.name == "AGENTS.md"));
+        assert!(items
+            .iter()
+            .any(|i| i.kind == ItemKind::Rule && i.name == "extra.md"));
+        assert!(items
+            .iter()
+            .any(|i| i.kind == ItemKind::Skill && i.name == "review"));
+        let fs_server = items
+            .iter()
+            .find(|i| i.kind == ItemKind::Mcp && i.name == "filesystem")
+            .unwrap();
+        assert_eq!(fs_server.state, ItemState::Enabled);
+        assert!(matches!(
+            fs_server.toggle_spec,
+            Some(ToggleSpec::TomlFlag { .. })
+        ));
+        let hook = items
+            .iter()
+            .find(|i| i.kind == ItemKind::Hook && i.name == "safety-check")
+            .unwrap();
+        assert_eq!(hook.state, ItemState::Enabled);
+    }
+
+    #[test]
+    fn grok_toml_mcp_toggles_the_enabled_flag_in_place() {
+        let root = crate::test_env::temp_dir("scanner-grok-mcp-toggle");
+        let grok = root.join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(
+            grok.join("config.toml"),
+            "[mcp_servers.filesystem]\ncommand = \"npx\"\nenabled = true\n",
+        )
+        .unwrap();
+
+        let items = scan_provider(ProviderId::Grok, &root, Scope::Project);
+        let mut server = items
+            .iter()
+            .find(|i| i.kind == ItemKind::Mcp && i.name == "filesystem")
+            .unwrap()
+            .clone();
+        crate::toggler::toggle_item(&mut server).unwrap();
+        assert_eq!(server.state, ItemState::Disabled);
+        let text = std::fs::read_to_string(grok.join("config.toml")).unwrap();
+        assert!(
+            text.contains("enabled = false"),
+            "toml must keep its comment-free shape: {text}"
+        );
+    }
+
+    #[test]
     fn zcode_disabled_entry_flag_is_reported() {
-        let root = temp_dir("zcode-flag");
+        let root = crate::test_env::temp_dir("scanner-zcode-flag");
         let zc = root.join(".zcode");
         std::fs::create_dir_all(&zc).unwrap();
         std::fs::write(

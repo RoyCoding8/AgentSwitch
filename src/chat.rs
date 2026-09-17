@@ -106,7 +106,40 @@ fn parse_iso_seconds(label: &str) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
-    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+    let seconds = days * 86400 + hour * 3600 + minute * 60 + second;
+    Some(seconds - utc_offset_seconds(&label[19..])?)
+}
+
+fn utc_offset_seconds(rest: &str) -> Option<i64> {
+    let rest = if let Some(fraction) = rest.strip_prefix('.') {
+        match fraction.find(|c: char| !c.is_ascii_digit()) {
+            Some(index) => &fraction[index..],
+            None => "",
+        }
+    } else {
+        rest
+    };
+    match rest {
+        "" | "Z" | "z" => Some(0),
+        _ => {
+            let (sign, body) = match rest.as_bytes()[0] {
+                b'+' => (1i64, &rest[1..]),
+                b'-' => (-1i64, &rest[1..]),
+                _ => return Some(0),
+            };
+            let (hours, minutes) = if let Some((h, m)) = body.split_once(':') {
+                (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?)
+            } else if body.len() == 4 {
+                (
+                    body.get(0..2)?.parse::<i64>().ok()?,
+                    body.get(2..4)?.parse::<i64>().ok()?,
+                )
+            } else {
+                (body.parse::<i64>().ok()?, 0)
+            };
+            Some(sign * (hours * 3600 + minutes * 60))
+        }
+    }
 }
 
 fn provider_matches(filter: Option<crate::types::ProviderId>, provider: ChatProvider) -> bool {
@@ -120,6 +153,8 @@ fn provider_matches(filter: Option<crate::types::ProviderId>, provider: ChatProv
                 | (ProviderId::Kiro, ChatProvider::Kiro)
                 | (ProviderId::OpenCode, ChatProvider::OpenCode)
                 | (ProviderId::Zcode, ChatProvider::Zcode)
+                | (ProviderId::Grok, ChatProvider::Grok)
+                | (ProviderId::Muse, ChatProvider::Muse)
         )
     })
 }
@@ -152,6 +187,12 @@ pub fn scan_all(provider_filter: Option<crate::types::ProviderId>) -> Vec<ChatSe
     if include(ChatProvider::Zcode) {
         sessions.extend(scan_zcode());
     }
+    if include(ChatProvider::Grok) {
+        sessions.extend(scan_grok());
+    }
+    if include(ChatProvider::Muse) {
+        sessions.extend(scan_muse());
+    }
     sessions.extend(scan_imported().into_iter().filter(|s| include(s.provider)));
     sort_sessions(&mut sessions);
     sessions
@@ -175,7 +216,7 @@ pub fn scan_trash(provider_filter: Option<crate::types::ProviderId>) -> Vec<Chat
     sessions
 }
 
-pub fn load_archive(session: &ChatSession) -> Result<ChatArchive> {
+fn load_archive(session: &ChatSession) -> Result<ChatArchive> {
     match session.source_kind {
         ChatSourceKind::ImportedArchive => {
             let path = session
@@ -186,9 +227,15 @@ pub fn load_archive(session: &ChatSession) -> Result<ChatArchive> {
             validate_archive(&archive)?;
             Ok(archive)
         }
+        ChatSourceKind::Jsonl | ChatSourceKind::JsonlDir
+            if session.provider == ChatProvider::Muse =>
+        {
+            load_muse_archive(session)
+        }
         ChatSourceKind::Jsonl | ChatSourceKind::JsonlDir => load_jsonl_archive(session),
         ChatSourceKind::KiroCli => load_kiro_archive(session),
         ChatSourceKind::OpenCodeDb => load_opencode_archive(session),
+        ChatSourceKind::GrokDir => load_grok_archive(session),
     }
 }
 
@@ -211,15 +258,21 @@ pub fn export_sessions_zip(sessions: &[ChatSession], target: &Path) -> Result<Ba
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let mut report = BatchReport::default();
     let mut entries = Vec::new();
+    let mut used_names: HashSet<String> = HashSet::new();
     for session in sessions {
         match load_archive(session) {
             Ok(archive) => {
-                let name = format!(
-                    "chats/{}-{}.{}",
+                let base = format!(
+                    "{}-{}",
                     session.provider.id(),
-                    safe_file_stem(&format!("{}-{}", session.id, session.title)),
-                    ARCHIVE_EXT
+                    safe_file_stem(&format!("{}-{}", session.id, session.title))
                 );
+                let mut name = format!("chats/{base}.{ARCHIVE_EXT}");
+                let mut n = 2;
+                while !used_names.insert(name.clone()) {
+                    name = format!("chats/{base}-{n}.{ARCHIVE_EXT}");
+                    n += 1;
+                }
                 zip.start_file(&name, options)?;
                 zip.write_all(serde_json::to_string_pretty(&archive)?.as_bytes())?;
                 entries.push(ChatZipManifestEntry {
@@ -295,7 +348,12 @@ pub fn conversion_targets() -> Vec<ChatProvider> {
     ChatProvider::ALL
         .iter()
         .copied()
-        .filter(|provider| *provider != ChatProvider::Antigravity)
+        .filter(|provider| {
+            !matches!(
+                provider,
+                ChatProvider::Antigravity | ChatProvider::Grok | ChatProvider::Muse
+            )
+        })
         .collect()
 }
 
@@ -310,6 +368,12 @@ pub fn convert_session(session: &ChatSession, target: ChatProvider) -> Result<Pa
     if target == ChatProvider::Antigravity || session.provider == ChatProvider::Antigravity {
         anyhow::bail!(
             "Antigravity chats are encrypted inside the CLI and cannot be read or written here"
+        );
+    }
+    if matches!(target, ChatProvider::Grok | ChatProvider::Muse) {
+        anyhow::bail!(
+            "{} sessions are stored in a proprietary event format that cannot be written here",
+            target.label()
         );
     }
     if session.provider == target {
@@ -337,12 +401,24 @@ fn write_converted(target: ChatProvider, archive: &ChatArchive) -> Result<PathBu
         ChatProvider::Antigravity => {
             anyhow::bail!("Antigravity chats are encrypted inside the CLI and cannot be written")
         }
+        ChatProvider::Grok | ChatProvider::Muse => {
+            anyhow::bail!(
+                "{} sessions are stored in a proprietary event format that cannot be written here",
+                target.label()
+            )
+        }
     }
 }
 
 pub fn convert_archive_file(input: &Path, target: ChatProvider) -> Result<(PathBuf, usize)> {
     if target == ChatProvider::Antigravity {
         anyhow::bail!("Antigravity chats are encrypted inside the CLI and cannot be written");
+    }
+    if matches!(target, ChatProvider::Grok | ChatProvider::Muse) {
+        anyhow::bail!(
+            "{} sessions are stored in a proprietary event format that cannot be written here",
+            target.label()
+        );
     }
     let is_zip = input
         .extension()
@@ -358,6 +434,12 @@ pub fn convert_archive_file(input: &Path, target: ChatProvider) -> Result<(PathB
 fn retag_archive_for(archive: &mut ChatArchive, target: ChatProvider) -> Result<()> {
     if archive.source_provider == ChatProvider::Antigravity {
         anyhow::bail!("Antigravity chats are encrypted inside the CLI and cannot be converted");
+    }
+    if matches!(target, ChatProvider::Grok | ChatProvider::Muse) {
+        anyhow::bail!(
+            "{} sessions are stored in a proprietary event format that cannot be written here",
+            target.label()
+        );
     }
     archive.source_provider = target;
     archive.raw_events.clear();
@@ -387,6 +469,17 @@ fn convert_archive_json(input: &Path, target: ChatProvider) -> Result<PathBuf> {
     Ok(out)
 }
 
+fn safe_zip_name(name: &str) -> Option<&str> {
+    let name = name.strip_prefix('/').unwrap_or(name);
+    if name.is_empty() || name.contains('\\') || name.contains(':') {
+        return None;
+    }
+    if name.split('/').any(|part| part == "..") {
+        return None;
+    }
+    Some(name)
+}
+
 fn add_zip_bytes(total: &mut u64, size: u64) -> Result<()> {
     *total = total
         .checked_add(size)
@@ -408,7 +501,13 @@ fn convert_archive_zip(input: &Path, target: ChatProvider) -> Result<(PathBuf, u
     let mut total_bytes = 0u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
-        let name = entry.name().to_string();
+        let raw_name = entry.name().to_string();
+        let Some(name) = safe_zip_name(&raw_name).map(str::to_string) else {
+            if raw_name.ends_with(ARCHIVE_EXT) {
+                skipped += 1;
+            }
+            continue;
+        };
         if !name.ends_with(ARCHIVE_EXT) {
             if !name.ends_with('/') && name != "manifest.json" {
                 add_zip_bytes(&mut total_bytes, entry.size())?;
@@ -438,7 +537,10 @@ fn convert_archive_zip(input: &Path, target: ChatProvider) -> Result<(PathBuf, u
         anyhow::bail!(
             "no convertible chats found in this ZIP{}",
             if skipped > 0 {
-                format!(" ({skipped} Antigravity chat(s) cannot be converted)")
+                format!(
+                    " ({skipped} chat(s) cannot be converted to {})",
+                    target.label()
+                )
             } else {
                 String::new()
             }
@@ -515,11 +617,14 @@ pub fn import_zip(path: &Path, project_dir: Option<&Path>) -> Result<BatchReport
             anyhow::bail!("ZIP entry '{name}' exceeds the uncompressed size limit");
         }
         add_zip_bytes(&mut total_bytes, entry.size())?;
-        let mut buf = String::with_capacity(entry.size() as usize);
-        std::io::Read::read_to_string(&mut entry, &mut buf)?;
-        let archive: ChatArchive = match serde_json::from_str(&buf) {
-            Ok(a) => a,
-            Err(_) => {
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        std::io::Read::read_to_end(&mut entry, &mut buf)?;
+        let archive: ChatArchive = match String::from_utf8(buf)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+        {
+            Some(a) => a,
+            None => {
                 report.failed += 1;
                 continue;
             }
@@ -544,6 +649,9 @@ pub fn soft_delete(session: &ChatSession) -> Result<()> {
     if session.source_kind == ChatSourceKind::KiroCli {
         return soft_delete_kiro_session(session);
     }
+    if session.source_kind == ChatSourceKind::GrokDir {
+        return soft_delete_grok_session(session);
+    }
     if session.source_kind == ChatSourceKind::OpenCodeDb {
         return soft_delete_db_session(session);
     }
@@ -552,14 +660,11 @@ pub fn soft_delete(session: &ChatSession) -> Result<()> {
         .source_path
         .as_ref()
         .ok_or_else(|| anyhow!("chat has no file path to delete"))?;
-    let trash_dir = trash_dir().join(session.provider.id());
-    fs::create_dir_all(&trash_dir)?;
-    let stem = safe_file_stem(&format!("{}-{}", session.id, session.title));
     let ext = source
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("chat");
-    let target = unique_path(&trash_dir, &stem, ext);
+    let target = trash_target(session, ext)?;
     move_path(source, &target)?;
     let manifest = DeleteManifest {
         original_path: Some(source.clone()),
@@ -576,15 +681,25 @@ pub fn soft_delete(session: &ChatSession) -> Result<()> {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from(".")),
         );
-        let _ = move_path(&target, source);
-        return Err(error).context(
-            "chat moved to trash but the manifest could not be written; it was moved back",
-        );
+        let rolled_back = match move_path(&target, source) {
+            Ok(()) => "it was moved back".to_string(),
+            Err(back_error) => format!("moving it back failed too: {back_error}"),
+        };
+        return Err(anyhow::Error::from(error).context(format!(
+            "chat moved to trash but the manifest could not be written; {rolled_back}"
+        )));
     }
     if session.provider == ChatProvider::Codex {
         codex_state_unregister(source);
     }
     Ok(())
+}
+
+fn trash_target(session: &ChatSession, ext: &str) -> Result<PathBuf> {
+    let dir = trash_dir().join(session.provider.id());
+    fs::create_dir_all(&dir)?;
+    let stem = safe_file_stem(&format!("{}-{}", session.id, session.title));
+    Ok(unique_path(&dir, &stem, ext))
 }
 
 fn base_manifest(session: &ChatSession) -> DeleteManifest {
@@ -613,10 +728,7 @@ fn soft_delete_kiro_session(session: &ChatSession) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("Kiro chat has no file path"))?;
     let meta_path = kiro_meta_path(source)?;
-    let trash_dir = trash_dir().join(session.provider.id());
-    fs::create_dir_all(&trash_dir)?;
-    let stem = safe_file_stem(&format!("{}-{}", session.id, session.title));
-    let target = unique_path(&trash_dir, &stem, "");
+    let target = trash_target(session, "")?;
     fs::create_dir_all(&target)?;
     let base = meta_path.with_extension("");
     let manifest = DeleteManifest {
@@ -656,16 +768,37 @@ fn soft_delete_kiro_session(session: &ChatSession) -> Result<()> {
     Ok(())
 }
 
+fn soft_delete_grok_session(session: &ChatSession) -> Result<()> {
+    let source = session
+        .source_path
+        .as_ref()
+        .ok_or_else(|| anyhow!("Grok chat has no session directory"))?;
+    let target = trash_target(session, "")?;
+    move_path(source, &target)?;
+    let manifest = DeleteManifest {
+        original_path: Some(source.clone()),
+        trashed_path: Some(target.clone()),
+        ..base_manifest(session)
+    };
+    if let Err(error) = fs::write(
+        target.with_extension("delete.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    ) {
+        let _ = move_path(&target, source);
+        return Err(anyhow::Error::from(error).context(
+            "Grok chat moved to trash but the manifest could not be written; it was moved back",
+        ));
+    }
+    Ok(())
+}
+
 fn soft_delete_db_session(session: &ChatSession) -> Result<()> {
     let db_path = session
         .source_path
         .as_ref()
         .ok_or_else(|| anyhow!("database chat has no database path"))?;
     let archive = load_archive(session)?;
-    let trash_dir = trash_dir().join(session.provider.id());
-    fs::create_dir_all(&trash_dir)?;
-    let stem = safe_file_stem(&format!("{}-{}", session.id, session.title));
-    let archive_path = unique_path(&trash_dir, &stem, ARCHIVE_EXT);
+    let archive_path = trash_target(session, ARCHIVE_EXT)?;
     atomic_write(
         &archive_path,
         serde_json::to_string_pretty(&archive)?.as_bytes(),
@@ -678,7 +811,11 @@ fn soft_delete_db_session(session: &ChatSession) -> Result<()> {
         ..base_manifest(session)
     };
     let manifest_path = archive_path.with_extension("delete.json");
-    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    if let Err(error) = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?) {
+        let _ = fs::remove_file(&archive_path);
+        return Err(anyhow::Error::from(error))
+            .context("could not record the trash manifest; the archived chat was not trashed");
+    }
     if let Err(error) = delete_db_session_rows(db_path, &session.id) {
         let _ = fs::remove_file(&manifest_path);
         let _ = fs::remove_file(&archive_path);
@@ -751,6 +888,15 @@ pub fn restore_from_trash(session: &ChatSession) -> Result<PathBuf> {
     }
     if manifest.source_kind == Some(ChatSourceKind::KiroCli) && source.is_dir() {
         return restore_kiro_session(source, original, manifest_path);
+    }
+    if manifest.source_kind == Some(ChatSourceKind::GrokDir) && source.is_dir() {
+        let target = available_restore_path(original);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        move_path(source, &target)?;
+        fs::remove_file(manifest_path)?;
+        return Ok(target);
     }
     let target = available_restore_path(original);
     if let Some(parent) = target.parent() {
@@ -877,8 +1023,7 @@ fn scan_claude() -> Vec<ChatSession> {
 }
 
 fn claude_home() -> Option<PathBuf> {
-    crate::provider::env_path("CLAUDE_CONFIG_DIR")
-        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
+    crate::provider::global_dir(crate::types::ProviderId::Claude).ok()
 }
 
 fn scan_codex() -> Vec<ChatSession> {
@@ -918,8 +1063,9 @@ fn zcode_db_path() -> Option<PathBuf> {
     if let Some(custom) = env::var_os("ZCODE_DB").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(custom)).filter(|path| path.is_file());
     }
-    dirs::home_dir()
-        .map(|home| home.join(".zcode").join("cli").join("db").join("db.sqlite"))
+    crate::provider::global_dir(crate::types::ProviderId::Zcode)
+        .ok()
+        .map(|home| home.join("cli").join("db").join("db.sqlite"))
         .filter(|path| path.is_file())
 }
 
@@ -935,6 +1081,533 @@ fn scan_zcode() -> Vec<ChatSession> {
         return vec![];
     };
     scan_sqlite_sessions(&db_path, ChatProvider::Zcode)
+}
+
+fn grok_home() -> Option<PathBuf> {
+    crate::provider::global_dir(crate::types::ProviderId::Grok).ok()
+}
+
+fn scan_grok() -> Vec<ChatSession> {
+    let Some(home) = grok_home() else {
+        return vec![];
+    };
+    let sessions_root = home.join("sessions");
+    if !sessions_root.is_dir() {
+        return vec![];
+    }
+    let mut out = Vec::new();
+    let Ok(cwd_dirs) = fs::read_dir(&sessions_root) else {
+        return vec![];
+    };
+    for cwd_dir in cwd_dirs.flatten() {
+        let cwd_path = cwd_dir.path();
+        if !cwd_path.is_dir() {
+            continue;
+        }
+        let Ok(session_dirs) = fs::read_dir(&cwd_path) else {
+            continue;
+        };
+        for session_dir in session_dirs.flatten() {
+            let dir = session_dir.path();
+            if dir.is_dir() {
+                if let Some(session) = grok_session(&cwd_path, &dir) {
+                    out.push(session);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn grok_session(cwd_dir: &Path, dir: &Path) -> Option<ChatSession> {
+    let summary_path = dir.join("summary.json");
+    let summary: Value = serde_json::from_str(&fs::read_to_string(&summary_path).ok()?).ok()?;
+    let fallback_id = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("chat")
+        .to_string();
+    let id = summary
+        .pointer("/info/id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or(&fallback_id)
+        .to_string();
+    let title = summary
+        .get("generated_title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| summary.get("session_summary").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(|title| title.chars().take(100).collect::<String>())
+        .unwrap_or_else(|| format!("Untitled {} chat", ChatProvider::Grok.label()));
+    let project_path = summary
+        .pointer("/info/cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| grok_cwd_label(cwd_dir));
+    let size_bytes = fs::metadata(dir.join("chat_history.jsonl"))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let meta = fs::metadata(&summary_path).ok()?;
+    let created_at = summary
+        .get("created_at")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let updated_at = summary
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| file_time_label(&meta, true));
+    let turn_count = summary
+        .get("num_chat_messages")
+        .or_else(|| summary.get("num_messages"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    Some(ChatSession {
+        id,
+        title,
+        provider: ChatProvider::Grok,
+        project_path,
+        created_at,
+        updated_at,
+        source_path: Some(dir.to_path_buf()),
+        source_kind: ChatSourceKind::GrokDir,
+        turn_count,
+        size_bytes,
+        imported: false,
+        subagent: false,
+        trash_manifest: None,
+    })
+}
+
+fn grok_cwd_label(cwd_dir: &Path) -> String {
+    if let Ok(text) = fs::read_to_string(cwd_dir.join(".cwd")) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    cwd_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(percent_decode)
+        .unwrap_or_else(|| "Grok workspace".into())
+}
+
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escape = (bytes[i] == b'%' && i + 2 < bytes.len())
+            .then(|| std::str::from_utf8(&bytes[i + 1..i + 3]).ok())
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escape {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn load_grok_archive(session: &ChatSession) -> Result<ChatArchive> {
+    let dir = session
+        .source_path
+        .as_ref()
+        .ok_or_else(|| anyhow!("Grok chat has no session directory"))?;
+    let mut messages = Vec::new();
+    let mut tools = Vec::new();
+    let mut tool_ids: HashMap<String, usize> = HashMap::new();
+    let mut raw_events = Vec::new();
+    let file = File::open(dir.join("chat_history.jsonl"))?;
+    for line in jsonl_lines(file) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        grok_collect(&value, &mut messages, &mut tools, &mut tool_ids);
+        raw_events.push(value);
+    }
+    Ok(archive_from(session, messages, tools, raw_events))
+}
+
+fn grok_text_parts(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|part| !matches!(str_field(part, &["type"]), Some("image" | "image_url")))
+            .filter_map(|part| str_field(part, &["text"]).map(ToOwned::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn push_tool_entry(
+    tools: &mut Vec<ChatToolCall>,
+    tool_ids: &mut HashMap<String, usize>,
+    id: Option<&str>,
+    name: &str,
+    summary: &str,
+    timestamp: Option<String>,
+) {
+    if let Some(id) = id {
+        tool_ids.insert(id.to_string(), tools.len());
+    }
+    tools.push(ChatToolCall {
+        name: name.into(),
+        timestamp,
+        summary: summary.into(),
+    });
+}
+
+fn push_tool_outcome(
+    tools: &mut Vec<ChatToolCall>,
+    tool_ids: &mut HashMap<String, usize>,
+    id: Option<&str>,
+    outcome: &str,
+    timestamp: Option<String>,
+) {
+    match id.and_then(|id| tool_ids.get(id).copied()) {
+        Some(index) => {
+            if !outcome.trim().is_empty() {
+                tools[index].summary = outcome.to_string();
+            }
+        }
+        None => tools.push(ChatToolCall {
+            name: "tool".into(),
+            timestamp,
+            summary: if outcome.trim().is_empty() {
+                "tool result".into()
+            } else {
+                outcome.to_string()
+            },
+        }),
+    }
+}
+
+fn grok_collect(
+    value: &Value,
+    messages: &mut Vec<ChatMessage>,
+    tools: &mut Vec<ChatToolCall>,
+    tool_ids: &mut HashMap<String, usize>,
+) {
+    let kind = str_field(value, &["type"])
+        .or_else(|| str_field(value, &["role"]))
+        .unwrap_or_default();
+    let text = grok_text_parts(value.get("content").unwrap_or(&Value::Null));
+    match kind {
+        "user" => {
+            if value.get("synthetic_reason").is_some_and(|r| !r.is_null()) {
+                return;
+            }
+            if !text.trim().is_empty() {
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    timestamp: None,
+                    text,
+                });
+            }
+        }
+        "assistant" => {
+            if !text.trim().is_empty() {
+                messages.push(ChatMessage {
+                    role: "assistant".into(),
+                    timestamp: None,
+                    text,
+                });
+            }
+            for call in value
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let function = call.get("function");
+                let name = str_field(call, &["name"])
+                    .or_else(|| function.and_then(|f| str_field(f, &["name"])))
+                    .unwrap_or("tool");
+                let id = str_field(call, &["id"])
+                    .or_else(|| function.and_then(|f| str_field(f, &["id"])));
+                let summary = str_field(call, &["arguments"])
+                    .or_else(|| function.and_then(|f| str_field(f, &["arguments"])))
+                    .unwrap_or("tool call");
+                push_tool_entry(tools, tool_ids, id, name, summary, None);
+            }
+        }
+        "tool_result" | "tool" => {
+            push_tool_outcome(
+                tools,
+                tool_ids,
+                str_field(value, &["tool_call_id"]),
+                &text,
+                None,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn muse_sessions_root() -> Option<PathBuf> {
+    let base = crate::provider::env_path("XDG_DATA_HOME").or_else(|| {
+        crate::provider::home_dir()
+            .ok()
+            .map(|home| home.join(".local").join("share"))
+    })?;
+    Some(base.join("muse").join("sessions"))
+}
+
+fn scan_muse() -> Vec<ChatSession> {
+    let Some(root) = muse_sessions_root() else {
+        return vec![];
+    };
+    if !root.is_dir() {
+        return vec![];
+    }
+    WalkDir::new(root)
+        .max_depth(8)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| entry.file_name().to_str() == Some("session.jsonl"))
+        .filter_map(|entry| muse_session(entry.path()).ok())
+        .collect()
+}
+
+fn muse_session(path: &Path) -> Result<ChatSession> {
+    let meta = fs::metadata(path)?;
+    let parsed = parse_muse_session(path);
+    let subagent = path.ancestors().skip(1).any(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "subagent")
+    });
+    let fallback_id = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("chat")
+        .to_string();
+    let title = parsed
+        .title
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| format!("Untitled {} chat", ChatProvider::Muse.label()));
+    Ok(ChatSession {
+        id: parsed.id.unwrap_or(fallback_id),
+        title,
+        provider: ChatProvider::Muse,
+        project_path: parsed
+            .workspace
+            .unwrap_or_else(|| ChatProvider::Muse.label().into()),
+        created_at: parsed.started_us.map(muse_iso),
+        updated_at: parsed
+            .ended_us
+            .map(muse_iso)
+            .unwrap_or_else(|| file_time_label(&meta, true)),
+        source_path: Some(path.to_path_buf()),
+        source_kind: ChatSourceKind::Jsonl,
+        turn_count: parsed.messages.len(),
+        size_bytes: meta.len(),
+        imported: false,
+        subagent,
+        trash_manifest: None,
+    })
+}
+
+fn muse_iso(micros: i64) -> String {
+    fmt_iso((micros.max(0) as u64) / 1_000_000)
+}
+
+struct MuseParsed {
+    id: Option<String>,
+    workspace: Option<String>,
+    title: Option<String>,
+    started_us: Option<i64>,
+    ended_us: Option<i64>,
+    messages: Vec<ChatMessage>,
+    tools: Vec<ChatToolCall>,
+}
+
+fn parse_muse_session(path: &Path) -> MuseParsed {
+    let mut records: Vec<(i64, i64, usize, Option<i64>, Value)> = Vec::new();
+    let mut id: Option<String> = None;
+    let mut workspace: Option<String> = None;
+    let mut started_us: Option<i64> = None;
+    let mut ended_us: Option<i64> = None;
+    if let Ok(file) = File::open(path) {
+        for (line_no, line) in jsonl_lines(file).enumerate() {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            match str_field(&value, &["payload_type"]) {
+                Some("runtime.session.metadata") => {
+                    if let Some(root) = value
+                        .pointer("/payload/record/workspace_root")
+                        .and_then(Value::as_str)
+                        .filter(|root| !root.trim().is_empty())
+                    {
+                        workspace = Some(root.to_string());
+                    }
+                }
+                Some("runtime.session") => {
+                    if value.pointer("/payload/kind").and_then(Value::as_str) != Some("run") {
+                        continue;
+                    }
+                    if id.is_none() {
+                        id = value
+                            .pointer("/stream/id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.trim().is_empty())
+                            .map(ToOwned::to_owned);
+                    }
+                    let Some(event) = value.pointer("/payload/event") else {
+                        continue;
+                    };
+                    if event.get("kind").and_then(Value::as_str).is_none() {
+                        continue;
+                    }
+                    let recorded_us = value.get("recorded_at").and_then(Value::as_i64);
+                    if let Some(us) = recorded_us {
+                        started_us = Some(started_us.map_or(us, |current: i64| current.min(us)));
+                        ended_us = Some(ended_us.map_or(us, |current: i64| current.max(us)));
+                    }
+                    let sequence = value.get("sequence").and_then(Value::as_i64);
+                    let band = if sequence.is_some() { 0 } else { 1 };
+                    records.push((
+                        band,
+                        sequence.unwrap_or(0),
+                        line_no,
+                        recorded_us,
+                        event.clone(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    records.sort_by_cached_key(|(band, sequence, line_no, _, _)| (*band, *sequence, *line_no));
+    let mut messages = Vec::new();
+    let mut tools = Vec::new();
+    let mut tool_ids: HashMap<String, usize> = HashMap::new();
+    for (_, _, _, recorded_us, event) in records {
+        muse_collect_event(
+            &event,
+            recorded_us,
+            &mut messages,
+            &mut tools,
+            &mut tool_ids,
+        );
+    }
+    let title = messages
+        .iter()
+        .find(|message| message.role == "user")
+        .and_then(|message| message.text.lines().find(|line| !line.trim().is_empty()))
+        .map(|line| line.chars().take(100).collect::<String>());
+    MuseParsed {
+        id,
+        workspace,
+        title,
+        started_us,
+        ended_us,
+        messages,
+        tools,
+    }
+}
+
+fn muse_collect_event(
+    event: &Value,
+    recorded_us: Option<i64>,
+    messages: &mut Vec<ChatMessage>,
+    tools: &mut Vec<ChatToolCall>,
+    tool_ids: &mut HashMap<String, usize>,
+) {
+    let kind = str_field(event, &["kind"]).unwrap_or_default();
+    let timestamp = recorded_us.map(muse_iso);
+    let mut push = |role: &str, text: String| {
+        if !text.trim().is_empty() {
+            messages.push(ChatMessage {
+                role: role.into(),
+                timestamp: timestamp.clone(),
+                text,
+            });
+        }
+    };
+    match kind {
+        "started" => push(
+            "user",
+            str_field(event, &["prompt"])
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        "assistant_message_committed" => push(
+            "assistant",
+            str_field(event, &["text"]).unwrap_or_default().to_string(),
+        ),
+        "assistant_tool_calls_committed" => {
+            push(
+                "assistant",
+                str_field(event, &["text"]).unwrap_or_default().to_string(),
+            );
+            for call in event
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_tool_entry(
+                    tools,
+                    tool_ids,
+                    str_field(call, &["call_id"]),
+                    str_field(call, &["name"]).unwrap_or("tool"),
+                    str_field(call, &["args"]).unwrap_or("tool call"),
+                    timestamp.clone(),
+                );
+            }
+        }
+        "tool_result_batch_committed" => {
+            for result in event
+                .get("results")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let outcome = str_field(result, &["text"]).unwrap_or_default().to_string();
+                push_tool_outcome(
+                    tools,
+                    tool_ids,
+                    str_field(result, &["tool_call_id"]),
+                    &outcome,
+                    timestamp.clone(),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn load_muse_archive(session: &ChatSession) -> Result<ChatArchive> {
+    let path = session
+        .source_path
+        .as_ref()
+        .ok_or_else(|| anyhow!("Muse chat has no session file"))?;
+    let parsed = parse_muse_session(path);
+    Ok(archive_from(
+        session,
+        parsed.messages,
+        parsed.tools,
+        Vec::new(),
+    ))
 }
 
 fn scan_sqlite_sessions(db_path: &Path, provider: ChatProvider) -> Vec<ChatSession> {
@@ -1068,7 +1741,9 @@ fn load_opencode_current(
     let mut order = Vec::new();
     for row in rows {
         let (message_id, message_data, part_data) = row?;
-        let message: Value = serde_json::from_str(&message_data)?;
+        let Ok(message) = serde_json::from_str::<Value>(&message_data) else {
+            continue;
+        };
         if !grouped.contains_key(&message_id) {
             order.push(message_id.clone());
             grouped.insert(message_id.clone(), (message, Vec::new()));
@@ -1317,14 +1992,16 @@ fn trashed_session(manifest_path: &Path) -> Result<ChatSession> {
         .is_some_and(|title| !title.trim().is_empty());
     if !manifest_has_meta && session.source_path.is_some() {
         if let Ok(archive) = load_archive(&session) {
-            session.title = archive.title;
-            session.project_path = archive.project_path;
-            session.created_at = archive.created_at;
-            session.updated_at = archive
-                .updated_at
-                .unwrap_or_else(|| format!("unix:{}", manifest.deleted_at_unix));
+            if source_kind == ChatSourceKind::ImportedArchive {
+                session.title = archive.title;
+                session.project_path = archive.project_path;
+                session.created_at = archive.created_at;
+                session.updated_at = archive
+                    .updated_at
+                    .unwrap_or_else(|| format!("unix:{}", manifest.deleted_at_unix));
+                session.imported = true;
+            }
             session.turn_count = archive.messages.len();
-            session.imported = source_kind == ChatSourceKind::ImportedArchive;
         }
     }
     Ok(session)
@@ -1453,53 +2130,6 @@ fn store_cached_meta(
 
 fn modified_since_epoch(meta: &fs::Metadata) -> Option<std::time::Duration> {
     meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()
-}
-
-#[allow(dead_code)]
-fn jsonl_dir_session(
-    provider: ChatProvider,
-    root: &Path,
-    dir: &Path,
-    files: Vec<PathBuf>,
-) -> Result<ChatSession> {
-    let mut parsed = SessionMeta::default();
-    let mut size = 0;
-    let mut updated = None;
-    for file in &files {
-        if let Ok(meta) = fs::metadata(file) {
-            size += meta.len();
-            updated = Some(file_time_label(&meta, true));
-        }
-        merge_meta(&mut parsed, parse_jsonl_meta(provider, file, root)?);
-    }
-    let fallback_id = dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("chat")
-        .to_string();
-    Ok(ChatSession {
-        title: parsed
-            .title
-            .clone()
-            .unwrap_or_else(|| format!("Untitled {} chat", provider.label())),
-        id: parsed.id.unwrap_or(fallback_id),
-        provider,
-        project_path: parsed
-            .project_path
-            .unwrap_or_else(|| project_label_from_path(provider, root, dir)),
-        created_at: parsed.created_at,
-        updated_at: parsed
-            .updated_at
-            .or(updated)
-            .unwrap_or_else(|| "unknown".into()),
-        source_path: Some(dir.to_path_buf()),
-        source_kind: ChatSourceKind::JsonlDir,
-        turn_count: parsed.turn_count,
-        size_bytes: size,
-        imported: false,
-        subagent: false,
-        trash_manifest: None,
-    })
 }
 
 fn load_jsonl_archive(session: &ChatSession) -> Result<ChatArchive> {
@@ -1921,13 +2551,11 @@ fn decode_claude_project_slug(slug: &str) -> String {
 }
 
 fn kiro_sessions_dir() -> Result<PathBuf> {
-    kiro_sessions_dir_from(crate::provider::env_path("KIRO_HOME"))
+    kiro_sessions_dir_from(crate::provider::global_dir(crate::types::ProviderId::Kiro).ok())
 }
 
 fn kiro_sessions_dir_from(override_home: Option<PathBuf>) -> Result<PathBuf> {
-    let base = override_home
-        .or_else(|| dirs::home_dir().map(|home| home.join(".kiro")))
-        .ok_or_else(|| anyhow!("cannot resolve Kiro home"))?;
+    let base = override_home.ok_or_else(|| anyhow!("cannot resolve Kiro home"))?;
     Ok(base.join("sessions").join("cli"))
 }
 
@@ -2051,14 +2679,14 @@ fn restore_kiro_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Res
                 .and_then(parse_epoch_millis)
                 .map(|ms| ms / 1000)
                 .unwrap_or(now_secs);
-            let block_kind = if kind == "ToolResults" {
-                "toolResult"
+            let block = if kind == "ToolResults" {
+                serde_json::json!({"kind": "toolResult", "data": {"content": &msg.text}})
             } else {
-                "text"
+                serde_json::json!({"kind": "text", "data": &msg.text})
             };
             let mut data = serde_json::json!({
                 "message_id": gen_uuid(),
-                "content": [{"kind": block_kind, "data": msg.text}],
+                "content": [block],
             });
             if kind == "Prompt" {
                 data["meta"] = serde_json::json!({"timestamp": timestamp});
@@ -2130,6 +2758,17 @@ fn restore_codex_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Re
         log.push_str(&serde_json::to_string(&meta_line)?);
         log.push('\n');
         for (msg_index, msg) in archive.messages.iter().enumerate() {
+            if msg.role == "tool" {
+                let ts = msg.timestamp.as_deref().unwrap_or(&now_iso);
+                let echo = serde_json::json!({
+                    "timestamp": ts,
+                    "type": "event_msg",
+                    "payload": {"type": "tool_result", "message": &msg.text}
+                });
+                log.push_str(&serde_json::to_string(&echo)?);
+                log.push('\n');
+                continue;
+            }
             let (role, content_type, event_type) = match msg.role.as_str() {
                 "user" => ("user", "input_text", "user_message"),
                 "assistant" => ("assistant", "output_text", "agent_message"),
@@ -2574,8 +3213,7 @@ fn text_from_value(value: &Value) -> Option<String> {
 }
 
 fn codex_home() -> Option<PathBuf> {
-    crate::provider::env_path("CODEX_HOME")
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+    crate::provider::global_dir(crate::types::ProviderId::Codex).ok()
 }
 
 fn codex_titles() -> HashMap<String, String> {
@@ -2595,16 +3233,6 @@ fn codex_titles() -> HashMap<String, String> {
             ))
         })
         .collect()
-}
-
-#[allow(dead_code)]
-fn merge_meta(to: &mut SessionMeta, from: SessionMeta) {
-    to.id = to.id.take().or(from.id);
-    to.title = to.title.take().or(from.title);
-    to.project_path = to.project_path.take().or(from.project_path);
-    to.created_at = to.created_at.take().or(from.created_at);
-    to.updated_at = from.updated_at.or(to.updated_at.take());
-    to.turn_count += from.turn_count;
 }
 
 fn jsonl_sources(path: &Path) -> Vec<PathBuf> {
@@ -2740,7 +3368,7 @@ mod tests {
 
     #[test]
     fn parses_codex_jsonl_metadata_and_messages() {
-        let dir = temp_test_dir("codex-jsonl");
+        let dir = crate::test_env::temp_dir("codex-jsonl");
         let file = dir.join("rollout-abc.jsonl");
         fs::write(
             &file,
@@ -2783,8 +3411,98 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_encoding_in_one_zip_entry_fails_only_that_entry() {
+        let dir = crate::test_env::temp_dir("zip-bad-utf8");
+        let data = dir.join("data");
+        with_env_var("AGENT_SWITCH_DATA_DIR", &data, || {
+            let good = ChatArchive {
+                schema_version: ARCHIVE_VERSION,
+                source_provider: ChatProvider::Antigravity,
+                source_session_id: "agy-1".into(),
+                title: "Archive agy-1".into(),
+                project_path: "D:/work/agy".into(),
+                created_at: None,
+                updated_at: None,
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    timestamp: None,
+                    text: "hello".into(),
+                }],
+                tool_calls: vec![],
+                raw_events: vec![],
+            };
+            let staging = dir.join("out.zip");
+            let file = File::create(&staging).unwrap();
+            let mut zip = ZipWriter::new(file);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zip.start_file("chats/good.agentswitch-chat.json", options)
+                .unwrap();
+            zip.write_all(serde_json::to_string_pretty(&good).unwrap().as_bytes())
+                .unwrap();
+            zip.start_file("chats/bad.agentswitch-chat.json", options)
+                .unwrap();
+            zip.write_all(&[0xFF, 0xFE, 0x00, b'{']).unwrap();
+            zip.finish().unwrap();
+
+            let report = import_zip(&staging, None).unwrap();
+            assert_eq!(report.ok, 1, "the valid entry must still import");
+            assert_eq!(report.failed, 1, "only the unreadable entry fails");
+        });
+    }
+
+    #[test]
+    fn opencode_current_loader_skips_corrupt_message_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+             CREATE TABLE part (id INTEGER PRIMARY KEY, message_id TEXT, data TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES ('m1', 's1', '{\"role\":\"user\"}', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part VALUES (1, 'm1', '{\"text\":\"hello\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO message VALUES ('m2', 's1', 'not-json', 2)", [])
+            .unwrap();
+
+        let mut messages = vec![];
+        let mut tools = vec![];
+        load_opencode_current(&conn, "s1", &mut messages, &mut tools).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "hello");
+    }
+
+    #[test]
+    fn iso_timestamps_with_offsets_compare_against_utc() {
+        let with_offset = parse_iso_seconds("2026-05-01T00:00:00+02:00").unwrap();
+        let utc = parse_iso_seconds("2026-04-30T22:00:00Z").unwrap();
+        assert_eq!(with_offset, utc);
+
+        let negative = parse_iso_seconds("2026-05-01T00:00:00-01:30").unwrap();
+        assert_eq!(negative, parse_iso_seconds("2026-05-01T01:30:00Z").unwrap());
+
+        let fractional = parse_iso_seconds("2026-05-01T00:00:00.123Z").unwrap();
+        assert_eq!(
+            fractional,
+            parse_iso_seconds("2026-05-01T00:00:00Z").unwrap()
+        );
+
+        assert_eq!(
+            parse_iso_seconds("2026-05-01T00:00:00+0200"),
+            parse_iso_seconds("2026-05-01T00:00:00+02:00")
+        );
+    }
+
+    #[test]
     fn metadata_search_matches_known_fields() {
-        let dir = temp_test_dir("metadata-search");
+        let dir = crate::test_env::temp_dir("metadata-search");
         let file = write_sample_jsonl(&dir, "search-a", "D:/work/search-app");
         let session = jsonl_session(ChatProvider::Codex, &dir, &file).unwrap();
         assert!(metadata_matches(&session, "codex local search-app"));
@@ -2794,7 +3512,7 @@ mod tests {
 
     #[test]
     fn exports_single_and_multi_zip_manifest() {
-        let dir = temp_test_dir("export-zip");
+        let dir = crate::test_env::temp_dir("export-zip");
         let file_a = write_sample_jsonl(&dir, "zip-a", "D:/work/a");
         let file_b = write_sample_jsonl(&dir, "zip-b", "D:/work/b");
         let a = jsonl_session(ChatProvider::Codex, &dir, &file_a).unwrap();
@@ -2821,7 +3539,7 @@ mod tests {
 
     #[test]
     fn trash_scan_restore_and_delete_forever() {
-        let dir = temp_test_dir("trash-flow");
+        let dir = crate::test_env::temp_dir("trash-flow");
         with_env_var("AGENT_SWITCH_DATA_DIR", &dir.join("data"), || {
             let file = write_sample_jsonl(&dir, "trash-a", "D:/work/trash");
             let session = jsonl_session(ChatProvider::Codex, &dir, &file).unwrap();
@@ -2843,32 +3561,16 @@ mod tests {
     }
 
     fn with_env_var<T>(name: &str, value: &Path, run: impl FnOnce() -> T) -> T {
-        with_env_vars(&[(name, value)], run)
+        crate::test_env::with_env_vars(&[(name, value)], run)
     }
 
     fn with_env_vars<T>(vars: &[(&str, &Path)], run: impl FnOnce() -> T) -> T {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
-        let previous: Vec<(String, Option<std::ffi::OsString>)> = vars
-            .iter()
-            .map(|(name, _)| ((*name).to_string(), env::var_os(name)))
-            .collect();
-        for (name, value) in vars {
-            env::set_var(name, value);
-        }
-        let result = run();
-        for ((name, _), (_, previous)) in vars.iter().zip(previous.iter()).rev() {
-            match previous {
-                Some(previous) => env::set_var(name, previous),
-                None => env::remove_var(name),
-            }
-        }
-        result
+        crate::test_env::with_env_vars(vars, run)
     }
 
     #[test]
     fn scans_and_exports_kiro_cli_sessions() {
-        let dir = temp_test_dir("kiro-cli");
+        let dir = crate::test_env::temp_dir("kiro-cli");
         let kiro_home = dir.join(".kiro");
         let cli = kiro_home.join("sessions").join("cli");
         fs::create_dir_all(&cli).unwrap();
@@ -2900,7 +3602,7 @@ mod tests {
 
     #[test]
     fn kiro_sessions_surface_globally_and_badge_subagents() {
-        let dir = temp_test_dir("kiro-global");
+        let dir = crate::test_env::temp_dir("kiro-global");
         let cli = dir.join(".kiro").join("sessions").join("cli");
         fs::create_dir_all(&cli).unwrap();
         let id = "11111111-2222-3333-4444-555555555555";
@@ -2938,7 +3640,7 @@ mod tests {
 
     #[test]
     fn kiro_tool_use_blocks_become_tool_calls_with_outcomes() {
-        let dir = temp_test_dir("kiro-tools");
+        let dir = crate::test_env::temp_dir("kiro-tools");
         let cli = dir.join(".kiro").join("sessions").join("cli");
         fs::create_dir_all(&cli).unwrap();
         let id = "11111111-2222-3333-4444-555555555555";
@@ -2981,7 +3683,7 @@ mod tests {
 
     #[test]
     fn failed_kiro_trash_moves_session_files_back() {
-        let dir = temp_test_dir("kiro-rollback");
+        let dir = crate::test_env::temp_dir("kiro-rollback");
         let kiro_home = dir.join(".kiro");
         let cli = kiro_home.join("sessions").join("cli");
         fs::create_dir_all(&cli).unwrap();
@@ -3026,7 +3728,7 @@ mod tests {
 
     #[test]
     fn imports_kiro_archive_back_into_native_store() {
-        let dir = temp_test_dir("kiro-import");
+        let dir = crate::test_env::temp_dir("kiro-import");
         let kiro_home = dir.join(".kiro");
         let cli = kiro_home.join("sessions").join("cli");
         fs::create_dir_all(&cli).unwrap();
@@ -3090,13 +3792,6 @@ mod tests {
         file
     }
 
-    fn temp_test_dir(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("agentswitch-{name}-{}", unix_now()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn empty_or_relative_home_overrides_fall_back_to_defaults() {
         let home = dirs::home_dir().unwrap();
@@ -3119,7 +3814,7 @@ mod tests {
 
     #[test]
     fn rejects_zip_with_too_many_entries() {
-        let dir = temp_test_dir("zip-limit");
+        let dir = crate::test_env::temp_dir("zip-limit");
         let path = dir.join("too-many.zip");
         let file = File::create(&path).unwrap();
         let mut zip = ZipWriter::new(file);
@@ -3136,37 +3831,10 @@ mod tests {
 
     #[test]
     fn scans_opencode_sessions_from_db() {
-        let dir = temp_test_dir("opencode-db");
+        let dir = crate::test_env::temp_dir("opencode-db");
         let db_path = dir.join("opencode.db");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                slug TEXT NOT NULL,
-                directory TEXT NOT NULL,
-                title TEXT NOT NULL,
-                version TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL
-            );
-            CREATE TABLE message (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );
-            CREATE TABLE part (
-                id TEXT PRIMARY KEY,
-                message_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );",
-        )
-        .unwrap();
+        conn.execute_batch(SESSION_SCHEMA_MINIMAL).unwrap();
         conn.execute(
             "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
@@ -3273,7 +3941,7 @@ mod tests {
 
     #[test]
     fn codex_event_msg_echoes_do_not_duplicate_response_items() {
-        let dir = temp_test_dir("codex-dedup");
+        let dir = crate::test_env::temp_dir("codex-dedup");
         let file = dir.join("rollout-dup.jsonl");
         fs::write(
             &file,
@@ -3299,7 +3967,7 @@ mod tests {
 
     #[test]
     fn claude_restore_uses_slug_directory_and_native_events() {
-        let dir = temp_test_dir("claude-restore");
+        let dir = crate::test_env::temp_dir("claude-restore");
         let home = dir.join(".claude");
         let archive = ChatArchive {
             schema_version: ARCHIVE_VERSION,
@@ -3376,37 +4044,10 @@ mod tests {
 
     #[test]
     fn scans_zcode_sessions_from_sqlite_db() {
-        let dir = temp_test_dir("zcode-db");
+        let dir = crate::test_env::temp_dir("zcode-db");
         let db_path = dir.join("db.sqlite");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                slug TEXT NOT NULL,
-                directory TEXT NOT NULL,
-                title TEXT NOT NULL,
-                version TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL
-            );
-            CREATE TABLE message (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );
-            CREATE TABLE part (
-                id TEXT PRIMARY KEY,
-                message_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );",
-        )
-        .unwrap();
+        conn.execute_batch(SESSION_SCHEMA_MINIMAL).unwrap();
         conn.execute(
             "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             rusqlite::params![
@@ -3449,37 +4090,10 @@ mod tests {
 
     #[test]
     fn zcode_import_restores_into_native_db() {
-        let dir = temp_test_dir("zcode-import");
+        let dir = crate::test_env::temp_dir("zcode-import");
         let db_path = dir.join("db.sqlite");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                slug TEXT NOT NULL,
-                directory TEXT NOT NULL,
-                title TEXT NOT NULL,
-                version TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL
-            );
-            CREATE TABLE message (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );
-            CREATE TABLE part (
-                id TEXT PRIMARY KEY,
-                message_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );",
-        )
-        .unwrap();
+        conn.execute_batch(SESSION_SCHEMA_MINIMAL).unwrap();
         conn.close().unwrap();
 
         let archive_path = dir.join("zcode.agentswitch-chat.json");
@@ -3534,7 +4148,7 @@ mod tests {
 
     #[test]
     fn claude_round_trip_scan_export_import_rescan() {
-        let dir = temp_test_dir("claude-roundtrip");
+        let dir = crate::test_env::temp_dir("claude-roundtrip");
         let home_a = dir.join("home-a");
         let project_dir = home_a.join("projects").join("D--AI-Demo");
         fs::create_dir_all(&project_dir).unwrap();
@@ -3575,7 +4189,7 @@ mod tests {
 
     #[test]
     fn codex_round_trip_honors_codex_home() {
-        let dir = temp_test_dir("codex-roundtrip");
+        let dir = crate::test_env::temp_dir("codex-roundtrip");
         let home_a = dir.join("codex-home-a");
         let sessions_dir = home_a.join("sessions").join("2026").join("05").join("01");
         fs::create_dir_all(&sessions_dir).unwrap();
@@ -3620,7 +4234,7 @@ mod tests {
 
     #[test]
     fn deflated_zip_export_import_round_trip() {
-        let dir = temp_test_dir("zip-roundtrip");
+        let dir = crate::test_env::temp_dir("zip-roundtrip");
         let data = dir.join("data");
         with_env_var("AGENT_SWITCH_DATA_DIR", &data, || {
             let make_archive = |id: &str, text: &str| ChatArchive {
@@ -3739,7 +4353,7 @@ mod tests {
             eprintln!("no live ZCode db; skipping");
             return;
         }
-        let dir = temp_test_dir("live-zcode");
+        let dir = crate::test_env::temp_dir("live-zcode");
         for suffix in ["", "-wal", "-shm"] {
             let source = PathBuf::from(format!("{}{suffix}", db.display()));
             if source.exists() {
@@ -3778,7 +4392,7 @@ mod tests {
 
     #[test]
     fn converts_claude_chat_into_codex_store() {
-        let dir = temp_test_dir("convert-claude-to-codex");
+        let dir = crate::test_env::temp_dir("convert-claude-to-codex");
         let home_a = dir.join("claude-home");
         let project_dir = home_a.join("projects").join("D--AI-Demo");
         fs::create_dir_all(&project_dir).unwrap();
@@ -3839,35 +4453,10 @@ mod tests {
 
     #[test]
     fn converts_opencode_db_chat_into_zcode_store() {
-        let dir = temp_test_dir("convert-opencode-to-zcode");
-        let schema = "CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                slug TEXT NOT NULL,
-                directory TEXT NOT NULL,
-                title TEXT NOT NULL,
-                version TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL
-            );
-            CREATE TABLE message (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );
-            CREATE TABLE part (
-                id TEXT PRIMARY KEY,
-                message_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );";
+        let dir = crate::test_env::temp_dir("convert-opencode-to-zcode");
         let src_db = dir.join("opencode.sqlite");
         let conn = Connection::open(&src_db).unwrap();
-        conn.execute_batch(schema).unwrap();
+        conn.execute_batch(SESSION_SCHEMA_MINIMAL).unwrap();
         conn.execute(
             "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             rusqlite::params!["sess_oc", "proj", "sess_oc", "D:/work/x", "Cross store chat", "1", 1000_i64, 2000_i64],
@@ -3887,7 +4476,7 @@ mod tests {
 
         let dst_db = dir.join("zcode.sqlite");
         let conn = Connection::open(&dst_db).unwrap();
-        conn.execute_batch(schema).unwrap();
+        conn.execute_batch(SESSION_SCHEMA_MINIMAL).unwrap();
         conn.close().unwrap();
 
         let source = with_env_var("OPENCODE_DB", &src_db, || scan_opencode().remove(0));
@@ -3948,7 +4537,7 @@ mod tests {
 
     #[test]
     fn converted_archive_file_imports_into_chosen_project() {
-        let dir = temp_test_dir("convert-archive-file");
+        let dir = crate::test_env::temp_dir("convert-archive-file");
         let home_a = dir.join("claude-home");
         let project_dir = home_a.join("projects").join("D--AI-Demo");
         fs::create_dir_all(&project_dir).unwrap();
@@ -3994,7 +4583,7 @@ mod tests {
 
     #[test]
     fn converted_zip_retagged_for_target_store() {
-        let dir = temp_test_dir("convert-archive-zip");
+        let dir = crate::test_env::temp_dir("convert-archive-zip");
         let make = |provider, id: &str, title: &str, with_raw: bool| ChatArchive {
             schema_version: ARCHIVE_VERSION,
             source_provider: provider,
@@ -4062,7 +4651,7 @@ mod tests {
 
     #[test]
     fn convert_archive_file_rejects_bad_input_and_antigravity() {
-        let dir = temp_test_dir("convert-archive-guards");
+        let dir = crate::test_env::temp_dir("convert-archive-guards");
         let make = |provider, title: &str| ChatArchive {
             schema_version: ARCHIVE_VERSION,
             source_provider: provider,
@@ -4109,37 +4698,10 @@ mod tests {
 
     #[test]
     fn zcode_db_session_trashes_and_restores_with_identity() {
-        let dir = temp_test_dir("zcode-db-trash");
+        let dir = crate::test_env::temp_dir("zcode-db-trash");
         let db_path = dir.join("db.sqlite");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                slug TEXT NOT NULL,
-                directory TEXT NOT NULL,
-                title TEXT NOT NULL,
-                version TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL
-            );
-            CREATE TABLE message (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );
-            CREATE TABLE part (
-                id TEXT PRIMARY KEY,
-                message_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );",
-        )
-        .unwrap();
+        conn.execute_batch(SESSION_SCHEMA_MINIMAL).unwrap();
         conn.execute(
             "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             rusqlite::params!["sess_abc", "proj", "sess_abc", "D:/work/trash", "Trashable chat", "1", 1780000000000_i64, 1780001000000_i64],
@@ -4201,28 +4763,10 @@ mod tests {
 
     #[test]
     fn opencode_legacy_db_session_trashes_cleanly() {
-        let dir = temp_test_dir("opencode-legacy-trash");
+        let dir = crate::test_env::temp_dir("opencode-legacy-trash");
         let db_path = dir.join("legacy.sqlite");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                slug TEXT NOT NULL,
-                directory TEXT NOT NULL,
-                title TEXT NOT NULL,
-                version TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL
-            );
-            CREATE TABLE session_message (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                time_created INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );",
-        )
-        .unwrap();
+        conn.execute_batch(SESSION_SCHEMA_LEGACY).unwrap();
         conn.execute(
             "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             rusqlite::params!["sess_leg", "proj", "sess_leg", "D:/work/old", "Legacy chat", "1", 100_i64, 200_i64],
@@ -4307,7 +4851,7 @@ mod tests {
 
     #[test]
     fn failed_codex_registration_keeps_trash_manifest() {
-        let dir = temp_test_dir("codex-failed-register");
+        let dir = crate::test_env::temp_dir("codex-failed-register");
         let codex_home = dir.join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
         codex_threads_db_fixture(&codex_home.join("state_5.sqlite"));
@@ -4341,7 +4885,7 @@ mod tests {
 
     #[test]
     fn codex_thread_registered_in_state_database_across_trash_cycle() {
-        let dir = temp_test_dir("codex-state-db");
+        let dir = crate::test_env::temp_dir("codex-state-db");
         let codex_home = dir.join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
         codex_threads_db_fixture(&codex_home.join("state_5.sqlite"));
@@ -4423,7 +4967,7 @@ mod tests {
 
     #[test]
     fn restoring_imported_codex_archive_skips_state_database() {
-        let dir = temp_test_dir("codex-imported-restore");
+        let dir = crate::test_env::temp_dir("codex-imported-restore");
         let codex_home = dir.join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
         codex_threads_db_fixture(&codex_home.join("state_5.sqlite"));
@@ -4490,7 +5034,7 @@ mod tests {
 
     #[test]
     fn zcode_conversion_matches_current_schema() {
-        let dir = temp_test_dir("zcode-current-schema");
+        let dir = crate::test_env::temp_dir("zcode-current-schema");
         let db_path = dir.join("db.sqlite");
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
@@ -4604,7 +5148,7 @@ mod tests {
 
     #[test]
     fn kiro_restore_events_carry_message_ids_and_timestamps() {
-        let dir = temp_test_dir("kiro-restore");
+        let dir = crate::test_env::temp_dir("kiro-restore");
         let home = dir.join(".kiro");
         let archive = ChatArchive {
             schema_version: ARCHIVE_VERSION,
@@ -4661,6 +5205,8 @@ mod tests {
             ChatProvider::Kiro => ("KIRO_HOME", dir.join("kiro-home")),
             ChatProvider::OpenCode => ("OPENCODE_DB", dir.join("opencode.sqlite")),
             ChatProvider::Zcode => ("ZCODE_DB", dir.join("zcode.sqlite")),
+            ChatProvider::Grok => ("GROK_HOME", dir.join("grok-home")),
+            ChatProvider::Muse => ("XDG_DATA_HOME", dir.join("xdg-data")),
             ChatProvider::Antigravity => unreachable!("excluded from conversions"),
         }
     }
@@ -4689,6 +5235,24 @@ mod tests {
             session_id TEXT NOT NULL,
             time_created INTEGER NOT NULL,
             time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );";
+
+    const SESSION_SCHEMA_LEGACY: &str = "
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            directory TEXT NOT NULL,
+            title TEXT NOT NULL,
+            version TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL
+        );
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
             data TEXT NOT NULL
         );";
 
@@ -4785,8 +5349,78 @@ mod tests {
                 seed_sqlite_store(&dir.join("zcode.sqlite"), "zcode question", "zcode answer");
                 ("zcode question", "zcode answer")
             }
+            ChatProvider::Grok => {
+                grok_fixture(
+                    dir,
+                    "D%3A%2Fwork%2Fmx",
+                    "55555555-5555-5555-5555-555555555555",
+                    r#"{"info":{"id":"55555555-5555-5555-5555-555555555555","cwd":"D:/work/mx"},"session_summary":"grok question","created_at":"2026-05-01T00:00:00Z","updated_at":"2026-05-01T00:01:00Z","num_messages":3,"num_chat_messages":2}"#,
+                    &[
+                        r#"{"type":"user","content":[{"type":"text","text":"grok question"}]}"#,
+                        r#"{"type":"assistant","content":"grok answer","tool_calls":[]}"#,
+                    ],
+                );
+                ("grok question", "grok answer")
+            }
+            ChatProvider::Muse => {
+                muse_fixture(
+                    &dir.join("xdg-data")
+                        .join("muse")
+                        .join("sessions")
+                        .join("2026")
+                        .join("05")
+                        .join("01")
+                        .join("66666666-6666-6666-6666-666666666666"),
+                    &[
+                        muse_envelope(
+                            1,
+                            "runtime.session.metadata",
+                            r#"{"record":{"workspace_root":"D:/work/mx"}}"#,
+                        ),
+                        muse_envelope(
+                            2,
+                            "runtime.session",
+                            r#"{"kind":"run","event":{"kind":"started","prompt":"muse question"}}"#,
+                        ),
+                        muse_envelope(
+                            3,
+                            "runtime.session",
+                            r#"{"kind":"run","event":{"kind":"assistant_message_committed","text":"muse answer"}}"#,
+                        ),
+                    ],
+                );
+                ("muse question", "muse answer")
+            }
             ChatProvider::Antigravity => unreachable!("excluded from conversions"),
         }
+    }
+
+    fn muse_envelope(sequence: u64, payload_type: &str, payload: &str) -> String {
+        format!(
+            r#"{{"schema_version":1,"stream":{{"kind":"session","id":"66666666-6666-6666-6666-666666666666"}},"recorded_at":1785972468194395,"record_type":"event","durability":"durable","sequence":{sequence},"payload_type":"{payload_type}","payload_schema_version":1,"payload":{payload}}}"#
+        )
+    }
+
+    fn grok_fixture(
+        dir: &std::path::Path,
+        cwd_dir: &str,
+        id: &str,
+        summary: &str,
+        history: &[&str],
+    ) {
+        let session_dir = dir
+            .join("grok-home")
+            .join("sessions")
+            .join(cwd_dir)
+            .join(id);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("summary.json"), summary).unwrap();
+        fs::write(session_dir.join("chat_history.jsonl"), history.join("\n")).unwrap();
+    }
+
+    fn muse_fixture(path: &std::path::Path, records: &[String]) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("session.jsonl"), records.join("\n")).unwrap();
     }
 
     fn scan_provider(provider: ChatProvider, _project: &str) -> Vec<ChatSession> {
@@ -4796,13 +5430,209 @@ mod tests {
             ChatProvider::Kiro => scan_kiro(),
             ChatProvider::OpenCode => scan_opencode(),
             ChatProvider::Zcode => scan_zcode(),
+            ChatProvider::Grok => scan_grok(),
+            ChatProvider::Muse => scan_muse(),
             ChatProvider::Antigravity => unreachable!("excluded from conversions"),
         }
     }
 
+    fn tool_archive() -> ChatArchive {
+        ChatArchive {
+            schema_version: ARCHIVE_VERSION,
+            source_provider: ChatProvider::Claude,
+            source_session_id: "tool-1".into(),
+            title: "Tool chat".into(),
+            project_path: "D:/work/tool".into(),
+            created_at: None,
+            updated_at: None,
+            messages: vec![
+                ChatMessage {
+                    role: "user".into(),
+                    timestamp: None,
+                    text: "run the build".into(),
+                },
+                ChatMessage {
+                    role: "assistant".into(),
+                    timestamp: None,
+                    text: "running".into(),
+                },
+                ChatMessage {
+                    role: "tool".into(),
+                    timestamp: None,
+                    text: "build failed".into(),
+                },
+            ],
+            tool_calls: vec![],
+            raw_events: vec![],
+        }
+    }
+
+    #[test]
+    fn codex_conversion_preserves_tool_result_turns() {
+        let dir = crate::test_env::temp_dir("codex-tool-conv");
+        with_env_var("CODEX_HOME", &dir.join("codex-home"), || {
+            restore_codex_native(&tool_archive(), None).unwrap();
+            let sessions = scan_codex();
+            assert_eq!(sessions.len(), 1);
+            let loaded = load_archive(&sessions[0]).unwrap();
+            let roles: Vec<_> = loaded.messages.iter().map(|m| m.role.as_str()).collect();
+            assert_eq!(
+                roles,
+                ["user", "assistant", "tool"],
+                "tool turns must not be silently dropped by the Codex writer"
+            );
+            assert_eq!(loaded.messages[2].text, "build failed");
+        });
+    }
+
+    #[test]
+    fn kiro_conversion_parks_tool_results_as_tool_outcomes() {
+        let dir = crate::test_env::temp_dir("kiro-tool-conv");
+        with_env_var("KIRO_HOME", &dir.join("kiro-home"), || {
+            restore_kiro_native(&tool_archive(), None).unwrap();
+            let sessions = scan_kiro();
+            assert_eq!(sessions.len(), 1);
+            let loaded = load_archive(&sessions[0]).unwrap();
+            let roles: Vec<_> = loaded.messages.iter().map(|m| m.role.as_str()).collect();
+            assert_eq!(
+                roles,
+                ["user", "assistant"],
+                "Kiro chats carry tool outcomes as tool metadata, not messages"
+            );
+            assert!(
+                loaded
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.summary.contains("build failed")),
+                "the tool result must survive as a tool outcome, got: {:?}",
+                loaded.tool_calls
+            );
+        });
+    }
+
+    #[test]
+    fn failed_db_trash_manifest_leaves_no_orphan_archive() {
+        let dir = crate::test_env::temp_dir("db-trash-orphan");
+        let db = dir.join("store.sqlite");
+        seed_sqlite_store(&db, "orphan q", "orphan a");
+        let session = ChatSession {
+            id: "sess_mx".into(),
+            title: "Orphan check".into(),
+            provider: ChatProvider::OpenCode,
+            project_path: "D:/work/mx".into(),
+            created_at: None,
+            updated_at: "2026-05-01T00:00:00Z".into(),
+            source_path: Some(db),
+            source_kind: ChatSourceKind::OpenCodeDb,
+            turn_count: 2,
+            size_bytes: 0,
+            imported: false,
+            subagent: false,
+            trash_manifest: None,
+        };
+        let data = dir.join("data");
+        with_env_var("AGENT_SWITCH_DATA_DIR", &data, || {
+            let stem = safe_file_stem(&format!("{}-{}", session.id, session.title));
+            let trash_dir = trash_dir().join(session.provider.id());
+            fs::create_dir_all(trash_dir.join(format!("{stem}.agentswitch-chat.delete.json")))
+                .unwrap();
+
+            assert!(soft_delete(&session).is_err());
+            assert!(scan_trash(None).is_empty(), "no discoverable manifest");
+            assert!(
+                !trash_dir
+                    .join(format!("{stem}.agentswitch-chat.json"))
+                    .exists(),
+                "the archive must be rolled back when the manifest cannot be written"
+            );
+        });
+    }
+
+    #[test]
+    fn converted_zips_drop_unsafe_entry_names() {
+        let dir = crate::test_env::temp_dir("zip-traversal");
+        let staging = dir.join("in.zip");
+        let file = File::create(&staging).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        zip.start_file("chats/good.agentswitch-chat.json", options)
+            .unwrap();
+        zip.write_all(
+            serde_json::to_string_pretty(&tool_archive())
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        zip.start_file("../evil.txt", options).unwrap();
+        zip.write_all(b"pwned").unwrap();
+        zip.finish().unwrap();
+
+        let (out_path, skipped) = convert_archive_zip(&staging, ChatProvider::Codex).unwrap();
+        assert_eq!(skipped, 0);
+        let out = ZipArchive::new(File::open(&out_path).unwrap()).unwrap();
+        let names: Vec<&str> = out.file_names().collect();
+        assert!(
+            names.iter().all(|name| !name.contains("..")),
+            "repacked zip must not carry traversal entry names: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.ends_with(ARCHIVE_EXT)),
+            "the convertible chat is still repacked"
+        );
+    }
+
+    #[test]
+    fn exporting_duplicate_sessions_gets_unique_zip_names() {
+        let dir = crate::test_env::temp_dir("zip-dup-names");
+        let archive_text = serde_json::to_string_pretty(&tool_archive()).unwrap();
+        let first = dir.join("first.agentswitch-chat.json");
+        let second = dir.join("second.agentswitch-chat.json");
+        fs::write(&first, &archive_text).unwrap();
+        fs::write(&second, &archive_text).unwrap();
+        let make = |path: PathBuf| ChatSession {
+            id: "same-id".into(),
+            title: "Same".into(),
+            provider: ChatProvider::Kiro,
+            project_path: "D:/work".into(),
+            created_at: None,
+            updated_at: "2026-05-01T00:00:00Z".into(),
+            source_path: Some(path),
+            source_kind: ChatSourceKind::ImportedArchive,
+            turn_count: 3,
+            size_bytes: 0,
+            imported: false,
+            subagent: false,
+            trash_manifest: None,
+        };
+        let sessions = vec![make(first), make(second)];
+
+        let report = export_sessions_zip(&sessions, &dir.join("out.zip")).unwrap();
+        assert_eq!(report.ok, 2);
+        let zip = ZipArchive::new(File::open(dir.join("out.zip")).unwrap()).unwrap();
+        let names: Vec<&str> = zip
+            .file_names()
+            .filter(|name| name.starts_with("chats/"))
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert_eq!(
+            std::collections::HashSet::<&str>::from_iter(names.iter().copied()).len(),
+            2,
+            "both chats must land under distinct entry names: {names:?}"
+        );
+    }
+
     #[test]
     fn every_provider_pair_converts_and_lands_discoverable() {
-        let providers = [
+        let sources = [
+            ChatProvider::Claude,
+            ChatProvider::Codex,
+            ChatProvider::Kiro,
+            ChatProvider::OpenCode,
+            ChatProvider::Zcode,
+            ChatProvider::Grok,
+            ChatProvider::Muse,
+        ];
+        let targets = [
             ChatProvider::Claude,
             ChatProvider::Codex,
             ChatProvider::Kiro,
@@ -4810,13 +5640,17 @@ mod tests {
             ChatProvider::Zcode,
         ];
         let mut combos = 0;
-        for source in providers {
-            for target in providers {
+        for source in sources {
+            for target in targets {
                 if source == target {
                     continue;
                 }
                 combos += 1;
-                let dir = temp_test_dir(&format!("matrix-{}-to-{}", source.id(), target.id()));
+                let dir = crate::test_env::temp_dir(&format!(
+                    "matrix-{}-to-{}",
+                    source.id(),
+                    target.id()
+                ));
                 let (first, second) = build_source_store(&dir, source);
                 let (source_var, source_path) = provider_env(&dir, source);
                 let (target_var, target_path) = provider_env(&dir, target);
@@ -4857,6 +5691,266 @@ mod tests {
                 );
             }
         }
-        assert_eq!(combos, 20, "5 providers x 4 targets, Antigravity excluded");
+        assert_eq!(
+            combos, 30,
+            "7 sources x 5 targets minus the 5 identity pairs"
+        );
+    }
+
+    #[test]
+    fn grok_trash_moves_the_whole_session_directory() {
+        let dir = crate::test_env::temp_dir("grok-trash");
+        build_source_store(&dir, ChatProvider::Grok);
+        let (var, path) = provider_env(&dir, ChatProvider::Grok);
+        with_env_vars(
+            &[(var, &path), ("AGENT_SWITCH_DATA_DIR", &dir.join("data"))],
+            || {
+                let session = scan_grok().remove(0);
+                let session_dir = session.source_path.clone().unwrap();
+                soft_delete(&session).unwrap();
+                assert!(!session_dir.exists(), "session dir must leave the store");
+                let trashed = scan_trash(None).remove(0);
+                let manifest_path = trashed.trash_manifest.clone().unwrap();
+                let trashed_dir = trashed.source_path.clone().unwrap();
+                assert!(trashed_dir.join("summary.json").is_file());
+                assert!(trashed_dir.join("chat_history.jsonl").is_file());
+
+                let restored = restore_from_trash(&trashed).unwrap();
+                assert!(restored.join("summary.json").is_file());
+                assert!(restored.join("chat_history.jsonl").is_file());
+                assert!(!manifest_path.exists(), "manifest must be consumed");
+            },
+        );
+    }
+
+    #[test]
+    fn grok_tool_calls_bind_results_to_calls() {
+        let dir = crate::test_env::temp_dir("grok-tools");
+        grok_fixture(
+            &dir,
+            "work",
+            "77777777-7777-7777-7777-777777777777",
+            r#"{"info":{"id":"77777777-7777-7777-7777-777777777777","cwd":"D:/work"},"session_summary":"fix it","num_messages":4}"#,
+            &[
+                r#"{"type":"user","content":[{"type":"text","text":"run tests"}]}"#,
+                r#"{"type":"user","content":[{"type":"text","text":"<project-instructions>"}],"synthetic_reason":"ProjectInstructions"}"#,
+                r#"{"type":"assistant","content":"checking","tool_calls":[{"id":"call-1","name":"Bash","arguments":"{\"cmd\":\"cargo test\"}"}]}"#,
+                r#"{"type":"tool_result","tool_call_id":"call-1","content":"all green"}"#,
+            ],
+        );
+        let (var, path) = provider_env(&dir, ChatProvider::Grok);
+        with_env_vars(&[(var, &path)], || {
+            let session = scan_grok().remove(0);
+            assert_eq!(session.turn_count, 4);
+            let archive = load_archive(&session).unwrap();
+            assert_eq!(
+                archive.messages.len(),
+                2,
+                "synthetic user items are not turns"
+            );
+            assert_eq!(archive.messages[0].text, "run tests");
+            assert_eq!(archive.tool_calls.len(), 1);
+            assert_eq!(archive.tool_calls[0].name, "Bash");
+            assert_eq!(archive.tool_calls[0].summary, "all green");
+        });
+    }
+
+    #[test]
+    fn muse_orders_events_by_sequence_and_binds_tool_results() {
+        let dir = crate::test_env::temp_dir("muse-order");
+        muse_fixture(
+            &dir.join("xdg-data")
+                .join("muse")
+                .join("sessions")
+                .join("2026")
+                .join("08")
+                .join("05")
+                .join("88888888-8888-8888-8888-888888888888"),
+            &[
+                muse_envelope(
+                    1,
+                    "runtime.session.metadata",
+                    r#"{"record":{"workspace_root":"D:/work/mx"}}"#,
+                ),
+                muse_envelope(
+                    7,
+                    "runtime.session",
+                    r#"{"kind":"run","event":{"kind":"assistant_message_committed","text":"answer"}}"#,
+                ),
+                muse_envelope(
+                    3,
+                    "runtime.session",
+                    r#"{"kind":"run","event":{"kind":"started","prompt":"muse question"}}"#,
+                ),
+                muse_envelope(
+                    4,
+                    "runtime.session",
+                    r#"{"kind":"run","event":{"kind":"assistant_tool_calls_committed","text":"looking","tool_calls":[{"name":"read_file","call_id":"call-1","args":"{\"path\":\"it.rs\"}"}]}}"#,
+                ),
+                muse_envelope(
+                    5,
+                    "runtime.session",
+                    r#"{"kind":"run","event":{"kind":"tool_result_batch_committed","results":[{"tool_call_id":"call-1","text":"fn it_works() {}"}]}}"#,
+                ),
+                muse_envelope(
+                    6,
+                    "runtime.session",
+                    r#"{"kind":"run","event":{"kind":"model_completed","usage":{"input_tokens":1}}}"#,
+                ),
+                muse_envelope(
+                    8,
+                    "runtime.session",
+                    r#"{"kind":"paused","event":{"kind":"started","prompt":"phantom turn"}}"#,
+                ),
+            ],
+        );
+        let (var, path) = provider_env(&dir, ChatProvider::Muse);
+        with_env_vars(&[(var, &path)], || {
+            let sessions = scan_muse();
+            assert_eq!(sessions.len(), 1);
+            let session = &sessions[0];
+            assert_eq!(session.id, "66666666-6666-6666-6666-666666666666");
+            assert_eq!(session.project_path, "D:/work/mx");
+            assert_eq!(session.title, "muse question");
+            let archive = load_archive(session).unwrap();
+            let roles: Vec<&str> = archive.messages.iter().map(|m| m.role.as_str()).collect();
+            assert_eq!(roles, vec!["user", "assistant", "assistant"]);
+            assert_eq!(archive.messages[0].text, "muse question");
+            assert!(
+                !archive.messages.iter().any(|m| m.text == "phantom turn"),
+                "events outside payload.kind == \"run\" must be ignored"
+            );
+            assert_eq!(archive.tool_calls.len(), 1);
+            assert_eq!(archive.tool_calls[0].name, "read_file");
+            assert_eq!(archive.tool_calls[0].summary, "fn it_works() {}");
+        });
+    }
+
+    #[test]
+    fn muse_subagent_sessions_are_badged_and_have_their_own_rows() {
+        let dir = crate::test_env::temp_dir("muse-subagent");
+        let root = dir.join("xdg-data").join("muse").join("sessions");
+        muse_fixture(
+            &root.join("2026").join("08").join("05").join("p0"),
+            &[muse_envelope(
+                1,
+                "runtime.session",
+                r#"{"kind":"run","event":{"kind":"started","prompt":"root prompt"}}"#,
+            )],
+        );
+        muse_fixture(
+            &root
+                .join("2026")
+                .join("08")
+                .join("05")
+                .join("p0")
+                .join("subagent")
+                .join("p1"),
+            &[muse_envelope(
+                1,
+                "runtime.session",
+                r#"{"kind":"run","event":{"kind":"started","prompt":"child prompt"}}"#,
+            )],
+        );
+        let (var, path) = provider_env(&dir, ChatProvider::Muse);
+        with_env_vars(&[(var, &path)], || {
+            let sessions = scan_muse();
+            assert_eq!(sessions.len(), 2);
+            let sub_sessions: Vec<_> = sessions.iter().filter(|s| s.subagent).collect();
+            assert_eq!(sub_sessions.len(), 1);
+            assert_eq!(sub_sessions[0].title, "child prompt");
+        });
+    }
+
+    #[test]
+    fn converting_zip_of_grok_chats_targets_codex() {
+        let dir = crate::test_env::temp_dir("grok-zip-skip");
+        let zip_path = dir.join("grok-chats.zip");
+        let file = File::create(&zip_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        zip.start_file("chats/grok.agentswitch-chat.json", options)
+            .unwrap();
+        zip.write_all(
+            serde_json::to_string_pretty(&ChatArchive {
+                source_provider: ChatProvider::Grok,
+                ..tool_archive()
+            })
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+
+        let (converted, skipped) = convert_archive_file(&zip_path, ChatProvider::Codex).unwrap();
+        assert_eq!(
+            skipped, 0,
+            "Grok archives are readable sources and must convert"
+        );
+        let mut out = ZipArchive::new(File::open(&converted).unwrap()).unwrap();
+        let mut found = false;
+        for i in 0..out.len() {
+            let mut entry = out.by_index(i).unwrap();
+            let name = entry.name().to_string();
+            if !name.ends_with(ARCHIVE_EXT) {
+                continue;
+            }
+            let mut buf = String::new();
+            entry.read_to_string(&mut buf).unwrap();
+            let archive: ChatArchive = serde_json::from_str(&buf).unwrap();
+            assert_eq!(archive.source_provider, ChatProvider::Codex);
+            found = true;
+        }
+        assert!(found, "converted ZIP must contain the retagged chat");
+    }
+
+    #[test]
+    fn grok_legacy_role_shaped_history_still_parses() {
+        let dir = crate::test_env::temp_dir("grok-legacy");
+        grok_fixture(
+            &dir,
+            "work",
+            "99999999-9999-9999-9999-999999999999",
+            r#"{"info":{"id":"99999999-9999-9999-9999-999999999999","cwd":"D:/work"},"session_summary":"legacy","num_messages":3}"#,
+            &[
+                r#"{"role":"user","content":"legacy question"}"#,
+                r#"{"role":"assistant","content":"working","tool_calls":[{"id":"c1","type":"function","function":{"name":"Bash","arguments":"{\"cmd\":\"ls\"}"}}]}"#,
+                r#"{"role":"tool","tool_call_id":"c1","content":"done"}"#,
+            ],
+        );
+        let (var, path) = provider_env(&dir, ChatProvider::Grok);
+        with_env_vars(&[(var, &path)], || {
+            let session = scan_grok().remove(0);
+            let archive = load_archive(&session).unwrap();
+            let texts: Vec<_> = archive
+                .messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.text.as_str()))
+                .collect();
+            assert_eq!(
+                texts,
+                vec![("user", "legacy question"), ("assistant", "working")]
+            );
+            assert_eq!(archive.tool_calls.len(), 1);
+            assert_eq!(archive.tool_calls[0].name, "Bash");
+            assert_eq!(archive.tool_calls[0].summary, "done");
+        });
+    }
+
+    #[test]
+    fn percent_decode_tolerates_stray_percent_signs() {
+        assert_eq!(
+            percent_decode("D%3A%2Fwork%2Fmx").as_deref(),
+            Some("D:/work/mx")
+        );
+        assert_eq!(percent_decode("caf%C3%A9").as_deref(), Some("café"));
+        assert_eq!(percent_decode("100%-done").as_deref(), Some("100%-done"));
+    }
+
+    #[test]
+    fn conversion_rejects_grok_and_muse_targets() {
+        assert!(!conversion_targets().contains(&ChatProvider::Grok));
+        assert!(!conversion_targets().contains(&ChatProvider::Muse));
+        assert!(!conversion_targets().contains(&ChatProvider::Antigravity));
     }
 }

@@ -1,6 +1,6 @@
-use crate::config_store::{move_path, Snapshot};
+use crate::config_store::{atomic_write, move_path, Snapshot};
 use crate::types::*;
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 pub fn toggle_item(item: &mut ConfigItem) -> Result<()> {
     if item.kind == ItemKind::Plugin {
@@ -70,7 +70,9 @@ fn toggle_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
         {
             return toggle_kiro_hook_file(item, loc)
         }
-        ProviderId::Zcode => return toggle_zcode_hook(item, loc),
+        ProviderId::Zcode if !loc.event.starts_with("_stashed_") => {
+            return toggle_zcode_hook(item, loc)
+        }
         _ => {}
     }
     toggle_hook_stash(item, loc)
@@ -80,7 +82,6 @@ fn toggle_zcode_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     let snapshot = Snapshot::read(&item.path)?;
     let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
     let arr = array_at_mut(&mut doc, &loc.section, &loc.event)?;
-    let enable = !item.state.is_enabled();
     let entry = arr
         .iter_mut()
         .find(|entry| zcode_entry_fingerprint(entry) == loc.fingerprint)
@@ -88,14 +89,18 @@ fn toggle_zcode_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     let obj = entry
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("hook entry is not an object"))?;
+    let enable = !item.state.is_enabled();
     if enable {
         obj.remove("enabled");
-        item.state = ItemState::Enabled;
     } else {
         obj.insert("enabled".into(), serde_json::Value::Bool(false));
-        item.state = ItemState::Disabled;
     }
     snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    item.state = if enable {
+        ItemState::Enabled
+    } else {
+        ItemState::Disabled
+    };
     Ok(())
 }
 
@@ -185,7 +190,23 @@ fn stash_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     let mut stash: serde_json::Value = serde_json::from_str(sidecar.text()?)?;
     ensure_array(&mut stash, "", &loc.event)?.push(entry);
     sidecar.commit(serde_json::to_string_pretty(&stash)?.as_bytes())?;
-    snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    if let Err(error) = snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes()) {
+        let original = sidecar.text()?.to_string();
+        let restored = atomic_write(&sidecar_path(&item.path), original.as_bytes());
+        let cleaned = match restored {
+            Ok(()) if original == "{}" => {
+                std::fs::remove_file(sidecar_path(&item.path)).map_err(anyhow::Error::from)
+            }
+            Ok(()) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(back_error) = cleaned {
+            return Err(error).context(format!(
+                "restoring the hook sidecar also failed: {back_error}"
+            ));
+        }
+        return Err(error);
+    }
     item.state = ItemState::Disabled;
     Ok(())
 }
@@ -206,25 +227,30 @@ fn unstash_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
         let other_orders: Vec<u64> = stash
             .get(real_event)
             .and_then(serde_json::Value::as_array)
-            .map_or(vec![], |entries| {
-                entries
-                    .iter()
-                    .filter_map(|e| e.get("_agentswitch_order"))
-                    .filter_map(serde_json::Value::as_u64)
-                    .chain(std::iter::once(original_order))
-                    .collect()
-            });
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("_agentswitch_order"))
+            .filter_map(serde_json::Value::as_u64)
+            .chain(std::iter::once(original_order))
+            .collect();
         let snapshot = Snapshot::read(&item.path)?;
         let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
         let arr = array_at_mut(&mut doc, &loc.section, real_event)?;
         let index = restore_index(arr, original_order as usize, &other_orders);
         arr.insert(index, entry);
         drop_empty_stash(&mut stash);
-        sidecar.commit(serde_json::to_string_pretty(&stash)?.as_bytes())?;
+        snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+        if let Err(error) = sidecar.commit(serde_json::to_string_pretty(&stash)?.as_bytes()) {
+            if let Err(back_error) = atomic_write(&item.path, snapshot.text()?.as_bytes()) {
+                return Err(error).context(format!(
+                    "reverting the hook config also failed: {back_error}"
+                ));
+            }
+            return Err(error);
+        }
         if stash.as_object().is_some_and(|o| o.is_empty()) {
             let _ = std::fs::remove_file(&stash_path);
         }
-        snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes())?;
         item.state = ItemState::Enabled;
         return Ok(());
     }
@@ -249,14 +275,12 @@ fn restore_from_legacy_stash(item: &mut ConfigItem, loc: &HookLoc, real_event: &
         .get("_agentswitch_disabled")
         .and_then(|stash| stash.get(real_event))
         .and_then(serde_json::Value::as_array)
-        .map_or(vec![], |entries| {
-            entries
-                .iter()
-                .filter_map(|e| e.get("_agentswitch_order"))
-                .filter_map(serde_json::Value::as_u64)
-                .chain(std::iter::once(original_order as u64))
-                .collect()
-        });
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("_agentswitch_order"))
+        .filter_map(serde_json::Value::as_u64)
+        .chain(std::iter::once(original_order as u64))
+        .collect();
     if let Some(obj) = entry.as_object_mut() {
         obj.remove("_agentswitch_order");
     }
@@ -330,18 +354,42 @@ fn remove_hook(
         .enumerate()
         .filter_map(|(index, entry)| (identity(entry) == fingerprint).then_some(index))
         .collect();
-    match matches.as_slice() {
-        [index] => Ok(arr.remove(*index)),
+    let removed = match matches.as_slice() {
+        [index] => arr.remove(*index),
         [] => anyhow::bail!("hook no longer exists in {section}.{event}"),
         _ => {
             if let Some(order) = prefer_order {
                 if matches.contains(&order) {
-                    return Ok(arr.remove(order));
+                    arr.remove(order)
+                } else {
+                    anyhow::bail!("hook identity is ambiguous in {section}.{event}")
+                }
+            } else {
+                anyhow::bail!("hook identity is ambiguous in {section}.{event}")
+            }
+        }
+    };
+    if arr.is_empty() {
+        if section.is_empty() {
+            if let Some(root) = doc.as_object_mut() {
+                root.remove(event);
+            }
+        } else {
+            let section_now_empty = doc
+                .get_mut(section)
+                .and_then(|value| value.as_object_mut())
+                .is_some_and(|object| {
+                    object.remove(event);
+                    object.is_empty()
+                });
+            if section_now_empty {
+                if let Some(root) = doc.as_object_mut() {
+                    root.remove(section);
                 }
             }
-            anyhow::bail!("hook identity is ambiguous in {section}.{event}")
         }
     }
+    Ok(removed)
 }
 
 pub(crate) fn stash_entry_fingerprint(entry: &serde_json::Value) -> String {
@@ -631,18 +679,6 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_file(name: &str, content: &str) -> std::path::PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("agentswitch-toggler-{name}-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("settings.json");
-        std::fs::write(&path, content).unwrap();
-        path
-    }
-
     fn hook_item(path: std::path::PathBuf, entry: &serde_json::Value, name: &str) -> ConfigItem {
         let mut item = ConfigItem::new(name, ItemKind::Hook, path, ProviderId::Claude);
         item.hook_loc = Some(HookLoc {
@@ -655,16 +691,37 @@ mod tests {
         item
     }
 
+    fn read_doc(path: impl AsRef<std::path::Path>) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+    fn post_tool_use_item(
+        path: std::path::PathBuf,
+        entry: &serde_json::Value,
+        order: usize,
+    ) -> ConfigItem {
+        let mut item = ConfigItem::new("hook", ItemKind::Hook, path, ProviderId::Claude);
+        item.hook_loc = Some(HookLoc {
+            section: "hooks".into(),
+            event: "PostToolUse".into(),
+            order,
+            hook_name: "hook".into(),
+            fingerprint: hook_fingerprint(entry),
+        });
+        item
+    }
+
     #[test]
     fn hook_toggle_uses_content_identity_after_sibling_moves() {
         let first =
             serde_json::json!({"matcher":"Bash","hooks":[{"type":"command","command":"first"}]});
         let second =
             serde_json::json!({"matcher":"Edit","hooks":[{"type":"command","command":"second"}]});
-        let path = temp_file(
-            "identity",
-            &serde_json::json!({"hooks":{"PreToolUse":[first.clone(), second.clone()]}})
-                .to_string(),
+        let path = crate::test_env::temp_file(
+            "toggler-identity",
+            "settings.json",
+            serde_json::json!({"hooks":{"PreToolUse":[first.clone(), second.clone()]}})
+                .to_string()
+                .as_bytes(),
         );
         let mut first_item = hook_item(path.clone(), &first, "first");
         let mut second_item = hook_item(path.clone(), &second, "second");
@@ -672,11 +729,12 @@ mod tests {
         toggle_item(&mut first_item).unwrap();
         toggle_item(&mut second_item).unwrap();
 
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 0);
-        let stash: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(sidecar_path(&path)).unwrap()).unwrap();
+        let doc = read_doc(&path);
+        assert!(
+            doc.pointer("/hooks/PreToolUse").is_none(),
+            "emptied hook event arrays are dropped, not left behind"
+        );
+        let stash = read_doc(sidecar_path(&path));
         let stashed = stash["PreToolUse"].as_array().unwrap();
         let stripped: Vec<_> = stashed
             .iter()
@@ -694,15 +752,17 @@ mod tests {
     #[test]
     fn malformed_sidecar_fails_the_disable_without_touching_the_config() {
         let entry = serde_json::json!({"hooks":[{"command":"first"}]});
-        let path = temp_file(
-            "malformed",
-            &serde_json::json!({"hooks":{"PreToolUse":[entry.clone()]}}).to_string(),
+        let path = crate::test_env::temp_file(
+            "toggler-malformed",
+            "settings.json",
+            serde_json::json!({"hooks":{"PreToolUse":[entry.clone()]}})
+                .to_string()
+                .as_bytes(),
         );
         std::fs::write(sidecar_path(&path), "broken").unwrap();
         let mut item = hook_item(path.clone(), &entry, "first");
         assert!(toggle_item(&mut item).is_err());
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let doc = read_doc(&path);
         assert_eq!(
             doc["hooks"]["PreToolUse"].as_array().unwrap().len(),
             1,
@@ -713,13 +773,15 @@ mod tests {
     #[test]
     fn legacy_in_file_stash_is_still_reenableable() {
         let entry = serde_json::json!({"hooks":[{"command":"first"}]});
-        let path = temp_file(
-            "legacy-stash",
-            &serde_json::json!({
+        let path = crate::test_env::temp_file(
+            "toggler-legacy-stash",
+            "settings.json",
+            serde_json::json!({
                 "hooks":{"PreToolUse":[]},
                 "_agentswitch_disabled":"broken"
             })
-            .to_string(),
+            .to_string()
+            .as_bytes(),
         );
         let mut item = hook_item(path, &entry, "first");
         item.state = ItemState::Disabled;
@@ -735,8 +797,99 @@ mod tests {
     }
 
     #[test]
+    fn failed_stash_rolls_back_the_sidecar() {
+        let entry = serde_json::json!({"hooks":[{"command":"first"}]});
+        let path = crate::test_env::temp_file(
+            "toggler-stash-order",
+            "settings.json",
+            serde_json::json!({"hooks":{"PreToolUse":[entry.clone()]}})
+                .to_string()
+                .as_bytes(),
+        );
+        std::fs::create_dir(path.with_file_name("settings.json.bak")).unwrap();
+        let mut item = hook_item(path.clone(), &entry, "first");
+
+        assert!(toggle_item(&mut item).is_err());
+        assert!(
+            !sidecar_path(&path).exists(),
+            "a failed config commit must not leave the entry stranded in the sidecar"
+        );
+        let doc = read_doc(&path);
+        assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_unstash_keeps_the_hook_recoverable() {
+        let entry = serde_json::json!({"hooks":[{"command":"first"}]});
+        let path = crate::test_env::temp_file(
+            "toggler-unstash-order",
+            "settings.json",
+            serde_json::json!({"hooks":{"PreToolUse":[]}})
+                .to_string()
+                .as_bytes(),
+        );
+        std::fs::write(
+            sidecar_path(&path),
+            serde_json::json!({"PreToolUse":[entry.clone()]}).to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir(path.with_file_name("settings.json.bak")).unwrap();
+        let mut item = hook_item(path.clone(), &entry, "first");
+        item.state = ItemState::Disabled;
+        item.hook_loc = Some(HookLoc {
+            section: "hooks".into(),
+            event: "_stashed_PreToolUse".into(),
+            order: 0,
+            hook_name: "first".into(),
+            fingerprint: hook_fingerprint(&entry),
+        });
+
+        assert!(toggle_item(&mut item).is_err());
+        let stash = read_doc(sidecar_path(&path));
+        assert_eq!(
+            stash["PreToolUse"][0]["hooks"][0]["command"], "first",
+            "the hook must survive in the sidecar when the restore commit fails"
+        );
+        let doc = read_doc(&path);
+        assert_eq!(
+            doc["hooks"]["PreToolUse"].as_array().unwrap().len(),
+            0,
+            "config must be reverted to its pre-toggle state"
+        );
+    }
+
+    #[test]
+    fn failed_zcode_toggle_leaves_state_unchanged() {
+        let first =
+            serde_json::json!({"matcher":"Bash","hooks":[{"type":"process","command":"check"}]});
+        let path = crate::test_env::temp_file(
+            "toggler-zcode-state",
+            "settings.json",
+            serde_json::json!({"hooks":{"enabled":true,"events":{"PreToolUse":[first.clone()]}}})
+                .to_string()
+                .as_bytes(),
+        );
+        std::fs::create_dir(path.with_file_name("settings.json.bak")).unwrap();
+        let mut item = ConfigItem::new("check", ItemKind::Hook, path, ProviderId::Zcode);
+        item.hook_loc = Some(HookLoc {
+            section: "hooks/events".into(),
+            event: "PreToolUse".into(),
+            order: 0,
+            hook_name: "check".into(),
+            fingerprint: hook_fingerprint(&first),
+        });
+
+        assert!(toggle_item(&mut item).is_err());
+        assert!(
+            item.state.is_enabled(),
+            "state must not change when the commit fails"
+        );
+    }
+
+    #[test]
     fn filesystem_agent_toggle_renames_and_restores_directory() {
-        let path = temp_file("agent-dir", "agent");
+        let path =
+            crate::test_env::temp_file("toggler-agent-dir", "settings.json", "agent".as_bytes());
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("config.json"), "{}").unwrap();
@@ -761,7 +914,11 @@ mod tests {
 
     #[test]
     fn codex_toml_hook_is_reported_as_read_only() {
-        let mut path = temp_file("codex-hook", "[hooks]\n");
+        let mut path = crate::test_env::temp_file(
+            "toggler-codex-hook",
+            "settings.json",
+            "[hooks]\n".as_bytes(),
+        );
         path.set_extension("toml");
         std::fs::write(&path, "[hooks]\n").unwrap();
         let mut item = ConfigItem::new("notify", ItemKind::Hook, path, ProviderId::Codex);
@@ -779,9 +936,10 @@ mod tests {
 
     #[test]
     fn claude_project_mcp_toggle_updates_approval_lists() {
-        let mcp_path = temp_file(
-            "claude-mcp",
-            r#"{"mcpServers":{"docs":{"type":"http","url":"https://example.test"}}}"#,
+        let mcp_path = crate::test_env::temp_file(
+            "toggler-claude-mcp",
+            "settings.json",
+            r#"{"mcpServers":{"docs":{"type":"http","url":"https://example.test"}}}"#.as_bytes(),
         );
         let settings_path = mcp_path.parent().unwrap().join("settings.local.json");
         std::fs::write(&settings_path, "{}").unwrap();
@@ -794,8 +952,7 @@ mod tests {
         });
 
         toggle_item(&mut item).unwrap();
-        let settings: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(settings_path).unwrap()).unwrap();
+        let settings = read_doc(settings_path);
         assert_eq!(
             settings["disabledMcpjsonServers"],
             serde_json::json!(["docs"])
@@ -805,9 +962,10 @@ mod tests {
 
     #[test]
     fn antigravity_mcp_toggle_uses_disabled_flag() {
-        let path = temp_file(
-            "antigravity-mcp",
-            r#"{"mcpServers":{"docs":{"command":"server"}}}"#,
+        let path = crate::test_env::temp_file(
+            "toggler-antigravity-mcp",
+            "settings.json",
+            r#"{"mcpServers":{"docs":{"command":"server"}}}"#.as_bytes(),
         );
         let mut item =
             ConfigItem::new("docs", ItemKind::Mcp, path.clone(), ProviderId::Antigravity);
@@ -820,8 +978,7 @@ mod tests {
         });
 
         toggle_item(&mut item).unwrap();
-        let config: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let config = read_doc(path);
         assert_eq!(config["mcpServers"]["docs"]["disabled"], true);
     }
 
@@ -829,10 +986,12 @@ mod tests {
     fn zcode_hook_toggle_uses_native_enabled_flag() {
         let first =
             serde_json::json!({"matcher":"Bash","hooks":[{"type":"process","command":"check"}]});
-        let path = temp_file(
-            "zcode-hook",
-            &serde_json::json!({"hooks":{"enabled":true,"events":{"PreToolUse":[first.clone()]}}})
-                .to_string(),
+        let path = crate::test_env::temp_file(
+            "toggler-zcode-hook",
+            "settings.json",
+            serde_json::json!({"hooks":{"enabled":true,"events":{"PreToolUse":[first.clone()]}}})
+                .to_string()
+                .as_bytes(),
         );
         let mut item = ConfigItem::new("check", ItemKind::Hook, path.clone(), ProviderId::Zcode);
         item.hook_loc = Some(HookLoc {
@@ -845,16 +1004,14 @@ mod tests {
 
         toggle_item(&mut item).unwrap();
         assert_eq!(item.state, ItemState::Disabled);
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let doc = read_doc(&path);
         let entry = &doc["hooks"]["events"]["PreToolUse"][0];
         assert_eq!(entry["enabled"], serde_json::json!(false));
         assert_eq!(entry["matcher"], "Bash", "entry must stay in place");
 
         toggle_item(&mut item).unwrap();
         assert_eq!(item.state, ItemState::Enabled);
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let doc = read_doc(&path);
         assert!(doc["hooks"]["events"]["PreToolUse"][0]
             .get("enabled")
             .is_none());
@@ -862,9 +1019,10 @@ mod tests {
 
     #[test]
     fn zcode_mcp_stash_moves_servers_out_of_mcp_servers() {
-        let path = temp_file(
-            "zcode-mcp",
-            r#"{"mcp":{"servers":{"docs":{"type":"stdio","command":"ctx"}}}}"#,
+        let path = crate::test_env::temp_file(
+            "toggler-zcode-mcp",
+            "settings.json",
+            r#"{"mcp":{"servers":{"docs":{"type":"stdio","command":"ctx"}}}}"#.as_bytes(),
         );
         let mut item = ConfigItem::new("docs", ItemKind::Mcp, path.clone(), ProviderId::Zcode);
         item.toggle_spec = Some(ToggleSpec::JsonStash {
@@ -873,8 +1031,7 @@ mod tests {
         });
 
         toggle_item(&mut item).unwrap();
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let doc = read_doc(&path);
         assert!(doc["mcp"]["servers"].get("docs").is_none());
         assert_eq!(
             doc["_disabled_mcp_servers"]["docs"]["command"], "ctx",
@@ -882,8 +1039,7 @@ mod tests {
         );
 
         toggle_item(&mut item).unwrap();
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let doc = read_doc(&path);
         assert_eq!(doc["mcp"]["servers"]["docs"]["command"], "ctx");
         assert!(doc.get("_disabled_mcp_servers").is_none());
     }
@@ -893,33 +1049,21 @@ mod tests {
         let a = serde_json::json!({"matcher":"A","hooks":[{"type":"command","command":"a"}]});
         let b = serde_json::json!({"matcher":"B","hooks":[{"type":"command","command":"b"}]});
         let c = serde_json::json!({"matcher":"C","hooks":[{"type":"command","command":"c"}]});
-        let path = temp_file(
-            "order",
-            &serde_json::json!({"hooks":{"PostToolUse":[a.clone(), b.clone(), c.clone()]}})
-                .to_string(),
+        let path = crate::test_env::temp_file(
+            "toggler-order",
+            "settings.json",
+            serde_json::json!({"hooks":{"PostToolUse":[a.clone(), b.clone(), c.clone()]}})
+                .to_string()
+                .as_bytes(),
         );
-        let make = |entry: &serde_json::Value, order: usize| {
-            let mut item =
-                ConfigItem::new("hook", ItemKind::Hook, path.clone(), ProviderId::Claude);
-            item.hook_loc = Some(HookLoc {
-                section: "hooks".into(),
-                event: "PostToolUse".into(),
-                order,
-                hook_name: "hook".into(),
-                fingerprint: hook_fingerprint(entry),
-            });
-            item
-        };
-        let mut middle = make(&b, 1);
+        let mut middle = post_tool_use_item(path.clone(), &b, 1);
         toggle_item(&mut middle).unwrap();
 
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let doc = read_doc(&path);
         assert_eq!(doc["hooks"]["PostToolUse"].as_array().unwrap().len(), 2);
 
         toggle_item(&mut middle).unwrap();
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let doc = read_doc(&path);
         let restored = doc["hooks"]["PostToolUse"].as_array().unwrap();
         assert_eq!(restored.len(), 3);
         assert_eq!(
@@ -934,31 +1078,15 @@ mod tests {
         let b = serde_json::json!({"matcher":"B","hooks":[{"type":"command","command":"b"}]});
         let c = serde_json::json!({"matcher":"C","hooks":[{"type":"command","command":"c"}]});
         let d = serde_json::json!({"matcher":"D","hooks":[{"type":"command","command":"d"}]});
-        let path = temp_file(
-            "order-shift",
-            &serde_json::json!({"hooks":{"PostToolUse":[a.clone(), b.clone(), c.clone(), d.clone()]}})
-                .to_string(),
-        );
-        let make = |entry: &serde_json::Value, order: usize| {
-            let mut item =
-                ConfigItem::new("hook", ItemKind::Hook, path.clone(), ProviderId::Claude);
-            item.hook_loc = Some(HookLoc {
-                section: "hooks".into(),
-                event: "PostToolUse".into(),
-                order,
-                hook_name: "hook".into(),
-                fingerprint: hook_fingerprint(entry),
-            });
-            item
-        };
-        let mut first = make(&a, 0);
+        let path = crate::test_env::temp_file("toggler-order-shift", "settings.json", serde_json::json!({"hooks":{"PostToolUse":[a.clone(), b.clone(), c.clone(), d.clone()]}})
+                .to_string().as_bytes());
+        let mut first = post_tool_use_item(path.clone(), &a, 0);
         toggle_item(&mut first).unwrap();
-        let mut third = make(&c, 2);
+        let mut third = post_tool_use_item(path.clone(), &c, 2);
         toggle_item(&mut third).unwrap();
 
         toggle_item(&mut third).unwrap();
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let doc = read_doc(&path);
         let restored = doc["hooks"]["PostToolUse"].as_array().unwrap();
         let matchers: Vec<_> = restored
             .iter()
@@ -967,14 +1095,49 @@ mod tests {
         assert_eq!(matchers, ["B", "C", "D"]);
 
         toggle_item(&mut first).unwrap();
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let doc = read_doc(&path);
         let restored = doc["hooks"]["PostToolUse"].as_array().unwrap();
         let matchers: Vec<_> = restored
             .iter()
             .map(|entry| entry["matcher"].as_str().unwrap())
             .collect();
         assert_eq!(matchers, ["A", "B", "C", "D"]);
+    }
+
+    #[test]
+    fn zcode_legacy_stash_items_are_reenableable() {
+        let entry =
+            serde_json::json!({"matcher":"Bash","hooks":[{"type":"command","command":"check"}]});
+        let path = crate::test_env::temp_file(
+            "toggler-zcode-stash",
+            "settings.json",
+            serde_json::json!({"hooks":{"enabled":true,"events":{"PreToolUse":[]}}})
+                .to_string()
+                .as_bytes(),
+        );
+        std::fs::write(
+            sidecar_path(&path),
+            serde_json::json!({"PreToolUse":[entry.clone()]}).to_string(),
+        )
+        .unwrap();
+        let mut item = ConfigItem::new("check", ItemKind::Hook, path.clone(), ProviderId::Zcode);
+        item.state = ItemState::Disabled;
+        item.hook_loc = Some(HookLoc {
+            section: "hooks/events".into(),
+            event: "_stashed_PreToolUse".into(),
+            order: 0,
+            hook_name: "check".into(),
+            fingerprint: stash_entry_fingerprint(&entry),
+        });
+
+        toggle_item(&mut item).unwrap();
+        assert_eq!(item.state, ItemState::Enabled);
+        let doc = read_doc(&path);
+        assert_eq!(
+            doc["hooks"]["events"]["PreToolUse"][0]["matcher"], "Bash",
+            "the stashed entry must be restored into its native event array"
+        );
+        assert!(!sidecar_path(&path).exists(), "empty sidecar is removed");
     }
 
     #[test]

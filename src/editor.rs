@@ -12,7 +12,7 @@ pub struct EditorState {
 
 impl EditorState {
     pub fn open(&mut self, path: PathBuf) -> Result<()> {
-        if self.dirty && Some(&path) != self.path.as_ref() {
+        if self.dirty {
             return Err(anyhow::anyhow!(
                 "unsaved changes in {}; save or discard them first",
                 self.filename()
@@ -34,15 +34,16 @@ impl EditorState {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
-        let on_disk =
-            std::fs::read(&path).with_context(|| format!("re-reading {}", path.display()))?;
-        if on_disk != self.original.as_bytes() {
+        let snapshot =
+            crate::config_store::Snapshot::read_or(&path, self.original.as_bytes())?;
+        if snapshot.text()? != self.original {
             anyhow::bail!(
                 "{} changed on disk since it was opened; revert or reopen before saving",
                 path.display()
             );
         }
-        crate::config_store::atomic_write(&path, self.content.as_bytes())
+        snapshot
+            .commit(self.content.as_bytes())
             .with_context(|| format!("saving {}", path.display()))?;
         self.original = self.content.clone();
         self.dirty = false;
@@ -98,6 +99,20 @@ mod tests {
     }
 
     #[test]
+    fn reopening_the_same_path_while_dirty_does_not_discard_edits() {
+        let path = temp_path("same");
+        std::fs::write(&path, "on disk").unwrap();
+        let mut editor = EditorState::default();
+        editor.open(path.clone()).unwrap();
+        editor.content = "typed text".into();
+        editor.update_dirty();
+
+        let error = editor.open(path).unwrap_err().to_string();
+        assert!(error.contains("unsaved changes"));
+        assert_eq!(editor.content, "typed text");
+    }
+
+    #[test]
     fn save_refuses_to_overwrite_external_changes() {
         let path = temp_path("external");
         std::fs::write(&path, "original").unwrap();
@@ -113,5 +128,19 @@ mod tests {
         std::fs::write(&path, "original").unwrap();
         editor.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+    }
+
+    #[test]
+    fn save_writes_a_compatible_backup() {
+        let path = temp_path("backup");
+        std::fs::write(&path, "original").unwrap();
+        let mut editor = EditorState::default();
+        editor.open(path.clone()).unwrap();
+        editor.content = "mine".into();
+        editor.update_dirty();
+
+        editor.save().unwrap();
+        let backup = crate::config_store::backup_path(&path);
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), "original");
     }
 }

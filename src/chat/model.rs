@@ -11,6 +11,8 @@ pub enum ChatProvider {
     Kiro,
     OpenCode,
     Zcode,
+    Grok,
+    Muse,
 }
 
 impl ChatProvider {
@@ -21,6 +23,8 @@ impl ChatProvider {
         Self::Kiro,
         Self::OpenCode,
         Self::Zcode,
+        Self::Grok,
+        Self::Muse,
     ];
 
     pub fn label(self) -> &'static str {
@@ -31,6 +35,8 @@ impl ChatProvider {
             Self::Kiro => "Kiro",
             Self::OpenCode => "OpenCode",
             Self::Zcode => "ZCode",
+            Self::Grok => "Grok Build",
+            Self::Muse => "Muse Code",
         }
     }
 
@@ -42,6 +48,8 @@ impl ChatProvider {
             Self::Kiro => "kiro",
             Self::OpenCode => "opencode",
             Self::Zcode => "zcode",
+            Self::Grok => "grok",
+            Self::Muse => "muse",
         }
     }
 
@@ -53,6 +61,8 @@ impl ChatProvider {
             Self::Kiro => ProviderId::Kiro.color(),
             Self::OpenCode => ProviderId::OpenCode.color(),
             Self::Zcode => ProviderId::Zcode.color(),
+            Self::Grok => ProviderId::Grok.color(),
+            Self::Muse => ProviderId::Muse.color(),
         }
     }
 }
@@ -81,6 +91,7 @@ pub enum ChatSourceKind {
     ImportedArchive,
     KiroCli,
     OpenCodeDb,
+    GrokDir,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

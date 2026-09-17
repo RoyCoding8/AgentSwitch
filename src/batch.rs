@@ -34,7 +34,7 @@ pub fn toggle(items: &mut [ConfigItem], indices: &[usize]) -> BatchOutcome {
         match toggler::toggle_item(&mut items[index]) {
             Ok(()) => toggled += 1,
             Err(error) => {
-                let rollback_errors = rollback(items, &recoveries[..toggled]);
+                let rollback_errors = rollback(items, &recoveries[..=toggled]);
                 return BatchOutcome {
                     toggled,
                     error: Some(format!("{}: {error}", items[index].name)),
@@ -56,6 +56,9 @@ fn capture(items: &[ConfigItem], indices: &[usize]) -> Result<Vec<Recovery>> {
         .map(|&index| {
             let item = items[index].clone();
             let mut paths = vec![item.path.clone()];
+            if item.hook_loc.is_some() {
+                paths.push(toggler::sidecar_path(&item.path));
+            }
             if let Some(ToggleSpec::StringLists { path, .. }) = &item.toggle_spec {
                 paths.push(path.clone());
             }
@@ -114,22 +117,12 @@ fn rollback(items: &mut [ConfigItem], recoveries: &[Recovery]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ItemKind, ProviderId};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("agentswitch-batch-{nonce}"));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
+    use crate::toggler::stash_entry_fingerprint;
+    use crate::types::{HookLoc, ItemKind, ProviderId};
 
     #[test]
     fn failed_batch_restores_prior_rename_exactly() {
-        let dir = temp_dir();
+        let dir = crate::test_env::temp_dir("batch");
         let first_path = dir.join("first.md");
         let second_path = dir.join("second.md");
         fs::write(&first_path, "first").unwrap();
@@ -151,5 +144,79 @@ mod tests {
         assert_eq!(fs::read_to_string(&first_path).unwrap(), "first");
         assert!(!first_path.with_extension("md.disabled").exists());
         assert!(items[0].state.is_enabled());
+    }
+
+    fn hook_item(path: PathBuf, _entry: &serde_json::Value, fingerprint: &str) -> ConfigItem {
+        let mut item = ConfigItem::new("hook", ItemKind::Hook, path, ProviderId::Claude);
+        item.hook_loc = Some(HookLoc {
+            section: "hooks".into(),
+            event: "PreToolUse".into(),
+            order: 0,
+            hook_name: "hook".into(),
+            fingerprint: fingerprint.into(),
+        });
+        item
+    }
+
+    #[test]
+    fn failed_batch_rolls_back_hook_sidecars() {
+        let dir = crate::test_env::temp_dir("batch");
+        let settings = dir.join("settings.json");
+        let entry =
+            serde_json::json!({"matcher":"Bash","hooks":[{"type":"command","command":"first"}]});
+        fs::write(
+            &settings,
+            serde_json::json!({"hooks":{"PreToolUse":[entry.clone()]}}).to_string(),
+        )
+        .unwrap();
+        let other = dir.join("other.json");
+        fs::write(&other, r#"{"hooks":{"PreToolUse":[]}}"#).unwrap();
+        let mut items = vec![
+            hook_item(settings.clone(), &entry, &stash_entry_fingerprint(&entry)),
+            hook_item(other, &serde_json::json!({"matcher":"X"}), "no-such-hook"),
+        ];
+
+        let outcome = toggle(&mut items, &[0, 1]);
+        assert!(outcome.error.is_some());
+        assert!(
+            !toggler::sidecar_path(&settings).exists(),
+            "the stashed hook entry must be rolled back out of the sidecar"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            doc["hooks"]["PreToolUse"].as_array().unwrap().len(),
+            1,
+            "the successful hook toggle must be reverted with the batch"
+        );
+    }
+
+    #[test]
+    fn failed_batch_rolls_back_the_failing_items_own_sidecar() {
+        let dir = crate::test_env::temp_dir("batch");
+        let settings = dir.join("settings.json");
+        let entry =
+            serde_json::json!({"matcher":"Bash","hooks":[{"type":"command","command":"first"}]});
+        fs::write(
+            &settings,
+            serde_json::json!({"hooks":{"PreToolUse":[entry.clone()]}}).to_string(),
+        )
+        .unwrap();
+        fs::create_dir(settings.with_file_name("settings.json.bak")).unwrap();
+        let mut items = vec![hook_item(
+            settings.clone(),
+            &entry,
+            &stash_entry_fingerprint(&entry),
+        )];
+
+        let outcome = toggle(&mut items, &[0]);
+        assert!(outcome.error.is_some());
+        assert!(
+            !toggler::sidecar_path(&settings).exists(),
+            "the sidecar mutated by the failing toggle itself must be restored"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
     }
 }

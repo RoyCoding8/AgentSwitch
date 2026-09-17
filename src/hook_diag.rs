@@ -206,6 +206,12 @@ fn behavior(provider: ProviderId, event: &str) -> String {
         "warning/feedback".into()
     } else if event.contains("SessionStart") {
         "context-injecting".into()
+    } else if event.contains("Permission") {
+        "approval-aware".into()
+    } else if event.contains("LLMCall") {
+        "observability".into()
+    } else if event.contains("Subagent") {
+        "lifecycle".into()
     } else if event.contains("Notification") {
         "notification".into()
     } else if event.contains("PreCompact") {
@@ -252,8 +258,14 @@ fn timeout(value: &Value) -> Option<u64> {
         .and_then(|v| v.as_array())
         .and_then(|a| a.first())
         .unwrap_or(value);
-    num_field(h, &["timeout", "timeout_ms", "timeoutMs"])
-        .or_else(|| num_field(value, &["timeout", "timeout_ms", "timeoutMs"]))
+    timeout_secs(h).or_else(|| timeout_secs(value))
+}
+
+fn timeout_secs(value: &Value) -> Option<u64> {
+    if let Some(secs) = num_field(value, &["timeout"]) {
+        return Some(secs);
+    }
+    num_field(value, &["timeout_ms", "timeoutMs"]).map(|ms| ms.div_ceil(1000))
 }
 
 use crate::types::parse_json_or_string;
@@ -325,6 +337,30 @@ mod tests {
         assert_eq!(r.handler, "lint");
         assert_eq!(r.timeout, Some(30));
         assert!(r.behavior.contains("block"));
+    }
+
+    #[test]
+    fn millisecond_timeouts_are_normalized_to_seconds() {
+        let r = item(
+            "lint",
+            r#"{"matcher":"Edit","hooks":[{"command":"lint","timeout_ms":30000}]}"#,
+            Scope::Project,
+        );
+        assert_eq!(r.timeout, Some(30));
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("over 120")),
+            "a 30s timeout in milliseconds must not trip the seconds threshold"
+        );
+    }
+
+    #[test]
+    fn oversized_timeouts_still_warn() {
+        let r = item(
+            "slow",
+            r#"{"matcher":"Edit","hooks":[{"command":"lint","timeout_ms":300000}]}"#,
+            Scope::Project,
+        );
+        assert!(r.warnings.iter().any(|w| w.contains("over 120")));
     }
 
     #[test]

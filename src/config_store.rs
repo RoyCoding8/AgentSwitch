@@ -108,8 +108,11 @@ pub fn move_path(source: &Path, target: &Path) -> Result<()> {
                     )
                 });
             }
-            fs::rename(&staged, target)
-                .with_context(|| format!("commit staged move to {}", target.display()))?;
+            if let Err(error) = fs::rename(&staged, target) {
+                cleanup(&staged);
+                return Err(error)
+                    .with_context(|| format!("commit staged move to {}", target.display()));
+            }
             let remove_result = if source.is_dir() {
                 fs::remove_dir_all(source)
             } else {
@@ -151,7 +154,25 @@ pub fn backup_path(path: &Path) -> PathBuf {
 
 fn backup_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let backup = backup_path(path);
+    if backup.exists() && !plausible(path, bytes) {
+        return Ok(());
+    }
     atomic_write(&backup, bytes).with_context(|| format!("back up {}", path.display()))
+}
+
+fn plausible(path: &Path, bytes: &[u8]) -> bool {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("json" | "jsonc") => {
+            let body = bytes
+                .strip_prefix([0xEF, 0xBB, 0xBF].as_slice())
+                .unwrap_or(bytes);
+            serde_json::from_slice::<serde_json::Value>(body).is_ok()
+        }
+        Some("toml") => std::str::from_utf8(bytes)
+            .ok()
+            .is_some_and(|text| text.parse::<toml::Table>().is_ok()),
+        _ => true,
+    }
 }
 
 fn staged_path(target: &Path) -> PathBuf {
@@ -183,7 +204,7 @@ fn copy_dir(source: &Path, target: &Path) -> Result<()> {
 
 fn verify_copy(source: &Path, target: &Path) -> Result<()> {
     if source.is_dir() {
-        let files = |root: &Path| -> Result<std::collections::HashMap<String, u64>> {
+        let listing = |root: &Path| -> Result<std::collections::HashMap<String, u64>> {
             let mut map = std::collections::HashMap::new();
             for entry in walkdir::WalkDir::new(root).follow_links(false).min_depth(1) {
                 let entry = entry.with_context(|| format!("walk {}", root.display()))?;
@@ -199,13 +220,47 @@ fn verify_copy(source: &Path, target: &Path) -> Result<()> {
             }
             Ok(map)
         };
-        if files(source)? != files(target)? {
+        let right = listing(target)?;
+        if listing(source)? != right {
             anyhow::bail!("staged directory copy is incomplete");
         }
-    } else if fs::metadata(source)?.len() != fs::metadata(target)?.len() {
-        anyhow::bail!("staged file copy has the wrong size");
+        for relative in right.keys() {
+            if !same_content(&source.join(relative), &target.join(relative))? {
+                anyhow::bail!("staged directory copy has the wrong content");
+            }
+        }
+    } else if !same_content(source, target)? {
+        anyhow::bail!("staged file copy has the wrong content");
     }
     Ok(())
+}
+
+fn same_content(a: &Path, b: &Path) -> Result<bool> {
+    let mut left = std::io::BufReader::new(fs::File::open(a)?);
+    let mut right = std::io::BufReader::new(fs::File::open(b)?);
+    loop {
+        let mut chunk_a = [0u8; 16 * 1024];
+        let mut chunk_b = [0u8; 16 * 1024];
+        let na = fill(&mut left, &mut chunk_a)?;
+        let nb = fill(&mut right, &mut chunk_b)?;
+        if na != nb || chunk_a[..na] != chunk_b[..nb] {
+            return Ok(false);
+        }
+        if na == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn fill(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
 }
 
 fn cleanup(path: &Path) {
@@ -219,23 +274,10 @@ fn cleanup(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_file(name: &str, content: &[u8]) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("agentswitch-store-{name}-{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.json");
-        fs::write(&path, content).unwrap();
-        path
-    }
 
     #[test]
     fn commit_replaces_file_and_preserves_backup() {
-        let path = temp_file("commit", b"old");
+        let path = crate::test_env::temp_file("store-commit", "config.json", b"old");
         let snapshot = Snapshot::read(&path).unwrap();
         snapshot.commit(b"new").unwrap();
 
@@ -245,7 +287,7 @@ mod tests {
 
     #[test]
     fn commit_rejects_external_edits() {
-        let path = temp_file("stale", b"old");
+        let path = crate::test_env::temp_file("store-stale", "config.json", b"old");
         let snapshot = Snapshot::read(&path).unwrap();
         fs::write(&path, b"external").unwrap();
 
@@ -255,8 +297,39 @@ mod tests {
     }
 
     #[test]
+    fn commit_keeps_the_last_valid_backup_over_corrupted_content() {
+        let path = crate::test_env::temp_file("store-bak-guard", "config.json", b"{\"v\":1}");
+        let snapshot = Snapshot::read(&path).unwrap();
+        snapshot.commit(b"{\"v\":2}").unwrap();
+
+        fs::write(&path, b"corrupted{").unwrap();
+        let snapshot = Snapshot::read(&path).unwrap();
+        snapshot.commit(b"{\"v\":3}").unwrap();
+
+        let backup = fs::read(path.with_extension("json.bak")).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&backup).unwrap(),
+            "{\"v\":1}",
+            "an externally corrupted snapshot must not overwrite the good backup"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"{\"v\":3}");
+    }
+
+    #[test]
+    fn commit_still_rotates_backups_between_valid_saves() {
+        let path = crate::test_env::temp_file("store-bak-rotate", "config.json", b"{\"v\":1}");
+        let snapshot = Snapshot::read(&path).unwrap();
+        snapshot.commit(b"{\"v\":2}").unwrap();
+        let snapshot = Snapshot::read(&path).unwrap();
+        snapshot.commit(b"{\"v\":3}").unwrap();
+        let backup = fs::read(path.with_extension("json.bak")).unwrap();
+        assert_eq!(std::str::from_utf8(&backup).unwrap(), "{\"v\":2}");
+    }
+
+    #[test]
     fn commit_can_create_a_missing_file_atomically() {
-        let path = temp_file("missing-parent", b"placeholder");
+        let path =
+            crate::test_env::temp_file("store-missing-parent", "config.json", b"placeholder");
         fs::remove_file(&path).unwrap();
         let snapshot = Snapshot::read_or(&path, b"{}").unwrap();
         snapshot.commit(b"{\"enabled\":true}").unwrap();
@@ -265,8 +338,8 @@ mod tests {
 
     #[test]
     fn move_rejects_existing_destination() {
-        let source = temp_file("move-source", b"source");
-        let target = temp_file("move-target", b"target");
+        let source = crate::test_env::temp_file("store-move-source", "config.json", b"source");
+        let target = crate::test_env::temp_file("store-move-target", "config.json", b"target");
         let error = move_path(&source, &target).unwrap_err().to_string();
         assert!(error.contains("destination already exists"));
         assert_eq!(fs::read(source).unwrap(), b"source");
