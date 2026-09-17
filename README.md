@@ -1,24 +1,65 @@
-# AgentSwitch
+<p align="center">
+  <img src="assets/agentswitch.svg" alt="AgentSwitch. Your agents. Your settings. One place." width="760">
+</p>
 
-Native desktop GUI for managing AI coding-agent configuration across providers. Toggle skills, hooks, rules, and MCP servers — browse, diff, and manage chat histories — without hand-editing provider files.
+<h1 align="center">AgentSwitch</h1>
+
+<p align="center">
+  A native desktop manager for your AI coding agents.<br>
+  Toggle configuration, compare workspaces, and browse chat histories without hand-editing provider files.
+</p>
+
+<p align="center">
+  <a href="https://github.com/RoyCoding8/AgentSwitch/actions/workflows/ci.yml"><img src="https://github.com/RoyCoding8/AgentSwitch/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://github.com/RoyCoding8/AgentSwitch/releases"><img src="https://img.shields.io/github/v/release/RoyCoding8/AgentSwitch?color=75e2c0&amp;labelColor=172a31" alt="Latest release"></a>
+  <a href="#build-from-source"><img src="https://img.shields.io/badge/Rust-1.88%2B-e5af75?labelColor=172a31" alt="Rust 1.88 or newer"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-aec0ca?labelColor=172a31" alt="Apache 2.0 license"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/RoyCoding8/AgentSwitch/releases"><img src="https://img.shields.io/badge/Download-AgentSwitch-75e2c0?style=for-the-badge&amp;labelColor=172a31" alt="Download AgentSwitch"></a>
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> &nbsp;·&nbsp;
+  <a href="#install">Install</a> &nbsp;·&nbsp;
+  <a href="#supported-providers">Providers</a> &nbsp;·&nbsp;
+  <a href="#usage">Usage</a> &nbsp;·&nbsp;
+  <a href="#build-from-source">Build from source</a>
+</p>
 
 ## Features
 
-- **Item Toggle** — per-item enable/disable with collision-aware moves and provider-specific JSON/TOML mutation.
-- **Bulk Toggle** — Enable All / Disable All for filtered item categories with exact file/path rollback on failure.
-- **Scope Switching** — project-level vs global configuration, with workspace browser.
-- **Diff Workbench** — compare project and global configs with stable, secret-safe fingerprints. Detects duplicates, missing targets, and scope conflicts.
-- **Hook Cockpit** — static hook inventory showing event, matcher, handler, blocking risk, timeout, duplicates, and project/global overlaps.
-- **Chat Manager** supports Claude Code, Codex CLI, Kiro, OpenCode, ZCode, Grok Build, and Muse Code. Browse all providers or filter by provider. Search, export single JSON or multi-chat ZIP archives, import archives, convert supported conversations, and move sessions to Trash.
+| Configure | Inspect | Manage chats |
+|---|---|---|
+| Toggle skills, hooks, rules, and MCP servers individually or in bulk. | Compare project and global configuration with secret-safe fingerprints. | Search conversations across supported providers. |
+| Switch between project and global scopes with the workspace browser. | Find duplicates, missing targets, and scope conflicts in **Diff**. | Export JSON or ZIP archives and import supported conversations. |
+| Edit instructions and rules with stale-edit detection and atomic saves. | Examine hook events, matchers, timeouts, and overlaps in **Hooks**. | Convert supported conversations and restore sessions from Trash. |
 
-Database-backed OpenCode/ZCode chats are archived before their rows are deleted. Avoid trashing a session the provider is actively updating. Restore rebuilds supported archived content and reuses the original session ID unless it is already occupied.
-- **Inline Editor** — edit instruction files, rules, and steering docs without leaving the app. Saves are atomic, refuse to clobber external edits, and warn before discarding unsaved changes.
-- **Atomic Config Writes** — structured mutations use same-directory atomic replacement, stale-edit detection, and compatible `.bak` files. TOML mutations preserve comments and formatting; JSON mutations preserve key order.
-- **Cross-platform** — Windows, Linux, and macOS builds.
+Native Windows, Linux, and macOS builds. Provider-specific toggles preserve TOML comments and formatting, and JSON key order. Bulk actions roll back file and path changes on failure.
 
-> Antigravity (`agy`) is the supported Google CLI; AgentSwitch does not include a separate Gemini CLI provider. Antigravity may still use the documented `GEMINI.md` filename.
+> [!IMPORTANT]
+> Chat compatibility varies by provider. Native resume is not guaranteed, and exported archives can contain sensitive source events. See the [compatibility notes](#compatibility-notes).
 
-## Supported Providers
+## Install
+
+Download the matching binary from [Releases](https://github.com/RoyCoding8/AgentSwitch/releases). No Rust toolchain is needed to use a prebuilt binary.
+
+| Platform | Release asset |
+|---|---|
+| Windows x86-64 | `agent-switch-windows-x86_64.exe` |
+| Linux x86-64 | `agent-switch-linux-x86_64` |
+| macOS Intel | `agent-switch-macos-x86_64` |
+| macOS Apple Silicon | `agent-switch-macos-aarch64` |
+
+## Supported providers
+
+Claude Code · Codex CLI · Antigravity · Kiro · OpenCode · ZCode · Junie CLI · Muse Code · Grok Build
+
+> Antigravity (`agy`) is the supported Google CLI. AgentSwitch does not include a separate Gemini CLI provider. Antigravity may still use the documented `GEMINI.md` filename.
+
+<details>
+<summary><strong>Provider paths and supported capabilities</strong></summary>
 
 | Provider | Instruction File | Skills | Hooks | MCP | Native Chats |
 |---|---|---|---|---|---|
@@ -31,6 +72,12 @@ Database-backed OpenCode/ZCode chats are archived before their rows are deleted.
 | Junie CLI (`junie`) | `.junie/AGENTS.md`, root `AGENTS.md`, `.junie/playbook.md`, legacy `.junie/guidelines.md` / `.junie/guidelines/`, `.junie/rules/*.md` | `.junie/skills/`, `.junie/commands/`, `.agents/skills/` | `hooks` in `~/.junie/config.json` only — the CLI ignores project-local hooks by default | `.junie/mcp/mcp.json` (project and user) | Not supported by AgentSwitch |
 | Muse Code (`muse`) | root `AGENTS.md`, `.agents/AGENTS.md` | `.agents/skills/` (project), `~/.config/muse/skills/` + `~/.agents/skills/` (user) | `.muse/hooks.json` (project) and `hooks` in `~/.config/muse/settings.json` (user) | `mcp_servers` in `~/.config/muse/settings.json` | JSONL event journal (`~/.local/share/muse/sessions/`) — browsable and exportable, not a conversion target; paths and event shapes follow AgentSwitch's implementation |
 | Grok Build (`grok`) | root `AGENTS.md`, `~/.grok/AGENTS.md`, `.grok/rules/*.md` | `.grok/skills/` | `.grok/hooks/*.json` (project + user, Claude-compatible shape) | `config.toml` `mcp_servers` (project + user) | Session directories (`~/.grok/sessions/`) — browsable and exportable, not a conversion target |
+
+</details>
+
+## Compatibility notes
+
+Database-backed OpenCode and ZCode chats are archived before their rows are deleted. Avoid trashing a session the provider is actively updating. Restore rebuilds supported archived content and reuses the original session ID unless it is already occupied.
 
 <details>
 <summary>How hook toggling works per provider</summary>
@@ -74,18 +121,7 @@ Antigravity chat browsing and conversion are not implemented. Grok Build and Mus
 
 </details>
 
-## Install
-
-Download the matching binary from [Releases](https://github.com/RoyCoding8/AgentSwitch/releases):
-
-| Platform | Asset |
-|---|---|
-| Windows x86-64 | `agent-switch-windows-x86_64.exe` |
-| Linux x86-64 | `agent-switch-linux-x86_64` |
-| macOS Intel | `agent-switch-macos-x86_64` |
-| macOS Apple Silicon | `agent-switch-macos-aarch64` |
-
-## Build from Source
+## Build from source
 
 `Cargo.toml` declares Rust 1.88. The locked dependencies built and all 151 enabled tests passed with Rust 1.88.0 on Windows GNU. CI uses stable Rust. Other targets have not been tested with Rust 1.88 in this audit. SQLite is bundled via `rusqlite`, so no system SQLite installation is needed.
 
@@ -100,7 +136,7 @@ Output binary:
 - **Windows:** `target/release/agent-switch.exe`
 - **Linux / macOS:** `target/release/agent-switch`
 
-### Linux Dependencies
+### Linux dependencies
 
 ```bash
 sudo apt-get update

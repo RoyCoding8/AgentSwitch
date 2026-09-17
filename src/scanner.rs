@@ -2218,8 +2218,8 @@ mod tests {
     #[test]
     fn muse_user_settings_mcp_servers_toggle_and_report_state() {
         let root = crate::test_env::temp_dir("scanner-muse-mcp");
-        let home = root.join("home");
-        let muse = home.join(".config").join("muse");
+        let config = root.join("xdg-config");
+        let muse = config.join("muse");
         std::fs::create_dir_all(&muse).unwrap();
         std::fs::write(
             muse.join("settings.json"),
@@ -2227,7 +2227,7 @@ mod tests {
         )
         .unwrap();
 
-        crate::test_env::with_env_vars(&[("AGENT_SWITCH_HOME", &home)], || {
+        crate::test_env::with_env_vars(&[("XDG_CONFIG_HOME", &config)], || {
             let items = scan_provider(ProviderId::Muse, &root, Scope::Global);
             let tools = items
                 .iter()

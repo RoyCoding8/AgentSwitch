@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="208" viewBox="0 0 760 208" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">AgentSwitch</title>
+  <desc id="desc">A mint switch connects two terminal prompts on a dark rounded tile, beside the AgentSwitch wordmark.</desc>
+  <rect x="1" y="1" width="758" height="206" rx="28" fill="#101820" stroke="#293944" stroke-width="2"/>
+  <path d="M624 1V207M680 1V207M736 1V207M568 1V207M512 1V207M512 48H758M512 104H758M512 160H758" stroke="#1B2933"/>
+  <rect x="33" y="33" width="142" height="142" rx="34" fill="#172A31" stroke="#34535A" stroke-width="2"/>
+  <path d="m56 64 12 10-12 10m21 0h14m30 40 12 10-12 10m21 0h10" stroke="#92B4BE" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="67" y="87" width="75" height="35" rx="17.5" fill="#75E2C0"/>
+  <circle cx="123" cy="104.5" r="12" fill="#101820"/>
+  <path d="M83 100v9m6-9v9" stroke="#244D47" stroke-width="2" stroke-linecap="round"/>
+  <text x="209" y="103" fill="#F0F5F7" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="51" font-weight="700" letter-spacing="-2">Agent<tspan fill="#75E2C0">Switch</tspan></text>
+  <text x="212" y="137" fill="#AEC0CA" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17" letter-spacing=".4">Your agents. Your settings. One place.</text>
+  <circle cx="703" cy="48" r="5" fill="#75E2C0"/>
+  <circle cx="723" cy="48" r="5" fill="#E5AF75"/>
+</svg>
