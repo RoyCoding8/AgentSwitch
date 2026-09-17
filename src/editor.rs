@@ -34,8 +34,7 @@ impl EditorState {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
-        let snapshot =
-            crate::config_store::Snapshot::read_or(&path, self.original.as_bytes())?;
+        let snapshot = crate::config_store::Snapshot::read_or(&path, self.original.as_bytes())?;
         if snapshot.text()? != self.original {
             anyhow::bail!(
                 "{} changed on disk since it was opened; revert or reopen before saving",
@@ -67,6 +66,12 @@ impl EditorState {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("")
+    }
+    pub fn path_display(&self) -> String {
+        self.path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default()
     }
 }
 

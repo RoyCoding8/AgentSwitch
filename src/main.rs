@@ -50,8 +50,26 @@ pub(crate) mod test_env {
         path
     }
 
+    #[test]
+    fn environment_is_restored_after_callback_panics() {
+        const KEY: &str = "AGENTSWITCH_TEST_PANIC_RESTORATION";
+        let previous = std::env::var_os(KEY);
+        let result = std::panic::catch_unwind(|| {
+            with_env_vars(&[(KEY, Path::new("temporary-value"))], || {
+                assert_eq!(std::env::var_os(KEY).unwrap(), "temporary-value");
+                panic!("callback failed");
+            });
+        });
+        assert!(result.is_err());
+        assert_eq!(std::env::var_os(KEY), previous);
+        with_env_vars(&[(KEY, Path::new("second-value"))], || {
+            assert_eq!(std::env::var_os(KEY).unwrap(), "second-value");
+        });
+        assert_eq!(std::env::var_os(KEY), previous);
+    }
+
     pub(crate) fn with_env_vars<T>(vars: &[(&str, &Path)], run: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let guard = ENV_LOCK.lock().unwrap();
         let previous: Vec<(String, Option<std::ffi::OsString>)> = vars
             .iter()
             .map(|(name, _)| ((*name).to_string(), std::env::var_os(name)))
@@ -59,13 +77,17 @@ pub(crate) mod test_env {
         for (name, value) in vars {
             std::env::set_var(name, value);
         }
-        let result = run();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
         for ((name, _), (_, previous)) in vars.iter().zip(previous.iter()).rev() {
             match previous {
                 Some(previous) => std::env::set_var(name, previous),
                 None => std::env::remove_var(name),
             }
         }
-        result
+        drop(guard);
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 }

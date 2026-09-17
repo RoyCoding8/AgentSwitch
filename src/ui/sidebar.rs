@@ -85,14 +85,18 @@ pub fn show(
             let dot_color = id.color();
             let dot_center = egui::pos2(r.left() + 16.0, r.center().y);
             ui.painter().circle_filled(dot_center, 5.0, dot_color);
+            let label = id.label();
             let text_pos = egui::pos2(r.left() + 30.0, r.center().y - 7.0);
             ui.painter().text(
                 text_pos,
                 egui::Align2::LEFT_TOP,
-                id.label(),
+                label,
                 theme::body_font(),
                 theme::TEXT_PRIMARY,
             );
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, is_sel, label)
+            });
             if resp.clicked() {
                 *selected = Some(id);
             }

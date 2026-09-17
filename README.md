@@ -9,12 +9,14 @@ Native desktop GUI for managing AI coding-agent configuration across providers. 
 - **Scope Switching** — project-level vs global configuration, with workspace browser.
 - **Diff Workbench** — compare project and global configs with stable, secret-safe fingerprints. Detects duplicates, missing targets, and scope conflicts.
 - **Hook Cockpit** — static hook inventory showing event, matcher, handler, blocking risk, timeout, duplicates, and project/global overlaps.
-- **Chat Manager** — unified chat history browser across Claude Code, Codex CLI, Kiro, OpenCode, ZCode, Grok Build, and Muse Code. Per-provider filtering when a provider is selected, or browse all providers together. Search, export (single JSON or multi-chat ZIP), soft-delete with Trash — including database-backed OpenCode/ZCode chats, which are archived and then removed from the live SQLite store (this works while the CLI is running) and restored later with their original session identity — plus import of archived sessions, and converting any chat into another harness's native store or exported archive file (Antigravity excluded — its chats are encrypted; Grok Build and Muse Code sessions are readable sources but never conversion targets, since their event-journal formats are not documented for writing).
+- **Chat Manager** supports Claude Code, Codex CLI, Kiro, OpenCode, ZCode, Grok Build, and Muse Code. Browse all providers or filter by provider. Search, export single JSON or multi-chat ZIP archives, import archives, convert supported conversations, and move sessions to Trash.
+
+Database-backed OpenCode/ZCode chats are archived before their rows are deleted. Avoid trashing a session the provider is actively updating. Restore rebuilds supported archived content and reuses the original session ID unless it is already occupied.
 - **Inline Editor** — edit instruction files, rules, and steering docs without leaving the app. Saves are atomic, refuse to clobber external edits, and warn before discarding unsaved changes.
 - **Atomic Config Writes** — structured mutations use same-directory atomic replacement, stale-edit detection, and compatible `.bak` files. TOML mutations preserve comments and formatting; JSON mutations preserve key order.
 - **Cross-platform** — Windows, Linux, and macOS builds.
 
-> Antigravity (`agy`) is the supported Google CLI. The discontinued Gemini CLI is not treated as a separate provider. Antigravity may still use the documented `GEMINI.md` filename.
+> Antigravity (`agy`) is the supported Google CLI; AgentSwitch does not include a separate Gemini CLI provider. Antigravity may still use the documented `GEMINI.md` filename.
 
 ## Supported Providers
 
@@ -22,32 +24,53 @@ Native desktop GUI for managing AI coding-agent configuration across providers. 
 |---|---|---|---|---|---|
 | Claude Code | `CLAUDE.md` | `.claude/skills/` | `.claude/settings*.json` (stash to sidecar) | Project `.mcp.json`; approval lists in settings | Best-effort JSONL (internal format) |
 | Codex CLI | `AGENTS.md` | `.codex/skills/`, `.agents/skills/` | `hooks.json` (stash to sidecar); `config.toml` inline hooks read-only | `config.toml` `mcp_servers` | Best-effort JSONL (internal format) |
-| Antigravity CLI (`agy`) | `GEMINI.md`, `AGENTS.md` | `.agents/skills/`, global `skills/` | `.agents/hooks.json` (native per-definition `enabled` flag) | `.agents/mcp_config.json` | Not supported (encrypted/internal) |
+| Antigravity CLI (`agy`) | `GEMINI.md`, `AGENTS.md` | `.agents/skills/`, global `skills/` | `.agents/hooks.json` (native per-definition `enabled` flag) | `.agents/mcp_config.json` | Not supported by AgentSwitch |
 | Kiro | Steering documents | Steering, Specs, Agents | `.kiro/hooks/*.json` (native per-hook `enabled` flag); legacy agent-config hooks stashed | `settings/mcp.json` | JSON + JSONL ACP sessions |
-| OpenCode | `AGENTS.md` | `.opencode/skills/` plus `.agents/`/`.claude/` compatibility | Plugins | `opencode.json` | SQLite with schema detection |
+| OpenCode | `AGENTS.md` | `.opencode/skills/` plus `.agents/`/`.claude/` compatibility | Plugins | `opencode.json` | Best-effort SQLite for recognized schemas; native resume compatibility is not guaranteed |
 | ZCode | `AGENTS.md` (workspace) / `~/.zcode/AGENTS.md` (user) | `.zcode/skills/`, `.agents/skills/` | `hooks.events` in `.zcode/config.json` / `~/.zcode/cli/config.json` (native per-entry `enabled` flag) | `mcp.servers` in the same configs (fallback `.agents/mcp.json`) | SQLite (`~/.zcode/cli/db/db.sqlite`) |
-| Junie CLI (`junie`) | `.junie/AGENTS.md`, root `AGENTS.md`, `.junie/playbook.md`, legacy `.junie/guidelines.md` / `.junie/guidelines/`, `.junie/rules/*.md` | `.junie/skills/`, `.junie/commands/`, `.agents/skills/` | `hooks` in `~/.junie/config.json` only — the CLI ignores project-local hooks by default | `.junie/mcp/mcp.json` (project and user) | Not supported (session storage format is undocumented) |
-| Muse Code (`muse`) | root `AGENTS.md`, `.agents/AGENTS.md` | `.agents/skills/` (project), `~/.config/muse/skills/` + `~/.agents/skills/` (user) | `.muse/hooks.json` (project) and `hooks` in `~/.config/muse/settings.json` (user) | `mcp_servers` in `~/.config/muse/settings.json` | JSONL event journal (`~/.local/share/muse/sessions/`) — browsable and exportable, not a conversion target |
+| Junie CLI (`junie`) | `.junie/AGENTS.md`, root `AGENTS.md`, `.junie/playbook.md`, legacy `.junie/guidelines.md` / `.junie/guidelines/`, `.junie/rules/*.md` | `.junie/skills/`, `.junie/commands/`, `.agents/skills/` | `hooks` in `~/.junie/config.json` only — the CLI ignores project-local hooks by default | `.junie/mcp/mcp.json` (project and user) | Not supported by AgentSwitch |
+| Muse Code (`muse`) | root `AGENTS.md`, `.agents/AGENTS.md` | `.agents/skills/` (project), `~/.config/muse/skills/` + `~/.agents/skills/` (user) | `.muse/hooks.json` (project) and `hooks` in `~/.config/muse/settings.json` (user) | `mcp_servers` in `~/.config/muse/settings.json` | JSONL event journal (`~/.local/share/muse/sessions/`) — browsable and exportable, not a conversion target; paths and event shapes follow AgentSwitch's implementation |
 | Grok Build (`grok`) | root `AGENTS.md`, `~/.grok/AGENTS.md`, `.grok/rules/*.md` | `.grok/skills/` | `.grok/hooks/*.json` (project + user, Claude-compatible shape) | `config.toml` `mcp_servers` (project + user) | Session directories (`~/.grok/sessions/`) — browsable and exportable, not a conversion target |
 
 <details>
 <summary>How hook toggling works per provider</summary>
 
-Hook toggling follows each provider's documented configuration. Claude Code has no per-hook disable setting, and its settings schema rejects unknown keys, so disabled hook entries are moved to a `<config>.agentswitch` sidecar next to the settings file — the settings file itself stays schema-clean — and restored to their original position on re-enable (stashes written by older versions inside `_agentswitch_disabled` keys are still listed and re-enabled). Codex `hooks.json` uses the same sidecar stash; Codex has no per-hook disable flag (only the global `features.hooks` toggle). Antigravity `hooks.json` maps hook names to definitions with a native per-definition `enabled: false` flag, which AgentSwitch toggles directly. Kiro CLI 3.0 hooks live in `.kiro/hooks/*.json` with a native per-hook `enabled` flag; embedded hooks in legacy `agents/*.json` configs use the sidecar stash. Junie hooks live under the `hooks` key of `~/.junie/config.json` and use the sidecar stash; project-local `.junie/config.json` hooks are never scanned because Junie itself ignores them for security. Muse Code hooks (`.muse/hooks.json` and the `hooks` block in user settings) and Grok Build hooks (`.grok/hooks/*.json`) both use the Claude-compatible matcher/hooks schema and toggle through the sidecar stash.
+AgentSwitch stores disabled Claude Code hook entries in a `<config>.agentswitch` sidecar and restores their original positions on re-enable. It also reads older `_agentswitch_disabled` stashes. Codex `hooks.json` uses the same sidecar approach. Antigravity hook definitions and Kiro CLI 3.0 `.kiro/hooks/*.json` files use native `enabled` flags. Legacy Kiro agent-config hooks use sidecars.
+
+AgentSwitch scans Junie hooks only in `~/.junie/config.json`. Junie ignores project-local hooks by default, although explicit CLI configuration can change that behavior. Muse Code and Grok Build hook integrations use matcher/hooks entries and sidecar stashes. Muse vendor compatibility has not been independently verified.
 
 </details>
 
 <details>
 <summary>ZCode scope and storage notes</summary>
 
-ZCode support follows z.ai's official configuration guide: user scope lives under `~/.zcode` (override with `ZCODE_HOME`), workspace scope under `<repo>/.zcode`. Hook entries are toggled through ZCode's own documented per-entry `enabled: false` flag; MCP servers are disabled by stashing them out of `mcp.servers`, since that is the key ZCode reads. Chat browsing reads the OpenCode-compatible session/message/part database ZCode ships at `~/.zcode/cli/db/db.sqlite` (override with `ZCODE_DB`).
+AgentSwitch reads user configuration from `~/.zcode/cli/config.json` and workspace configuration from `<repo>/.zcode/config.json`. Inspection of the shipped ZCode 3.11.2 code confirms `mcp.servers` in these configurations. AgentSwitch toggles hook entries through `enabled` and disables MCP servers by moving their entries into a sidecar.
+
+[ZCode's hook documentation](https://zcode.z.ai/en/docs/hooks) states that project-level hooks are ignored for security reasons. AgentSwitch can display and edit those entries, but changing their flags does not make ZCode execute them. Use user-level hooks or plugins for execution.
+
+Chat browsing targets ZCode's internal SQLite database at `~/.zcode/cli/db/db.sqlite`. The shipped 3.11.2 schema contains the `session`, `message`, and `part` columns used by AgentSwitch's OpenCode-compatible reader. This establishes structural compatibility, not native import or resume compatibility. ZCode updates may change these internals.
+
+In AgentSwitch, `ZCODE_HOME` overrides the user configuration root and `ZCODE_DB` overrides the chat database path. `ZCODE_HOME` does not relocate AgentSwitch's chat database lookup. These are AgentSwitch overrides, not verified general-purpose ZCode environment-variable contracts.
 
 </details>
 
 <details>
 <summary>Chat conversion details</summary>
 
-**Chat conversion** moves sessions between harnesses in two ways. *Direct:* pick a chat and use **Convert…** to write it straight into another installed harness's native store. *File-based migration:* export from harness A to an archive file, run **Convert archive…** on that file (single JSON or multi-chat ZIP), then use **Import** on the converted file and choose the project folder — the chat lands as a first-class session of harness B. This works even after harness A is uninstalled, since conversion operates purely on the exported file. Conversions always re-synthesize target-native events from AgentSwitch's normalized archive; source-harness event lines are never copied across formats, because each harness only parses its own schema. Converted chats are made discoverable by each harness's own mechanism — e.g. Codex sessions get a full native `session_meta` rollout **and a row in Codex's state database** (`state_N.sqlite` `threads`), since `/resume` lists from SQLite rather than scanning disk. Antigravity is never a conversion source or target because its chats are encrypted inside the CLI. Grok Build and Muse Code sessions are readable sources (their on-disk event formats are parsed directly), but they are never conversion targets: neither vendor documents a stable write format for their session stores, and hand-crafting one would risk corrupting live sessions.
+**Chat conversion** has two workflows:
+
+- Pick a chat and use **Convert…** to write it into a supported destination store.
+- Export a chat to JSON or ZIP, use **Convert archive…**, then **Import** the converted file and choose its project folder. The source provider does not need to remain installed.
+
+Conversion synthesizes destination events from AgentSwitch's normalized messages. It does not copy raw events between provider formats or recreate native tool invocations. Tests verify rediscovery and text round-trips through AgentSwitch's readers. Native CLI discovery, rendering, and resume compatibility are not guaranteed.
+
+Codex conversion writes a rollout and a session-index entry. If a `state_N.sqlite` database exists, AgentSwitch also attempts to register the session in its `threads` table. Registration requires a compatible schema.
+
+Tool metadata varies by provider. Summaries can contain field-type summaries, argument strings, or tool results. Timestamps may be absent. Some exported archives retain raw source events, including arguments and outputs. **Archives are not redacted exports.**
+
+Conversion transfers text extracted into `messages` using destination-specific role mappings. Results retained only in tool summaries or raw events do not transfer into native history. Native tool-result replay is not guaranteed.
+
+Antigravity chat browsing and conversion are not implemented. Grok Build and Muse Code are source-only integrations. AgentSwitch reads supported conversation records but has no native session writer for either provider. Grok extraction reads `chat_history.jsonl`, not the `updates.jsonl` resume log.
 
 </details>
 
@@ -64,7 +87,7 @@ Download the matching binary from [Releases](https://github.com/RoyCoding8/Agent
 
 ## Build from Source
 
-Requires the [Rust toolchain](https://rustup.rs/) (1.75+). SQLite is bundled via `rusqlite` — no system dependency needed.
+`Cargo.toml` declares Rust 1.88. The locked dependencies built and all 151 enabled tests passed with Rust 1.88.0 on Windows GNU. CI uses stable Rust. Other targets have not been tested with Rust 1.88 in this audit. SQLite is bundled via `rusqlite`, so no system SQLite installation is needed.
 
 ```bash
 git clone https://github.com/RoyCoding8/AgentSwitch.git

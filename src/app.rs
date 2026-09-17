@@ -185,6 +185,14 @@ impl eframe::App for App {
             self.first_frame = false;
         }
 
+        if self.editor.is_open()
+            && self.editor.dirty
+            && ctx.input(|input| input.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.editor.error = Some("__confirm_close__".into());
+        }
+
         if self.browse_requested {
             self.browse_requested = false;
             if let Some(path) = rfd::FileDialog::new().pick_folder() {
@@ -241,7 +249,10 @@ impl eframe::App for App {
             )
             .show(ctx, |ui_panel| {
                 if self.editor.is_open() {
-                    ui::editor_panel::show(ui_panel, &mut self.editor);
+                    let save_result = ui::editor_panel::show(ui_panel, &mut self.editor);
+                    if save_result.saved {
+                        self.rescan_items();
+                    }
                 } else if self.view == View::Chats {
                     self.show_chats(ui_panel);
                 } else if let Some(provider_id) = self.selected_provider {
@@ -312,6 +323,7 @@ impl eframe::App for App {
                                             ));
                                             return;
                                         }
+                                        self.rescan_items();
                                     }
                                     self.editor.open(md).unwrap_or_else(|error| {
                                         self.status_msg = Some(format!("Error: {error}"));
@@ -774,5 +786,70 @@ fn view_tab(ui: &mut egui::Ui, view: &mut View, value: View, label: &str) {
         .clicked()
     {
         *view = value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::App as _;
+
+    #[test]
+    fn window_close_is_cancelled_only_for_unsaved_edits() {
+        let mut app = App {
+            workspace: PathBuf::new(),
+            scope: Scope::Project,
+            providers: vec![],
+            selected_provider: None,
+            items: vec![],
+            diff_rows: vec![],
+            diff_filter: diagnostics::DiffFilter::All,
+            hook_rows: vec![],
+            hook_filter: hook_diag::HookFilter::All,
+            chat_sessions: vec![],
+            chat_trash: vec![],
+            chat_selection: HashSet::new(),
+            chat_search: String::new(),
+            chat_trash_mode: false,
+            chat_delete_confirm: None,
+            filter: FilterKind::All,
+            view: View::Items,
+            editor: EditorState {
+                path: Some(PathBuf::from("instructions.md")),
+                content: "unsaved edits".into(),
+                original: "original".into(),
+                dirty: true,
+                error: None,
+            },
+            status_msg: None,
+            browse_requested: false,
+            first_frame: true,
+        };
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let close_input = || {
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+            input
+        };
+        let output = ctx.run(close_input(), |ctx| app.update(ctx, &mut frame));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::CancelClose));
+        assert_eq!(app.editor.content, "unsaved edits");
+        assert_eq!(app.editor.error.as_deref(), Some("__confirm_close__"));
+        assert!(app.editor.dirty);
+
+        app.editor.revert();
+        let output = ctx.run(close_input(), |ctx| app.update(ctx, &mut frame));
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::CancelClose));
+        assert_eq!(app.editor.content, "original");
     }
 }

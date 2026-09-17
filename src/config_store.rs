@@ -160,13 +160,35 @@ fn backup_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write(&backup, bytes).with_context(|| format!("back up {}", path.display()))
 }
 
+pub(crate) fn jsonc_options() -> jsonc_parser::ParseOptions {
+    jsonc_parser::ParseOptions {
+        allow_comments: true,
+        allow_trailing_commas: true,
+        allow_loose_object_property_names: false,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+    }
+}
+
+pub(crate) fn parse_json(path: &Path, text: &str) -> Result<serde_json::Value> {
+    if path.extension().is_some_and(|ext| ext == "jsonc") {
+        Ok(jsonc_parser::parse_to_serde_value(text, &jsonc_options())?)
+    } else {
+        Ok(serde_json::from_str(text)?)
+    }
+}
+
 fn plausible(path: &Path, bytes: &[u8]) -> bool {
     match path.extension().and_then(|value| value.to_str()) {
         Some("json" | "jsonc") => {
             let body = bytes
                 .strip_prefix([0xEF, 0xBB, 0xBF].as_slice())
                 .unwrap_or(bytes);
-            serde_json::from_slice::<serde_json::Value>(body).is_ok()
+            std::str::from_utf8(body)
+                .ok()
+                .is_some_and(|text| parse_json(path, text).is_ok())
         }
         Some("toml") => std::str::from_utf8(bytes)
             .ok()
@@ -274,6 +296,51 @@ fn cleanup(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jsonc_backups_rotate_valid_comments_but_keep_last_good_on_corruption() {
+        let original = b"{\"v\": 1}";
+        let commented = b"{/* saved comment */\"v\": 2,}";
+        let path = crate::test_env::temp_file("store-jsonc-backup", "config.jsonc", original);
+        Snapshot::read(&path).unwrap().commit(commented).unwrap();
+        Snapshot::read(&path)
+            .unwrap()
+            .commit(b"{\"v\": 3}")
+            .unwrap();
+        assert_eq!(fs::read(backup_path(&path)).unwrap(), commented);
+        fs::write(&path, b"{/* unterminated").unwrap();
+        Snapshot::read(&path)
+            .unwrap()
+            .commit(b"{\"v\": 4}")
+            .unwrap();
+        assert_eq!(fs::read(backup_path(&path)).unwrap(), commented);
+        assert_eq!(fs::read(&path).unwrap(), b"{\"v\": 4}");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn jsonc_accepts_only_comments_and_trailing_commas_beyond_json() {
+        let path = Path::new("opencode.jsonc");
+        assert_eq!(
+            parse_json(path, "{/* note */\"v\": [1,],}").unwrap(),
+            serde_json::json!({"v": [1]})
+        );
+        for text in [
+            "{v: 1}",
+            "{'v': 1}",
+            "{\"v\": [1 2]}",
+            "{\"v\": 0xff}",
+            "{\"v\": +1}",
+            "{\"v\": 1} /* unfinished",
+            "{\"v\": [,]}",
+        ] {
+            assert!(
+                parse_json(path, text).is_err(),
+                "accepted malformed JSONC: {text}"
+            );
+        }
+        assert!(parse_json(Path::new("config.json"), "{/* note */\"v\": 1,}").is_err());
+    }
 
     #[test]
     fn commit_replaces_file_and_preserves_backup() {

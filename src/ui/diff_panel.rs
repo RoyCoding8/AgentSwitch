@@ -173,6 +173,6 @@ fn status_color(status: DiffStatus) -> egui::Color32 {
     match status {
         DiffStatus::Same => theme::GREEN,
         DiffStatus::ProjectOnly | DiffStatus::GlobalOnly => theme::TEXT_ACCENT,
-        DiffStatus::Differs => theme::YELLOW,
+        DiffStatus::Differs | DiffStatus::Unknown => theme::YELLOW,
     }
 }

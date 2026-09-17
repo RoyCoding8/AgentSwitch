@@ -82,9 +82,26 @@ fn toggle_zcode_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     let snapshot = Snapshot::read(&item.path)?;
     let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
     let arr = array_at_mut(&mut doc, &loc.section, &loc.event)?;
-    let entry = arr
-        .iter_mut()
-        .find(|entry| zcode_entry_fingerprint(entry) == loc.fingerprint)
+    let fingerprint_matches =
+        |entry: &serde_json::Value| zcode_entry_fingerprint(entry) == loc.fingerprint;
+    let selected = arr
+        .get(loc.order)
+        .is_some_and(&fingerprint_matches)
+        .then_some(loc.order)
+        .or_else(|| {
+            let matches: Vec<usize> = arr
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| fingerprint_matches(entry))
+                .map(|(index, _)| index)
+                .collect();
+            match matches.as_slice() {
+                [index] => Some(*index),
+                _ => None,
+            }
+        });
+    let entry = selected
+        .and_then(|index| arr.get_mut(index))
         .ok_or_else(|| anyhow::anyhow!("hook no longer exists in {}.{}", loc.section, loc.event))?;
     let obj = entry
         .as_object_mut()
@@ -176,18 +193,36 @@ fn toggle_hook_stash(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
 fn stash_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     let snapshot = Snapshot::read(&item.path)?;
     let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
-    let mut entry = remove_hook(
+    let (current_order, mut entry) = remove_hook(
         &mut doc,
         &loc.section,
         &loc.event,
         &loc.fingerprint,
         Some(loc.order),
     )?;
-    if let Some(obj) = entry.as_object_mut() {
-        obj.insert("_agentswitch_order".into(), serde_json::json!(loc.order));
-    }
     let sidecar = Snapshot::read_or(&sidecar_path(&item.path), b"{}")?;
     let mut stash: serde_json::Value = serde_json::from_str(sidecar.text()?)?;
+    let mut disabled_orders: Vec<_> = stash
+        .get(&loc.event)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("_agentswitch_order"))
+        .filter_map(serde_json::Value::as_u64)
+        .collect();
+    disabled_orders.sort_unstable();
+    let mut original_order = current_order as u64;
+    for order in disabled_orders {
+        if order <= original_order {
+            original_order += 1;
+        }
+    }
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert(
+            "_agentswitch_order".into(),
+            serde_json::json!(original_order),
+        );
+    }
     ensure_array(&mut stash, "", &loc.event)?.push(entry);
     sidecar.commit(serde_json::to_string_pretty(&stash)?.as_bytes())?;
     if let Err(error) = snapshot.commit(serde_json::to_string_pretty(&doc)?.as_bytes()) {
@@ -216,7 +251,13 @@ fn unstash_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
     let stash_path = sidecar_path(&item.path);
     let sidecar = Snapshot::read_or(&stash_path, b"{}")?;
     let mut stash: serde_json::Value = serde_json::from_str(sidecar.text()?)?;
-    if let Ok(mut entry) = remove_hook(&mut stash, "", real_event, &loc.fingerprint, None) {
+    if let Ok((_, mut entry)) = remove_hook(
+        &mut stash,
+        "",
+        real_event,
+        &loc.fingerprint,
+        Some(loc.order),
+    ) {
         let original_order = entry
             .get("_agentswitch_order")
             .and_then(serde_json::Value::as_u64)
@@ -260,7 +301,7 @@ fn unstash_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
 fn restore_from_legacy_stash(item: &mut ConfigItem, loc: &HookLoc, real_event: &str) -> Result<()> {
     let snapshot = Snapshot::read(&item.path)?;
     let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
-    let mut entry = remove_hook(
+    let (_, mut entry) = remove_hook(
         &mut doc,
         "_agentswitch_disabled",
         real_event,
@@ -340,7 +381,7 @@ fn remove_hook(
     event: &str,
     fingerprint: &str,
     prefer_order: Option<usize>,
-) -> Result<serde_json::Value> {
+) -> Result<(usize, serde_json::Value)> {
     let identity = |entry: &serde_json::Value| {
         let mut stripped = entry.clone();
         if let Some(obj) = stripped.as_object_mut() {
@@ -354,13 +395,13 @@ fn remove_hook(
         .enumerate()
         .filter_map(|(index, entry)| (identity(entry) == fingerprint).then_some(index))
         .collect();
-    let removed = match matches.as_slice() {
-        [index] => arr.remove(*index),
+    let index = match matches.as_slice() {
+        [index] => *index,
         [] => anyhow::bail!("hook no longer exists in {section}.{event}"),
         _ => {
             if let Some(order) = prefer_order {
                 if matches.contains(&order) {
-                    arr.remove(order)
+                    order
                 } else {
                     anyhow::bail!("hook identity is ambiguous in {section}.{event}")
                 }
@@ -369,6 +410,7 @@ fn remove_hook(
             }
         }
     };
+    let removed = arr.remove(index);
     if arr.is_empty() {
         if section.is_empty() {
             if let Some(root) = doc.as_object_mut() {
@@ -389,7 +431,7 @@ fn remove_hook(
             }
         }
     }
-    Ok(removed)
+    Ok((index, removed))
 }
 
 pub(crate) fn stash_entry_fingerprint(entry: &serde_json::Value) -> String {
@@ -530,7 +572,7 @@ fn toggle_json_flag(
     disabled_value: bool,
 ) -> Result<()> {
     let snapshot = Snapshot::read(&item.path)?;
-    let mut doc: serde_json::Value = serde_json::from_str(snapshot.text()?)?;
+    let mut doc = crate::config_store::parse_json(&item.path, snapshot.text()?)?;
     let segments: Vec<&str> = section.split('/').filter(|s| !s.is_empty()).collect();
     let section_obj = ensure_object_path(&mut doc, &segments)?;
     let entry = section_obj
@@ -546,7 +588,59 @@ fn toggle_json_flag(
             disabled_value
         }),
     );
-    commit_json(item, &snapshot, &doc, enable)
+    if item.path.extension().is_some_and(|ext| ext == "jsonc") {
+        use jsonc_parser::cst::{CstInputValue, CstObject, CstRootNode};
+
+        let root = CstRootNode::parse(snapshot.text()?, &crate::config_store::jsonc_options())?;
+        let unique_property = |object: &CstObject, key: &str| -> Result<_> {
+            let matches: Vec<_> = object
+                .properties()
+                .into_iter()
+                .filter(|property| {
+                    property
+                        .name()
+                        .and_then(|name| name.decoded_value().ok())
+                        .as_deref()
+                        == Some(key)
+                })
+                .collect();
+            if matches.len() > 1 {
+                anyhow::bail!("duplicate JSONC property {key}; resolve it before toggling");
+            }
+            Ok(matches.into_iter().next())
+        };
+        let mut object = root
+            .object_value()
+            .ok_or_else(|| anyhow::anyhow!("configuration root is not an object"))?;
+        for key in segments.iter().copied().chain(std::iter::once(name)) {
+            object = unique_property(&object, key)?
+                .and_then(|property| property.object_value())
+                .ok_or_else(|| anyhow::anyhow!("{key} is not an object"))?;
+        }
+        let value = CstInputValue::Bool(if enable {
+            enabled_value
+        } else {
+            disabled_value
+        });
+        if let Some(property) = unique_property(&object, flag)? {
+            property.set_value(value);
+        } else {
+            object.append(flag, value);
+        }
+        let text = root.to_string();
+        if crate::config_store::parse_json(&item.path, &text)? != doc {
+            anyhow::bail!("JSONC edit changed unexpected configuration values");
+        }
+        snapshot.commit(text.as_bytes())?;
+        item.state = if enable {
+            ItemState::Enabled
+        } else {
+            ItemState::Disabled
+        };
+        Ok(())
+    } else {
+        commit_json(item, &snapshot, &doc, enable)
+    }
 }
 
 fn toggle_toml_flag(
@@ -576,7 +670,7 @@ fn toggle_toml_flag(
     }
     let nested = doc
         .get_mut(section)
-        .and_then(|value| value.as_table_mut())
+        .and_then(inline_to_regular)
         .and_then(|table| table.get_mut(name))
         .and_then(inline_to_regular);
     let table = match nested {
@@ -632,11 +726,16 @@ fn toggle_json_stash(item: &mut ConfigItem, section: &str, name: &str) -> Result
         (section, disabled_section.as_str())
     };
     let source_segments: Vec<&str> = source_obj.split('/').filter(|s| !s.is_empty()).collect();
+    let target_segments: Vec<&str> = target_key.split('/').filter(|s| !s.is_empty()).collect();
+    if ensure_object_path(&mut doc, &target_segments)?.contains_key(name) {
+        anyhow::bail!(
+            "{target_key}.{name} already has a conflicting definition; refusing to overwrite it"
+        );
+    }
     let value = ensure_object_path(&mut doc, &source_segments)
         .ok()
         .and_then(|object| object.remove(name))
         .ok_or_else(|| anyhow::anyhow!("{source_obj}.{name} not found"))?;
-    let target_segments: Vec<&str> = target_key.split('/').filter(|s| !s.is_empty()).collect();
     ensure_object_path(&mut doc, &target_segments)?.insert(name.into(), value);
     if enable {
         if let Some(obj) = doc.as_object_mut() {
@@ -1018,6 +1117,106 @@ mod tests {
     }
 
     #[test]
+    fn json_stash_enable_rejects_a_live_server_with_the_same_name() {
+        let path = crate::test_env::temp_file(
+            "toggler-zcode-mcp-collision",
+            "settings.json",
+            r#"{"mcp":{"servers":{"docs":{"type":"stdio","command":"live"}}},"_disabled_mcp_servers":{"docs":{"type":"stdio","command":"stashed"}}}"#
+                .as_bytes(),
+        );
+        let mut item = ConfigItem::new("docs", ItemKind::Mcp, path.clone(), ProviderId::Zcode);
+        item.state = ItemState::Disabled;
+        item.toggle_spec = Some(ToggleSpec::JsonStash {
+            section: "mcp/servers".into(),
+            name: "docs".into(),
+        });
+
+        let error = toggle_item(&mut item).unwrap_err().to_string();
+        assert!(
+            error.contains("already has a conflicting definition"),
+            "actual: {error}"
+        );
+        let doc = read_doc(&path);
+        assert_eq!(
+            doc["mcp"]["servers"]["docs"]["command"], "live",
+            "live definition must stay untouched"
+        );
+        assert_eq!(
+            doc["_disabled_mcp_servers"]["docs"]["command"], "stashed",
+            "stashed definition must stay untouched"
+        );
+        assert_eq!(item.state, ItemState::Disabled);
+    }
+
+    #[test]
+    fn json_stash_disable_rejects_a_stash_entry_with_the_same_name() {
+        let path = crate::test_env::temp_file(
+            "toggler-zcode-mcp-disable-collision",
+            "settings.json",
+            r#"{"mcp":{"servers":{"docs":{"type":"stdio","command":"live"}}},"_disabled_mcp_servers":{"docs":{"type":"stdio","command":"stashed"}}}"#
+                .as_bytes(),
+        );
+        let mut item = ConfigItem::new("docs", ItemKind::Mcp, path.clone(), ProviderId::Zcode);
+        item.toggle_spec = Some(ToggleSpec::JsonStash {
+            section: "mcp/servers".into(),
+            name: "docs".into(),
+        });
+
+        let error = toggle_item(&mut item).unwrap_err().to_string();
+        assert!(
+            error.contains("already has a conflicting definition"),
+            "actual: {error}"
+        );
+        let doc = read_doc(&path);
+        assert_eq!(
+            doc["mcp"]["servers"]["docs"]["command"], "live",
+            "live definition must stay untouched"
+        );
+        assert_eq!(
+            doc["_disabled_mcp_servers"]["docs"]["command"], "stashed",
+            "stash must stay untouched"
+        );
+        assert_eq!(item.state, ItemState::Enabled);
+    }
+
+    #[test]
+    fn zcode_duplicate_hook_toggle_targets_the_selected_entry() {
+        let entry =
+            serde_json::json!({"matcher":"Bash","hooks":[{"type":"process","command":"check"}]});
+        let path = crate::test_env::temp_file(
+            "toggler-zcode-duplicate-hook",
+            "settings.json",
+            serde_json::json!({"hooks":{"enabled":true,"events":{"PreToolUse":[
+                entry.clone(), entry.clone()
+            ]}}})
+            .to_string()
+            .as_bytes(),
+        );
+        let mut item = ConfigItem::new("check", ItemKind::Hook, path.clone(), ProviderId::Zcode);
+        item.hook_loc = Some(HookLoc {
+            section: "hooks/events".into(),
+            event: "PreToolUse".into(),
+            order: 1,
+            hook_name: "check".into(),
+            fingerprint: hook_fingerprint(&entry),
+        });
+
+        toggle_item(&mut item).unwrap();
+        assert_eq!(item.state, ItemState::Disabled);
+        let doc = read_doc(&path);
+        assert!(
+            doc["hooks"]["events"]["PreToolUse"][0]
+                .get("enabled")
+                .is_none(),
+            "the unselected twin must stay enabled"
+        );
+        assert_eq!(
+            doc["hooks"]["events"]["PreToolUse"][1]["enabled"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
     fn zcode_mcp_stash_moves_servers_out_of_mcp_servers() {
         let path = crate::test_env::temp_file(
             "toggler-zcode-mcp",
@@ -1173,6 +1372,35 @@ mod tests {
             "flag written into converted table: {text}"
         );
         assert!(text.contains("command"), "existing keys survive: {text}");
+    }
+
+    #[test]
+    fn toml_root_inline_table_toggles_into_a_regular_table() {
+        let path = crate::test_env::temp_file(
+            "toggler-toml-inline-root",
+            "config.toml",
+            "mcp_servers = { docs = { command = \"docs\" } }\n".as_bytes(),
+        );
+        let mut item = ConfigItem::new("docs", ItemKind::Mcp, path.clone(), ProviderId::Codex);
+        item.toggle_spec = Some(ToggleSpec::TomlFlag {
+            section: "mcp_servers".into(),
+            name: "docs".into(),
+            flag: "enabled".into(),
+            enabled_value: true,
+            disabled_value: false,
+        });
+
+        toggle_item(&mut item).unwrap();
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["mcp_servers"]["docs"]["enabled"].as_bool(), Some(false));
+        assert_eq!(doc["mcp_servers"]["docs"]["command"].as_str(), Some("docs"));
+        assert_eq!(item.state, ItemState::Disabled);
+
+        toggle_item(&mut item).unwrap();
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["mcp_servers"]["docs"]["enabled"].as_bool(), Some(true));
+        assert_eq!(doc["mcp_servers"]["docs"]["command"].as_str(), Some("docs"));
+        assert_eq!(item.state, ItemState::Enabled);
     }
 
     #[test]

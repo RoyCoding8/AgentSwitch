@@ -43,7 +43,9 @@ pub fn global_dir(id: ProviderId) -> Result<PathBuf> {
         }
         ProviderId::Zcode => env_path("ZCODE_HOME").unwrap_or_else(|| home.join(".zcode")),
         ProviderId::Junie => home.join(".junie"),
-        ProviderId::Muse => xdg_config_dir().unwrap_or_else(|| home.join(".config")).join("muse"),
+        ProviderId::Muse => xdg_config_dir()
+            .unwrap_or_else(|| home.join(".config"))
+            .join("muse"),
         ProviderId::Grok => env_path("GROK_HOME").unwrap_or_else(|| home.join(".grok")),
     })
 }
@@ -83,7 +85,10 @@ pub fn instruction_files(id: ProviderId, root: &Path, scope: Scope) -> Result<Ve
         ],
         (ProviderId::Junie, Scope::Global) => vec![],
         (ProviderId::Muse, Scope::Project) => {
-            vec![root.join("AGENTS.md"), root.join(".agents").join("AGENTS.md")]
+            vec![
+                root.join("AGENTS.md"),
+                root.join(".agents").join("AGENTS.md"),
+            ]
         }
         (ProviderId::Muse, Scope::Global) => vec![dir.join("AGENTS.md")],
         (ProviderId::Grok, Scope::Project) => vec![root.join("AGENTS.md")],

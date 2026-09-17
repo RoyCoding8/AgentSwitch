@@ -2,14 +2,20 @@ use crate::editor::EditorState;
 use crate::ui::theme;
 use egui::{RichText, ScrollArea, TextEdit, Ui};
 
-pub fn show(ui: &mut Ui, editor: &mut EditorState) {
+#[derive(Default)]
+pub struct EditorUiResult {
+    pub saved: bool,
+}
+
+pub fn show(ui: &mut Ui, editor: &mut EditorState) -> EditorUiResult {
+    let mut result = EditorUiResult::default();
     if !editor.is_open() {
-        return;
+        return result;
     }
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!("Editing: {}", editor.filename()))
+                RichText::new(format!("Editing: {}", editor.path_display()))
                     .font(theme::heading_font())
                     .color(theme::TEXT_ACCENT),
             );
@@ -49,6 +55,8 @@ pub fn show(ui: &mut Ui, editor: &mut EditorState) {
                     {
                         if let Err(error) = editor.save() {
                             editor.error = Some(error.to_string());
+                        } else {
+                            result.saved = true;
                         }
                     }
                 }
@@ -92,4 +100,5 @@ pub fn show(ui: &mut Ui, editor: &mut EditorState) {
             }
         });
     });
+    result
 }

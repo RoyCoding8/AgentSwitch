@@ -195,7 +195,8 @@ fn read_string_lists(
 }
 
 fn read_json(path: &Path) -> Option<serde_json::Value> {
-    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    let text = std::fs::read_to_string(path).ok()?;
+    crate::config_store::parse_json(path, &text).ok()
 }
 
 fn read_toml(path: &Path) -> Option<toml::Value> {
@@ -212,27 +213,107 @@ fn scan_json_keys(path: &Path, key: &str, kind: ItemKind, provider: ProviderId) 
         (&format!("_disabled_{}", key), ItemState::Disabled),
     ] {
         if let Some(obj) = doc.get(check_key).and_then(|v| v.as_object()) {
-            for (name, value) in obj {
+            let opencode_mcp = provider == ProviderId::OpenCode && key == "mcp";
+            let nested = obj
+                .get("servers")
+                .and_then(|value| value.as_object())
+                .filter(|servers| {
+                    opencode_mcp
+                        && !["type", "enabled"]
+                            .iter()
+                            .any(|key| servers.get(*key).is_some_and(|value| !value.is_object()))
+                });
+            let global_timeout = opencode_mcp
+                && obj
+                    .get("timeout")
+                    .and_then(|value| value.as_object())
+                    .is_some_and(|timeout| {
+                        !["type", "enabled"]
+                            .iter()
+                            .any(|key| timeout.get(*key).is_some_and(|value| !value.is_object()))
+                            && (timeout.is_empty()
+                                || ["startup", "catalog", "execution"]
+                                    .iter()
+                                    .any(|key| timeout.contains_key(*key)))
+                            && ["startup", "catalog", "execution"].iter().all(|key| {
+                                timeout.get(*key).is_none_or(|value| {
+                                    value.as_f64().is_some_and(|n| n > 0.0 && n.fract() == 0.0)
+                                })
+                            })
+                    });
+            let mut entries: Vec<_> = obj
+                .iter()
+                .filter(|(name, _)| nested.is_none() || name.as_str() != "servers")
+                .filter(|(name, _)| !global_timeout || name.as_str() != "timeout")
+                .map(|(name, value)| (key, name, value))
+                .collect();
+            if let Some(servers) = nested {
+                entries.extend(
+                    servers
+                        .iter()
+                        .filter(|(name, _)| {
+                            name.as_str() == "servers"
+                                || (global_timeout && name.as_str() == "timeout")
+                                || !obj.contains_key(*name)
+                        })
+                        .map(|(name, value)| ("mcp/servers", name, value)),
+                );
+            }
+            for (section, name, value) in entries {
+                if opencode_mcp
+                    && !(value.get("type").is_some_and(|v| v.is_string())
+                        || value.get("enabled").is_some_and(|v| v.is_boolean())
+                        || value.get("disabled").is_some_and(|v| v.is_boolean()))
+                {
+                    continue;
+                }
                 let mut item = ConfigItem::new(name.clone(), kind, path.to_owned(), provider);
                 item.state = if base_state == ItemState::Disabled
-                    || value.get("disabled").and_then(|v| v.as_bool()) == Some(true)
-                    || value.get("enabled").and_then(|v| v.as_bool()) == Some(false)
-                {
+                    || if opencode_mcp {
+                        value
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .map(|enabled| !enabled)
+                            .unwrap_or_else(|| {
+                                value.get("disabled").and_then(|v| v.as_bool()) == Some(true)
+                            })
+                    } else if provider == ProviderId::OpenCode && key == "agent" {
+                        value.get("disable").and_then(|v| v.as_bool()) == Some(true)
+                    } else {
+                        value.get("disabled").and_then(|v| v.as_bool()) == Some(true)
+                            || value.get("enabled").and_then(|v| v.as_bool()) == Some(false)
+                    } {
                     ItemState::Disabled
                 } else {
                     ItemState::Enabled
                 };
                 item.editable = false;
                 item.toggle_spec = Some(match (provider, key) {
-                    (ProviderId::OpenCode, "mcp" | "agent") | (ProviderId::Muse, "mcp_servers") => {
+                    (ProviderId::OpenCode, "agent") => ToggleSpec::JsonFlag {
+                        section: key.to_string(),
+                        name: name.clone(),
+                        flag: "disable".into(),
+                        enabled_value: false,
+                        disabled_value: true,
+                    },
+                    (ProviderId::OpenCode, "mcp") => {
+                        let uses_disabled = value.get("enabled").is_none()
+                            && (section == "mcp/servers" || value.get("disabled").is_some());
                         ToggleSpec::JsonFlag {
-                            section: key.to_string(),
+                            section: section.to_string(),
                             name: name.clone(),
-                            flag: "enabled".into(),
-                            enabled_value: true,
-                            disabled_value: false,
+                            flag: if uses_disabled { "disabled" } else { "enabled" }.into(),
+                            enabled_value: !uses_disabled,
+                            disabled_value: uses_disabled,
                         }
                     }
+                    (ProviderId::Muse, "mcp_servers") => ToggleSpec::JsonFlag {
+                        section: key.to_string(),
+                        name: name.clone(),
+                        flag: "enabled".into(),
+                        enabled_value: true,
+                        disabled_value: false,
+                    },
                     (ProviderId::Antigravity | ProviderId::Kiro, "mcpServers") => {
                         ToggleSpec::JsonFlag {
                             section: key.to_string(),
@@ -736,8 +817,17 @@ fn scan_antigravity(root: &Path, scope: Scope) -> Vec<ConfigItem> {
             ProviderId::Antigravity,
         ));
     }
+    let mcp_path =
+        if scope == Scope::Global && crate::provider::env_path("ANTIGRAVITY_HOME").is_none() {
+            let Ok(home) = crate::provider::home_dir() else {
+                return items;
+            };
+            home.join(".gemini").join("config").join("mcp_config.json")
+        } else {
+            d.join("mcp_config.json")
+        };
     items.extend(scan_json_keys(
-        &d.join("mcp_config.json"),
+        &mcp_path,
         "mcpServers",
         ItemKind::Mcp,
         ProviderId::Antigravity,
@@ -831,7 +921,10 @@ fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
     } else {
         let flat = root.join("opencode.json");
         let nested = d.join("opencode.json");
-        if !flat.exists() && !flat.with_extension("jsonc").exists() && nested.exists() {
+        if !flat.exists()
+            && !flat.with_extension("jsonc").exists()
+            && (nested.exists() || nested.with_extension("jsonc").exists())
+        {
             nested
         } else {
             flat
@@ -851,36 +944,34 @@ fn scan_opencode(root: &Path, scope: Scope) -> Vec<ConfigItem> {
         ItemKind::Mcp,
         ProviderId::OpenCode,
     ));
-    if let Ok(text) = std::fs::read_to_string(&actual_cfg) {
-        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(plugins) = doc.get("plugin").and_then(|v| v.as_array()) {
-                for (i, p) in plugins.iter().enumerate() {
-                    let name = match p {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Array(a) => a
-                            .first()
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("plugin")
-                            .to_string(),
-                        _ => continue,
-                    };
-                    let mut item = ConfigItem::new(
-                        name,
-                        ItemKind::Plugin,
-                        actual_cfg.clone(),
-                        ProviderId::OpenCode,
-                    );
-                    item.hook_loc = Some(HookLoc {
-                        section: String::new(),
-                        event: "plugin".into(),
-                        order: i,
-                        hook_name: String::new(),
-                        fingerprint: format!("plugin:{i}"),
-                    });
-                    item.editable = false;
-                    item.detail = Some(json_detail(p));
-                    items.push(item);
-                }
+    if let Some(doc) = read_json(&actual_cfg) {
+        if let Some(plugins) = doc.get("plugin").and_then(|v| v.as_array()) {
+            for (i, p) in plugins.iter().enumerate() {
+                let name = match p {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Array(a) => a
+                        .first()
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("plugin")
+                        .to_string(),
+                    _ => continue,
+                };
+                let mut item = ConfigItem::new(
+                    name,
+                    ItemKind::Plugin,
+                    actual_cfg.clone(),
+                    ProviderId::OpenCode,
+                );
+                item.hook_loc = Some(HookLoc {
+                    section: String::new(),
+                    event: "plugin".into(),
+                    order: i,
+                    hook_name: String::new(),
+                    fingerprint: format!("plugin:{i}"),
+                });
+                item.editable = false;
+                item.detail = Some(json_detail(p));
+                items.push(item);
             }
         }
     }
@@ -1156,6 +1247,252 @@ mod tests {
     }
 
     #[test]
+    fn opencode_agent_toggle_uses_disable_and_rescans() {
+        for extension in ["json", "jsonc"] {
+            let root = crate::test_env::temp_dir("scanner-opencode-agent");
+            let path = root.join(format!("opencode.{extension}"));
+            std::fs::write(
+                &path,
+                r#"{"agent":{"review":{"disable":true,"prompt":"Review changes"}},"mcp":{"docs":{"enabled":true,"type":"remote","url":"https://example.test"}}}"#,
+            )
+            .unwrap();
+            let mut agent = scan_provider(ProviderId::OpenCode, &root, Scope::Project)
+                .into_iter()
+                .find(|item| item.name == "review")
+                .unwrap();
+            assert_eq!(agent.state, ItemState::Disabled);
+            crate::toggler::toggle_item(&mut agent).unwrap();
+            let enabled = read_json(&path).unwrap();
+            assert_eq!(
+                enabled["agent"]["review"],
+                serde_json::json!({"disable": false, "prompt": "Review changes"})
+            );
+            assert_eq!(enabled["mcp"]["docs"]["enabled"], true);
+            let mut agent = scan_provider(ProviderId::OpenCode, &root, Scope::Project)
+                .into_iter()
+                .find(|item| item.name == "review")
+                .unwrap();
+            assert_eq!(agent.state, ItemState::Enabled);
+            crate::toggler::toggle_item(&mut agent).unwrap();
+            assert_eq!(
+                read_json(&path).unwrap()["agent"]["review"],
+                serde_json::json!({"disable": true, "prompt": "Review changes"})
+            );
+            let agent = scan_provider(ProviderId::OpenCode, &root, Scope::Project)
+                .into_iter()
+                .find(|item| item.name == "review")
+                .unwrap();
+            assert_eq!(agent.state, ItemState::Disabled);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn opencode_nested_jsonc_scans_mcp() {
+        let root = crate::test_env::temp_dir("scanner-opencode-jsonc");
+        std::fs::create_dir_all(root.join(".opencode")).unwrap();
+        let path = root.join(".opencode/opencode.jsonc");
+        std::fs::write(
+            &path,
+            r#"{
+            // Local server
+            "mcp": {"audit-jsonc": {
+                "type": "local", "command": ["audit-never-execute"],
+                /* Keep enabled */ "enabled": true,
+            },},
+        }"#,
+        )
+        .unwrap();
+        let items = scan_provider(ProviderId::OpenCode, &root, Scope::Project);
+        let item = items
+            .iter()
+            .find(|item| item.kind == ItemKind::Mcp && item.name == "audit-jsonc")
+            .expect("nested JSONC MCP server must be discovered");
+        assert_eq!(item.path, path);
+        assert_eq!(item.state, ItemState::Enabled);
+        let detail: serde_json::Value =
+            serde_json::from_str(item.detail.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            detail["command"],
+            serde_json::json!(["audit-never-execute"])
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opencode_mcp_envelope_toggle_roundtrip() {
+        let root = crate::test_env::temp_dir("scanner-opencode-envelope");
+        let path = root.join("opencode.jsonc");
+        let original = r#"{
+  "mcp": {
+    "timeout": {"catalog": 5000, "execution": 5000},
+    "flat": {"type": "remote", "url": "https://example.test", "enabled": true},
+    "servers": {
+      // Preserve nested settings
+      "docs": {"type": "local", "command": ["never-execute"], "disabled": true},
+      "flat": {"type": "remote", "url": "https://shadow.test", "disabled": true}
+    }
+  }
+}"#;
+        std::fs::write(&path, original).unwrap();
+        let items = scan_provider(ProviderId::OpenCode, &root, Scope::Project);
+        let mcps: Vec<_> = items
+            .into_iter()
+            .filter(|item| item.kind == ItemKind::Mcp)
+            .collect();
+        assert_eq!(mcps.len(), 2);
+        assert!(mcps
+            .iter()
+            .any(|item| item.name == "flat" && item.state == ItemState::Enabled));
+        let mut docs = mcps
+            .into_iter()
+            .find(|item| item.name == "docs")
+            .expect("nested MCP server must be discovered");
+        assert_eq!(docs.state, ItemState::Disabled);
+        crate::toggler::toggle_item(&mut docs).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original.replacen("\"disabled\": true", "\"disabled\": false", 1)
+        );
+        let mut docs = scan_provider(ProviderId::OpenCode, &root, Scope::Project)
+            .into_iter()
+            .find(|item| item.name == "docs")
+            .unwrap();
+        assert_eq!(docs.state, ItemState::Enabled);
+        crate::toggler::toggle_item(&mut docs).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opencode_mcp_server_names_and_flags_roundtrip() {
+        let root = crate::test_env::temp_dir("scanner-opencode-mcp-flags");
+        let path = root.join("opencode.json");
+        for (original, name, section, flag, initially_enabled) in [
+            (
+                serde_json::json!({"mcp": {"timeout": {"catalog": 5000, "execution": 5000}, "servers": {"timeout": {"type": "remote", "url": "https://example.test", "disabled": true}}}}),
+                "timeout",
+                "mcp/servers",
+                "disabled",
+                false,
+            ),
+            (
+                serde_json::json!({"mcp": {"servers": {"servers": {"type": "remote", "url": "https://example.test", "disabled": false}}}}),
+                "servers",
+                "mcp/servers",
+                "disabled",
+                true,
+            ),
+            (
+                serde_json::json!({"mcp": {"servers": {"type": "remote", "url": "https://example.test", "enabled": true}}}),
+                "servers",
+                "mcp",
+                "enabled",
+                true,
+            ),
+            (
+                serde_json::json!({"mcp": {"timeout": {"type": "remote", "url": "https://example.test", "enabled": false}}}),
+                "timeout",
+                "mcp",
+                "enabled",
+                false,
+            ),
+            (
+                serde_json::json!({"mcp": {"servers": {"enabled": {"type": "remote", "url": "https://example.test", "enabled": false}}}}),
+                "enabled",
+                "mcp/servers",
+                "enabled",
+                false,
+            ),
+            (
+                serde_json::json!({"mcp": {"servers": {"type": {"type": "remote", "url": "https://example.test", "disabled": false}}}}),
+                "type",
+                "mcp/servers",
+                "disabled",
+                true,
+            ),
+            (
+                serde_json::json!({"mcp": {"docs": {"type": "remote", "url": "https://example.test", "disabled": true}}}),
+                "docs",
+                "mcp",
+                "disabled",
+                false,
+            ),
+        ] {
+            std::fs::write(&path, serde_json::to_string(&original).unwrap()).unwrap();
+            let mut items: Vec<_> = scan_provider(ProviderId::OpenCode, &root, Scope::Project)
+                .into_iter()
+                .filter(|item| item.kind == ItemKind::Mcp)
+                .collect();
+            assert_eq!(items.len(), 1, "{original}");
+            let item = &mut items[0];
+            assert_eq!(item.name, name);
+            assert_eq!(item.state.is_enabled(), initially_enabled);
+            crate::toggler::toggle_item(item).unwrap();
+            let mut expected = original.clone();
+            let mut entry = &mut expected;
+            for key in section.split('/') {
+                entry = &mut entry[key];
+            }
+            entry[name][flag] = serde_json::json!(if flag == "enabled" {
+                !initially_enabled
+            } else {
+                initially_enabled
+            });
+            assert_eq!(read_json(&path).unwrap(), expected);
+            let mut rescanned = scan_provider(ProviderId::OpenCode, &root, Scope::Project)
+                .into_iter()
+                .find(|item| item.kind == ItemKind::Mcp)
+                .unwrap();
+            assert_eq!(rescanned.state.is_enabled(), !initially_enabled);
+            crate::toggler::toggle_item(&mut rescanned).unwrap();
+            assert_eq!(read_json(&path).unwrap(), original);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opencode_flat_jsonc_toggle_preserves_comments() {
+        let root = crate::test_env::temp_dir("scanner-opencode-jsonc-toggle");
+        let path = root.join("opencode.jsonc");
+        let original = r#"{
+  // Keep this URL and comment
+  "mcp": {"docs": {"type": "remote", "url": "https://example.test/a//b/*c*/", "enabled": true,},},
+  /* Keep plugin options */ "plugin": [["audit-plugin", {"option": true,}],],
+}"#;
+        std::fs::write(&path, original).unwrap();
+        let items = scan_provider(ProviderId::OpenCode, &root, Scope::Project);
+        let mut item = items
+            .iter()
+            .find(|item| item.kind == ItemKind::Mcp && item.name == "docs")
+            .unwrap()
+            .clone();
+        let plugin = items
+            .iter()
+            .find(|item| item.kind == ItemKind::Plugin)
+            .unwrap();
+        assert_eq!(plugin.name, "audit-plugin");
+        crate::toggler::toggle_item(&mut item).unwrap();
+        assert_eq!(item.state, ItemState::Disabled);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original.replacen("\"enabled\": true", "\"enabled\": false", 1)
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("jsonc.bak")).unwrap(),
+            original
+        );
+        let mut rescanned = scan_provider(ProviderId::OpenCode, &root, Scope::Project)
+            .into_iter()
+            .find(|item| item.kind == ItemKind::Mcp)
+            .unwrap();
+        assert_eq!(rescanned.state, ItemState::Disabled);
+        crate::toggler::toggle_item(&mut rescanned).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn claude_hooks_in_settings_local_json_are_scanned() {
         let root = crate::test_env::temp_dir("scanner-claude-local-hooks");
         let claude = root.join(".claude");
@@ -1198,6 +1535,51 @@ mod tests {
         assert_eq!(mcps.len(), 1);
         assert_eq!(mcps[0].name, "docs");
         assert_eq!(mcps[0].path, root.join(".mcp.json"));
+    }
+
+    #[test]
+    fn antigravity_mcp_paths_follow_scope_and_override() {
+        let home = crate::test_env::temp_dir("scanner-antigravity-mcp");
+        let root = home.join("workspace");
+        let custom = home.join("custom");
+        let global = home.join(".gemini/config/mcp_config.json");
+        let project = root.join(".agents/mcp_config.json");
+        let overridden = custom.join("mcp_config.json");
+        for (path, name) in [
+            (&global, "global"),
+            (&project, "project"),
+            (&overridden, "custom"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                format!(r#"{{"mcpServers":{{"{name}":{{"serverUrl":"https://example.test"}}}}}}"#),
+            )
+            .unwrap();
+        }
+        for (scope, override_dir, expected_path, expected_name) in [
+            (Scope::Global, Path::new(""), &global, "global"),
+            (Scope::Project, Path::new(""), &project, "project"),
+            (Scope::Global, custom.as_path(), &overridden, "custom"),
+            (Scope::Project, custom.as_path(), &project, "project"),
+        ] {
+            crate::test_env::with_env_vars(
+                &[
+                    ("AGENT_SWITCH_HOME", &home),
+                    ("ANTIGRAVITY_HOME", override_dir),
+                ],
+                || {
+                    let items = scan_provider(ProviderId::Antigravity, &root, scope);
+                    let mcps: Vec<_> = items
+                        .iter()
+                        .filter(|item| item.kind == ItemKind::Mcp)
+                        .collect();
+                    assert_eq!(mcps.len(), 1);
+                    assert_eq!(mcps[0].name, expected_name);
+                    assert_eq!(&mcps[0].path, expected_path);
+                },
+            );
+        }
     }
 
     #[test]
@@ -1330,6 +1712,110 @@ mod tests {
             !sidecar_path_exists(&settings),
             "sidecar removed once empty"
         );
+    }
+
+    #[test]
+    fn hook_order_survives_multiple_toggles_with_rescans() {
+        let root = crate::test_env::temp_dir("scanner-hook-order");
+        let claude = root.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let entries: Vec<_> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|command| serde_json::json!({"hooks":[{"command":command}]}))
+            .collect();
+        std::fs::write(
+            &settings,
+            serde_json::json!({"hooks":{"Stop":entries}}).to_string(),
+        )
+        .unwrap();
+
+        for name in ["a", "c", "c", "a"] {
+            let mut item = scan_provider(ProviderId::Claude, &root, Scope::Project)
+                .into_iter()
+                .find(|item| item.kind == ItemKind::Hook && item.name == name)
+                .unwrap();
+            crate::toggler::toggle_item(&mut item).unwrap();
+        }
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let commands: Vec<_> = doc["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["hooks"][0]["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(commands, ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn hook_order_survives_all_three_hook_disable_and_restore_orders() {
+        let orders = [
+            ["a", "b", "c"],
+            ["a", "c", "b"],
+            ["b", "a", "c"],
+            ["b", "c", "a"],
+            ["c", "a", "b"],
+            ["c", "b", "a"],
+        ];
+        let root = crate::test_env::temp_dir("scanner-hook-permutations");
+        let claude = root.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let original = serde_json::json!({"hooks":{"Stop":[
+            {"hooks":[{"command":"a"}]},
+            {"hooks":[{"command":"b"}]},
+            {"hooks":[{"command":"c"}]},
+            {"hooks":[{"command":"d"}]}
+        ]}});
+        for disabled in orders {
+            for restored in orders {
+                std::fs::write(&settings, original.to_string()).unwrap();
+                for name in disabled.into_iter().chain(restored) {
+                    let mut item = scan_provider(ProviderId::Claude, &root, Scope::Project)
+                        .into_iter()
+                        .find(|item| item.kind == ItemKind::Hook && item.name == name)
+                        .unwrap();
+                    crate::toggler::toggle_item(&mut item).unwrap();
+                }
+                let actual: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+                assert_eq!(
+                    actual, original,
+                    "disable {disabled:?}, restore {restored:?}"
+                );
+                assert!(!sidecar_path_exists(&settings));
+            }
+        }
+    }
+
+    #[test]
+    fn identical_hooks_can_be_disabled_and_restored_after_rescanning() {
+        let root = crate::test_env::temp_dir("scanner-identical-hooks");
+        let claude = root.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let original = serde_json::json!({"hooks":{"Stop":[
+            {"hooks":[{"command":"same"}]},
+            {"hooks":[{"command":"same"}]}
+        ]}});
+        std::fs::write(&settings, original.to_string()).unwrap();
+        for state in [
+            ItemState::Enabled,
+            ItemState::Enabled,
+            ItemState::Disabled,
+            ItemState::Disabled,
+        ] {
+            let mut item = scan_provider(ProviderId::Claude, &root, Scope::Project)
+                .into_iter()
+                .find(|item| item.kind == ItemKind::Hook && item.state == state)
+                .unwrap();
+            crate::toggler::toggle_item(&mut item).unwrap();
+        }
+        let actual: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(actual, original);
+        assert!(!sidecar_path_exists(&settings));
     }
 
     #[test]

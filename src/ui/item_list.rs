@@ -80,6 +80,14 @@ pub fn show(ui: &mut Ui, items: &[ConfigItem], filter: FilterKind) -> ToggleResu
                         .rect_filled(r, CornerRadius::same(4), theme::BG_HOVER);
                 }
                 let enabled = item.state.is_enabled();
+                resp.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Checkbox,
+                        ui.is_enabled(),
+                        enabled,
+                        &item.name,
+                    )
+                });
                 let circ_center = egui::pos2(r.left() + 18.0, r.center().y);
                 let circ_color = if enabled {
                     theme::GREEN

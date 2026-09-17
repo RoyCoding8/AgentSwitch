@@ -144,7 +144,7 @@ fn utc_offset_seconds(rest: &str) -> Option<i64> {
 
 fn provider_matches(filter: Option<crate::types::ProviderId>, provider: ChatProvider) -> bool {
     use crate::types::ProviderId;
-    filter.map_or(true, |prov| {
+    filter.is_none_or(|prov| {
         matches!(
             (prov, provider),
             (ProviderId::Claude, ChatProvider::Claude)
@@ -918,7 +918,16 @@ pub fn restore_from_trash(session: &ChatSession) -> Result<PathBuf> {
     } else {
         Ok(())
     };
-    registered?;
+    if let Err(error) = registered {
+        return match move_path(&target, source) {
+            Ok(()) => Err(error).context("chat registration failed; file returned to trash"),
+            Err(rollback_error) => Err(error).context(format!(
+                "chat registration failed; returning {} to {} failed too: {rollback_error}",
+                target.display(),
+                source.display()
+            )),
+        };
+    }
     fs::remove_file(manifest_path)?;
     Ok(target)
 }
@@ -929,15 +938,53 @@ fn restore_kiro_session(source: &Path, original: &Path, manifest: &Path) -> Resu
     if let Some(parent) = target_json.parent() {
         fs::create_dir_all(parent)?;
     }
-    for entry in fs::read_dir(source)?.flatten() {
+    let mut planned = Vec::new();
+    let mut destinations = HashSet::new();
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
         let path = entry.path();
-        if path.is_file() {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let dest = target_base.with_extension(ext);
-            move_path(&path, &dest)?;
+        if !entry.file_type()?.is_file() {
+            anyhow::bail!("unexpected non-file in Kiro trash: {}", path.display());
         }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let dest = target_base.with_extension(ext);
+        if dest.exists() || !destinations.insert(dest.clone()) {
+            anyhow::bail!(
+                "restore destination already exists or repeats: {}",
+                dest.display()
+            );
+        }
+        planned.push((path, dest));
     }
-    fs::remove_dir_all(source)?;
+    let mut moved = Vec::new();
+    let result = (|| -> Result<()> {
+        for (path, dest) in &planned {
+            move_path(path, dest)?;
+            moved.push((path, dest));
+        }
+        fs::remove_dir(source)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let mut rollback_errors = Vec::new();
+        for (path, dest) in moved.into_iter().rev() {
+            if let Err(rollback_error) = move_path(dest, path) {
+                rollback_errors.push(format!(
+                    "{} to {}: {rollback_error}",
+                    dest.display(),
+                    path.display()
+                ));
+            }
+        }
+        return if rollback_errors.is_empty() {
+            Err(error).context("Kiro restore failed; files returned to trash")
+        } else {
+            Err(error).context(format!(
+                "Kiro restore failed; rollback also failed: {}",
+                rollback_errors.join("; ")
+            ))
+        };
+    }
     fs::remove_file(manifest)?;
     Ok(target_json)
 }
@@ -1040,10 +1087,8 @@ fn scan_codex() -> Vec<ChatSession> {
             if let Some(title) = titles.get(&session.id) {
                 session.title = title.clone();
             }
-            if let Some(path) = &session.source_path {
-                if seen.insert(path.clone()) {
-                    out.push(session);
-                }
+            if seen.insert(session.id.clone()) {
+                out.push(session);
             }
         }
     }
@@ -1051,12 +1096,27 @@ fn scan_codex() -> Vec<ChatSession> {
 }
 
 fn opencode_db_path() -> Option<PathBuf> {
-    if let Some(custom) = env::var_os("OPENCODE_DB").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(custom)).filter(|path| path.is_file());
+    let custom = env::var_os("OPENCODE_DB")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    if let Some(path) = &custom {
+        if path == Path::new(":memory:") {
+            return None;
+        }
+        if path.is_absolute() {
+            return Some(path.clone()).filter(|path| path.is_file());
+        }
     }
-    dirs::data_local_dir()
-        .map(|path| path.join("opencode").join("opencode.db"))
-        .filter(|path| path.is_file())
+    let base = crate::provider::env_path("XDG_DATA_HOME").or_else(|| {
+        crate::provider::home_dir()
+            .ok()
+            .map(|home| home.join(".local").join("share"))
+    })?;
+    Some(
+        base.join("opencode")
+            .join(custom.unwrap_or_else(|| PathBuf::from("opencode.db"))),
+    )
+    .filter(|path| path.is_file())
 }
 
 fn zcode_db_path() -> Option<PathBuf> {
@@ -2149,9 +2209,7 @@ fn load_jsonl_archive(session: &ChatSession) -> Result<ChatArchive> {
             if let Some((message, from_marker)) = message_from_event(&value) {
                 messages.push((message, from_marker));
             }
-            if let Some(tool) = tool_from_event(&value) {
-                tools.push(tool);
-            }
+            tools.extend(tools_from_event(&value));
             raw_events.push(value);
         }
     }
@@ -2405,36 +2463,55 @@ fn kiro_collect_tools(
     }
 }
 
-fn tool_from_event(value: &Value) -> Option<ChatToolCall> {
+fn tools_from_event(value: &Value) -> Vec<ChatToolCall> {
     let event = value.get("payload").unwrap_or(value);
-    let nested = event
+    let timestamp = str_field(event, &["timestamp"])
+        .or_else(|| str_field(value, &["timestamp"]))
+        .map(ToOwned::to_owned);
+    let name = |tool: &Value| {
+        str_field(tool, &["name", "tool", "command"])
+            .unwrap_or("tool")
+            .to_string()
+    };
+    let blocks = event
         .get("message")
         .and_then(|message| message.get("content"))
         .and_then(Value::as_array)
-        .and_then(|blocks| {
-            blocks
-                .iter()
-                .find(|block| str_field(block, &["type"]) == Some("tool_use"))
-        })
-        .map(ToOwned::to_owned);
-    let tool = match &nested {
-        Some(block) => block,
-        None => event
-            .get("tool_call")
-            .or_else(|| event.get("toolCall"))
-            .or_else(|| event.get("toolCalls"))
-            .or_else(|| event.get("tool_use"))?,
-    };
-    let name = str_field(tool, &["name", "tool", "command"])
-        .unwrap_or("tool")
-        .to_string();
-    Some(ChatToolCall {
-        name,
-        timestamp: str_field(event, &["timestamp"])
-            .or_else(|| str_field(value, &["timestamp"]))
-            .map(ToOwned::to_owned),
-        summary: summarize_tool(tool),
-    })
+        .into_iter()
+        .flatten()
+        .filter(|block| str_field(block, &["type"]) == Some("tool_use"))
+        .collect::<Vec<_>>();
+    if !blocks.is_empty() {
+        return blocks
+            .into_iter()
+            .map(|block| ChatToolCall {
+                name: name(block),
+                timestamp: timestamp.clone(),
+                summary: summarize_tool(block),
+            })
+            .collect();
+    }
+    let tool = event
+        .get("tool_call")
+        .or_else(|| event.get("toolCall"))
+        .or_else(|| event.get("toolCalls"))
+        .or_else(|| event.get("tool_use"));
+    match tool {
+        Some(Value::Array(calls)) => calls
+            .iter()
+            .map(|call| ChatToolCall {
+                name: name(call),
+                timestamp: timestamp.clone(),
+                summary: summarize_tool(call),
+            })
+            .collect(),
+        Some(call) => vec![ChatToolCall {
+            name: name(call),
+            timestamp,
+            summary: summarize_tool(call),
+        }],
+        None => vec![],
+    }
 }
 
 fn validate_archive(archive: &ChatArchive) -> Result<()> {
@@ -2690,6 +2767,8 @@ fn restore_kiro_native(archive: &ChatArchive, project_dir: Option<&Path>) -> Res
             });
             if kind == "Prompt" {
                 data["meta"] = serde_json::json!({"timestamp": timestamp});
+            } else {
+                data["timestamp"] = serde_json::json!(timestamp);
             }
             let ev = serde_json::json!({
                 "version": "v1",
@@ -2857,7 +2936,7 @@ fn codex_state_db_path() -> Option<PathBuf> {
         let Ok(version) = rest.parse::<u32>() else {
             continue;
         };
-        if best.as_ref().map_or(true, |(top, _)| version > *top) {
+        if best.as_ref().is_none_or(|(top, _)| version > *top) {
             best = Some((version, entry.path()));
         }
     }
@@ -3037,7 +3116,7 @@ fn insert_opencode_session(
             .collect::<Vec<_>>()
             .join(",");
         conn.execute(
-            &format!("INSERT OR IGNORE INTO session ({column_list}) VALUES ({placeholders})"),
+            &format!("INSERT OR ABORT INTO session ({column_list}) VALUES ({placeholders})"),
             rusqlite::params_from_iter(values.iter()),
         )?;
         for (i, msg) in archive.messages.iter().enumerate() {
@@ -3049,13 +3128,13 @@ fn insert_opencode_session(
             })
             .to_string();
             conn.execute(
-                "INSERT OR IGNORE INTO message (id, session_id, time_created, time_updated, data) VALUES (?1,?2,?3,?4,?5)",
+                "INSERT OR ABORT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1,?2,?3,?4,?5)",
                 rusqlite::params![&msg_id, &id, now_ms + i as i64, now_ms + i as i64, &data],
             )?;
             let part_id = format!("{msg_id}-part-0");
             let part_data = serde_json::json!({"type": "text", "text": &msg.text}).to_string();
             conn.execute(
-                "INSERT OR IGNORE INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1,?2,?3,?4,?5,?6)",
+                "INSERT OR ABORT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1,?2,?3,?4,?5,?6)",
                 rusqlite::params![&part_id, &msg_id, &id, now_ms + i as i64, now_ms + i as i64, &part_data],
             )?;
         }
@@ -3187,20 +3266,7 @@ fn text_from_value(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => Some(s.clone()),
         Value::Array(items) => {
-            let mut parts = Vec::new();
-            for item in items {
-                if let Some(text) = item
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("content").and_then(Value::as_str))
-                    .or_else(|| item.get("data").and_then(Value::as_str))
-                    .or_else(|| item.as_str())
-                {
-                    parts.push(text.to_string());
-                } else if let Some(text) = item.get("data").and_then(text_from_value) {
-                    parts.push(text);
-                }
-            }
+            let parts: Vec<_> = items.iter().filter_map(text_from_value).collect();
             Some(parts.join("\n")).filter(|s| !s.trim().is_empty())
         }
         Value::Object(map) => map
@@ -3558,6 +3624,37 @@ mod tests {
             delete_trash_forever(&trash[0]).unwrap();
             assert!(scan_trash(None).is_empty());
         });
+    }
+
+    #[test]
+    fn opencode_database_paths_follow_data_home_and_override() {
+        let home = crate::test_env::temp_dir("opencode-db-paths");
+        let xdg = home.join("xdg-data");
+        let default = home.join(".local/share/opencode/opencode.db");
+        let relocated = xdg.join("opencode/opencode.db");
+        let relative = xdg.join("opencode/custom.db");
+        let absolute = home.join("explicit.db");
+        for path in [&default, &relocated, &relative, &absolute] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"disposable path fixture").unwrap();
+        }
+        for (data_home, override_path, expected) in [
+            (Path::new(""), Path::new(""), Some(default)),
+            (xdg.as_path(), Path::new(""), Some(relocated)),
+            (xdg.as_path(), Path::new("custom.db"), Some(relative)),
+            (xdg.as_path(), absolute.as_path(), Some(absolute.clone())),
+            (xdg.as_path(), Path::new("missing.db"), None),
+            (xdg.as_path(), Path::new(":memory:"), None),
+        ] {
+            with_env_vars(
+                &[
+                    ("AGENT_SWITCH_HOME", &home),
+                    ("XDG_DATA_HOME", data_home),
+                    ("OPENCODE_DB", override_path),
+                ],
+                || assert_eq!(opencode_db_path(), expected),
+            );
+        }
     }
 
     fn with_env_var<T>(name: &str, value: &Path, run: impl FnOnce() -> T) -> T {
@@ -3966,6 +4063,78 @@ mod tests {
     }
 
     #[test]
+    fn kiro_restore_stamps_non_prompt_events_with_timestamp() {
+        let dir = crate::test_env::temp_dir("kiro-restore-timestamps");
+        let home = dir.join(".kiro");
+        let archive = ChatArchive {
+            schema_version: ARCHIVE_VERSION,
+            source_provider: ChatProvider::Claude,
+            source_session_id: "src".into(),
+            title: "Timestamped".into(),
+            project_path: r"D:\AI\FFmpeg-TUI".into(),
+            created_at: None,
+            updated_at: None,
+            messages: vec![
+                ChatMessage {
+                    role: "user".into(),
+                    timestamp: Some("unix:1746057600".into()),
+                    text: "when did this run".into(),
+                },
+                ChatMessage {
+                    role: "assistant".into(),
+                    timestamp: Some("unix:1746057660".into()),
+                    text: "sixty seconds later".into(),
+                },
+                ChatMessage {
+                    role: "tool".into(),
+                    timestamp: Some("unix:1746057720".into()),
+                    text: "tool output".into(),
+                },
+            ],
+            tool_calls: vec![],
+            raw_events: vec![],
+        };
+        with_env_var("KIRO_HOME", &home, || {
+            let json_path = restore_kiro_native(&archive, None).unwrap();
+            let events: Vec<Value> = fs::read_to_string(json_path.with_extension("jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(events[0]["kind"], "Prompt");
+            assert_eq!(events[1]["kind"], "AssistantMessage");
+            assert_eq!(events[2]["kind"], "ToolResults");
+            assert_eq!(events[0]["data"]["meta"]["timestamp"], 1746057600);
+            assert_eq!(events[1]["data"]["timestamp"], 1746057660);
+            assert_eq!(events[2]["data"]["timestamp"], 1746057720);
+            let session = kiro_session(&json_path).unwrap();
+            let restored = load_archive(&session).unwrap();
+            let messages: Vec<_> = restored
+                .messages
+                .iter()
+                .map(|message| {
+                    (
+                        message.role.as_str(),
+                        message.timestamp.as_deref(),
+                        message.text.as_str(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                messages,
+                vec![
+                    ("user", Some("2025-05-01T00:00:00Z"), "when did this run"),
+                    (
+                        "assistant",
+                        Some("2025-05-01T00:01:00Z"),
+                        "sixty seconds later"
+                    ),
+                ]
+            );
+        });
+    }
+
+    #[test]
     fn claude_restore_uses_slug_directory_and_native_events() {
         let dir = crate::test_env::temp_dir("claude-restore");
         let home = dir.join(".claude");
@@ -4188,6 +4357,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_session_archived_and_live_scan_deduplicates_by_id() {
+        let dir = crate::test_env::temp_dir("codex-duplicate-rows");
+        let home = dir.join("codex-home");
+        let id = "33333333-3333-3333-3333-333333333333";
+        let body = r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"33333333-3333-3333-3333-333333333333","cwd":"D:/work/dup"}}"#;
+        for root in ["sessions", "archived_sessions"] {
+            let leaf = home.join(root).join("2026").join("05").join("01");
+            fs::create_dir_all(&leaf).unwrap();
+            fs::write(
+                leaf.join(format!("rollout-2026-05-01T00-00-00-{id}.jsonl")),
+                body,
+            )
+            .unwrap();
+        }
+        let sessions = with_env_var("CODEX_HOME", &home, scan_codex);
+        let ids: Vec<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
+        assert_eq!(ids.len(), 1, "same session id listed once: {ids:?}");
+        assert_eq!(ids[0], id);
+    }
+
+    #[test]
     fn codex_round_trip_honors_codex_home() {
         let dir = crate::test_env::temp_dir("codex-roundtrip");
         let home_a = dir.join("codex-home-a");
@@ -4388,6 +4578,61 @@ mod tests {
             rescanned.len() > sessions.len(),
             "imported copy appears as a new session"
         );
+    }
+
+    #[test]
+    fn converts_nested_tool_result_text_into_codex_store() {
+        let dir = crate::test_env::temp_dir("convert-nested-tool-result");
+        let source_path = dir.join("source.jsonl");
+        fs::write(
+            &source_path,
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"nested-result\",\"cwd\":\"/fixture\",\"message\":{\"role\":\"user\",\"content\":\"Check file\"}}\n",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-1\",\"content\":[{\"type\":\"text\",\"text\":\"nested result retained\"}]}]}}\n"
+            ),
+        )
+        .unwrap();
+        let source = jsonl_session(ChatProvider::Claude, &dir, &source_path).unwrap();
+        let output = with_env_var("CODEX_HOME", &dir.join("codex"), || {
+            convert_session(&source, ChatProvider::Codex)
+        })
+        .unwrap();
+        let events: Vec<Value> = fs::read_to_string(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let texts: Vec<&str> = events
+            .iter()
+            .filter(|event| event["type"] == "response_item")
+            .filter_map(|event| event["payload"]["content"][0]["text"].as_str())
+            .collect();
+        assert_eq!(texts, vec!["Check file", "nested result retained"]);
+    }
+
+    #[test]
+    fn converts_every_tool_use_in_one_event() {
+        let dir = crate::test_env::temp_dir("convert-multiple-tool-use");
+        let source_path = dir.join("source.jsonl");
+        fs::write(
+            &source_path,
+            concat!(
+                "{\"type\":\"assistant\",\"sessionId\":\"two-tools\",\"message\":{\"role\":\"assistant\",\"content\":\"Working\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[",
+                "{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"Read\",\"input\":{\"file_path\":\"a.rs\"}},",
+                "{\"type\":\"tool_use\",\"id\":\"call-2\",\"name\":\"Grep\",\"input\":{\"pattern\":\"todo\"}}",
+                "]}}\n"
+            ),
+        )
+        .unwrap();
+        let source = jsonl_session(ChatProvider::Claude, &dir, &source_path).unwrap();
+        let archive = load_archive(&source).unwrap();
+        let names: Vec<&str> = archive
+            .tool_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Read", "Grep"]);
     }
 
     #[test]
@@ -4762,6 +5007,85 @@ mod tests {
     }
 
     #[test]
+    fn rejected_db_restore_reports_failure_and_keeps_archive() {
+        let dir = crate::test_env::temp_dir("db-restore-reject");
+        let db_path = dir.join("db.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(SESSION_SCHEMA_MINIMAL).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params!["sess_rej", "proj", "sess_rej", "D:/work/reject", "Reject restore", "1", 1780000000000_i64, 1780001000000_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params!["m1", "sess_rej", 1780000100000_i64, 1780000100000_i64, r#"{"role":"user"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params!["p1", "m1", "sess_rej", 1780000100000_i64, 1780000100000_i64, r#"{"type":"text","text":"saved answer"}"#],
+        )
+        .unwrap();
+        conn.close().unwrap();
+
+        let data = dir.join("data");
+        with_env_vars(
+            &[("AGENT_SWITCH_DATA_DIR", &data), ("ZCODE_DB", &db_path)],
+            || {
+                let session = scan_zcode().remove(0);
+                soft_delete(&session).unwrap();
+                let trash = scan_trash(None);
+                assert_eq!(trash.len(), 1);
+                let archive_path = trash[0].source_path.clone().unwrap();
+                let manifest_path = trash[0].trash_manifest.clone().unwrap();
+                let archive_before = fs::read(&archive_path).unwrap();
+                let manifest_before = fs::read(&manifest_path).unwrap();
+
+                for rejected_table in ["session", "message", "part"] {
+                    let conn = Connection::open(&db_path).unwrap();
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE {rejected_table} ADD COLUMN native_required TEXT NOT NULL ON CONFLICT IGNORE"
+                    ))
+                    .unwrap();
+
+                    let outcome = restore_from_trash(&trash[0]);
+                    assert!(
+                        outcome.is_err(),
+                        "restore must fail when {rejected_table} rejects a row"
+                    );
+                    assert_eq!(fs::read(&archive_path).unwrap(), archive_before);
+                    assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+                    for table in ["session", "message", "part"] {
+                        let count: i64 = conn
+                            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                                row.get(0)
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            count, 0,
+                            "{table} must be empty after {rejected_table} rejects a row"
+                        );
+                    }
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE {rejected_table} DROP COLUMN native_required"
+                    ))
+                    .unwrap();
+                }
+
+                restore_from_trash(&trash[0]).unwrap();
+                let restored = scan_zcode();
+                assert_eq!(restored.len(), 1);
+                assert_eq!(restored[0].id, "sess_rej");
+                let back = load_archive(&restored[0]).unwrap();
+                assert_eq!(back.messages.len(), 1);
+                assert_eq!(back.messages[0].text, "saved answer");
+                assert!(scan_trash(None).is_empty());
+            },
+        );
+    }
+
+    #[test]
     fn opencode_legacy_db_session_trashes_cleanly() {
         let dir = crate::test_env::temp_dir("opencode-legacy-trash");
         let db_path = dir.join("legacy.sqlite");
@@ -4850,6 +5174,89 @@ mod tests {
     }
 
     #[test]
+    fn kiro_restore_conflict_preserves_trash_and_retries() {
+        let dir = crate::test_env::temp_dir("kiro-restore-conflict");
+        let source = dir.join("trash");
+        let live = dir.join("live");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        let original = live.join("session.json");
+        let meta = source.join("session.json");
+        let log = source.join("session.jsonl");
+        let manifest = dir.join("session.delete.json");
+        fs::write(&meta, b"metadata").unwrap();
+        fs::write(&log, b"transcript").unwrap();
+        fs::write(&manifest, b"manifest").unwrap();
+        let conflict = live.join("session.jsonl");
+        fs::write(&conflict, b"existing transcript").unwrap();
+
+        assert!(restore_kiro_session(&source, &original, &manifest).is_err());
+        assert_eq!(fs::read(&meta).unwrap(), b"metadata");
+        assert_eq!(fs::read(&log).unwrap(), b"transcript");
+        assert_eq!(fs::read(&manifest).unwrap(), b"manifest");
+        assert_eq!(fs::read(&conflict).unwrap(), b"existing transcript");
+        assert!(!original.exists());
+
+        fs::remove_file(&conflict).unwrap();
+        assert_eq!(
+            restore_kiro_session(&source, &original, &manifest).unwrap(),
+            original
+        );
+        assert_eq!(fs::read(&original).unwrap(), b"metadata");
+        assert_eq!(fs::read(&conflict).unwrap(), b"transcript");
+        assert!(!source.exists());
+        assert!(!manifest.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kiro_restore_runtime_failure_returns_files_to_trash() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = crate::test_env::temp_dir("kiro-restore-locked-trash");
+        let source = dir.join("trash");
+        let original = dir.join("live").join("session.json");
+        let manifest = dir.join("session.delete.json");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("session.json"), b"metadata").unwrap();
+        fs::write(source.join("session.jsonl"), b"transcript").unwrap();
+        fs::write(&manifest, b"manifest").unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .custom_flags(0x02000000)
+            .open(&source)
+            .unwrap();
+
+        let error = restore_kiro_session(&source, &original, &manifest).unwrap_err();
+        assert!(
+            error.to_string().contains("files returned to trash"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(source.join("session.json")).unwrap(), b"metadata");
+        assert_eq!(
+            fs::read(source.join("session.jsonl")).unwrap(),
+            b"transcript"
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), b"manifest");
+        assert!(!original.exists());
+        assert!(!original.with_extension("jsonl").exists());
+
+        drop(lock);
+        assert_eq!(
+            restore_kiro_session(&source, &original, &manifest).unwrap(),
+            original
+        );
+        assert_eq!(fs::read(&original).unwrap(), b"metadata");
+        assert_eq!(
+            fs::read(original.with_extension("jsonl")).unwrap(),
+            b"transcript"
+        );
+        assert!(!source.exists());
+        assert!(!manifest.exists());
+    }
+
+    #[test]
     fn failed_codex_registration_keeps_trash_manifest() {
         let dir = crate::test_env::temp_dir("codex-failed-register");
         let codex_home = dir.join("codex-home");
@@ -4872,13 +5279,26 @@ mod tests {
                 let trash = scan_trash(None);
                 assert_eq!(trash.len(), 1);
                 let manifest_path = trash[0].trash_manifest.clone().unwrap();
+                let manifest: DeleteManifest =
+                    serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+                let trashed_path = manifest.trashed_path.unwrap();
+                let original_path = manifest.original_path.unwrap();
+                let original_bytes = fs::read(&trashed_path).unwrap();
 
                 fs::write(codex_home.join("state_5.sqlite"), b"not a database").unwrap();
                 assert!(
                     restore_from_trash(&trash[0]).is_err(),
                     "restore must surface the registration failure"
                 );
-                assert!(manifest_path.exists(), "manifest survives a half-restore");
+                assert!(manifest_path.exists(), "manifest survives a failed restore");
+                assert_eq!(fs::read(&trashed_path).unwrap(), original_bytes);
+                assert!(!original_path.exists());
+                fs::remove_file(codex_home.join("state_5.sqlite")).unwrap();
+                codex_threads_db_fixture(&codex_home.join("state_5.sqlite"));
+                assert_eq!(restore_from_trash(&trash[0]).unwrap(), original_path);
+                assert_eq!(fs::read(&original_path).unwrap(), original_bytes);
+                assert!(!trashed_path.exists());
+                assert!(!manifest_path.exists());
             },
         );
     }

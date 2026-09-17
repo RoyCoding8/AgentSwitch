@@ -12,7 +12,7 @@ use std::{
 pub struct DiffSide {
     pub state: ItemState,
     pub path: PathBuf,
-    pub fingerprint: String,
+    fingerprint: Option<Vec<Vec<u8>>>,
     pub summary: String,
     pub warnings: Vec<String>,
     pub count: usize,
@@ -24,6 +24,7 @@ pub enum DiffStatus {
     ProjectOnly,
     GlobalOnly,
     Differs,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,7 @@ impl DiffStatus {
             Self::ProjectOnly => "Project",
             Self::GlobalOnly => "Global",
             Self::Differs => "Differs",
+            Self::Unknown => "Unknown",
         }
     }
 }
@@ -110,6 +112,9 @@ fn build_rows(project: &[ConfigItem], global: &[ConfigItem]) -> Vec<DiffRow> {
             let p = project.get(&key).cloned();
             let g = global.get(&key).cloned();
             let status = match (&p, &g) {
+                (Some(a), Some(b)) if a.fingerprint.is_none() || b.fingerprint.is_none() => {
+                    DiffStatus::Unknown
+                }
                 (Some(a), Some(b)) if a.state == b.state && a.fingerprint == b.fingerprint => {
                     DiffStatus::Same
                 }
@@ -173,10 +178,13 @@ fn combine(scope: Scope, kind: ItemKind, mut sides: Vec<DiffSide>) -> DiffSide {
     } else {
         ItemState::Disabled
     };
-    first.fingerprint = std::iter::once(first.fingerprint.clone())
+    first.fingerprint = std::iter::once(first.fingerprint.take())
         .chain(sides.iter().map(|s| s.fingerprint.clone()))
-        .collect::<Vec<_>>()
-        .join("|");
+        .collect::<Option<Vec<_>>>()
+        .map(|entries| entries.into_iter().flatten().collect());
+    first
+        .warnings
+        .extend(sides.iter().flat_map(|s| s.warnings.clone()));
     first.summary = format!("{count} entries · {}", first.summary);
     first.warnings.push(format!(
         "Duplicate {} {} entries",
@@ -188,14 +196,33 @@ fn combine(scope: Scope, kind: ItemKind, mut sides: Vec<DiffSide>) -> DiffSide {
 }
 
 fn side_from_item(item: &ConfigItem) -> DiffSide {
-    let raw = item.detail.as_deref().unwrap_or("");
-    let value = parse_detail(raw);
+    let value = item
+        .detail
+        .as_deref()
+        .map(parse_detail)
+        .unwrap_or(Value::Null);
+    let mut warnings = warnings_for(item, &value);
+    let fingerprint = if item.detail.is_some() {
+        Some(vec![fingerprint(&value).into_bytes()])
+    } else {
+        match std::fs::read(&item.path) {
+            Ok(bytes) => Some(vec![bytes]),
+            Err(error) => {
+                warnings.push(format!(
+                    "Could not read {} for comparison ({:?})",
+                    item.path.display(),
+                    error.kind()
+                ));
+                None
+            }
+        }
+    };
     DiffSide {
         state: item.state,
         path: item.path.clone(),
-        fingerprint: fingerprint(&value),
+        fingerprint,
         summary: summary_for(item, &value),
-        warnings: warnings_for(item, &value),
+        warnings,
         count: 1,
     }
 }
@@ -449,6 +476,103 @@ mod tests {
         assert_eq!(status("diff"), DiffStatus::Differs);
         assert_eq!(status("local"), DiffStatus::ProjectOnly);
         assert_eq!(status("home"), DiffStatus::GlobalOnly);
+    }
+
+    #[test]
+    fn file_backed_rows_compare_contents_without_displaying_them() {
+        let project_root = crate::test_env::temp_dir("diff-project");
+        let global_root = crate::test_env::temp_dir("diff-global");
+        let project_path = project_root.join("AGENTS.md");
+        let global_path = global_root.join("AGENTS.md");
+        let secret = "private-fixture-token";
+        std::fs::write(&project_path, secret).unwrap();
+        std::fs::write(&global_path, secret).unwrap();
+        let project = scanner::scan_provider(ProviderId::Codex, &project_root, Scope::Project);
+        let global = scanner::scan_provider(ProviderId::Codex, &global_root, Scope::Project);
+        let row_for_files = || {
+            build_rows(&project, &global)
+                .into_iter()
+                .find(|row| row.kind == ItemKind::InstructionFile && row.name == "AGENTS.md")
+                .unwrap()
+        };
+        assert_eq!(row_for_files().status, DiffStatus::Same);
+        std::fs::write(&global_path, "different-private-fixture").unwrap();
+        let row = row_for_files();
+        assert_eq!(row.status, DiffStatus::Differs);
+        for side in [row.project.unwrap(), row.global.unwrap()] {
+            assert!(!side.summary.contains(secret));
+            assert!(!side.summary.contains("different-private-fixture"));
+            assert!(side.warnings.is_empty());
+        }
+        std::fs::remove_dir_all(project_root).unwrap();
+        std::fs::remove_dir_all(global_root).unwrap();
+    }
+
+    #[test]
+    fn file_backed_read_failures_are_not_reported_as_equal() {
+        let root = crate::test_env::temp_dir("diff-unreadable");
+        let missing = ConfigItem::new(
+            "AGENTS.md",
+            ItemKind::InstructionFile,
+            root.join("missing.md"),
+            ProviderId::Codex,
+        );
+        let row = build_rows(
+            std::slice::from_ref(&missing),
+            std::slice::from_ref(&missing),
+        )
+        .remove(0);
+        assert_eq!(row.status.label(), "Unknown");
+        assert!(row.has_conflict());
+        assert!(row.warnings.iter().any(|w| w.contains("Could not read")));
+        assert!(DiffFilter::OnlyDifferences.matches(&row));
+        let valid_path = root.join("AGENTS.md");
+        std::fs::write(&valid_path, "").unwrap();
+        let valid = ConfigItem::new(
+            "AGENTS.md",
+            ItemKind::InstructionFile,
+            valid_path,
+            ProviderId::Codex,
+        );
+        let row = build_rows(&[valid.clone(), missing], &[valid]).remove(0);
+        assert_eq!(row.status.label(), "Unknown");
+        assert!(row.warnings.iter().any(|w| w.contains("Could not read")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_backed_non_utf8_contents_compare_exactly() {
+        let path = crate::test_env::temp_file("diff-binary", "AGENTS.md", &[0xff]);
+        let other = crate::test_env::temp_file("diff-binary-other", "AGENTS.md", &[0xfe]);
+        let make = |path| {
+            ConfigItem::new(
+                "AGENTS.md",
+                ItemKind::InstructionFile,
+                path,
+                ProviderId::Codex,
+            )
+        };
+        let project = make(path.clone());
+        let global = make(other.clone());
+        assert_eq!(
+            build_rows(
+                std::slice::from_ref(&project),
+                std::slice::from_ref(&global)
+            )[0]
+            .status,
+            DiffStatus::Differs
+        );
+        std::fs::write(&other, [0xff]).unwrap();
+        assert_eq!(
+            build_rows(
+                std::slice::from_ref(&project),
+                std::slice::from_ref(&global)
+            )[0]
+            .status,
+            DiffStatus::Same
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(other.parent().unwrap()).unwrap();
     }
 
     #[test]
