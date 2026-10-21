@@ -2143,9 +2143,9 @@ fn parse_jsonl_meta(provider: ChatProvider, path: &Path, root: &Path) -> Result<
             continue;
         };
         update_meta_from_event(provider, &value, &mut meta_parsed);
-        if meta_parsed.project_path.is_none() && provider == ChatProvider::Claude {
-            meta_parsed.project_path = Some(project_label_from_path(provider, root, path));
-        }
+    }
+    if meta_parsed.project_path.is_none() && provider == ChatProvider::Claude {
+        meta_parsed.project_path = Some(project_label_from_path(provider, root, path));
     }
     store_cached_meta(provider, path, &meta, &meta_parsed);
     Ok(meta_parsed)
@@ -3419,13 +3419,10 @@ mod tests {
     #[test]
     fn claude_project_labels_keep_word_hyphens() {
         let sep = std::path::MAIN_SEPARATOR;
-        // Runs of two or more hyphens always decode to separators, and both
-        // interpretations agree, so this holds on every machine.
         assert_eq!(
             decode_claude_project_slug("D--AI--AgentSwitch"),
             format!("D:{sep}AI{sep}AgentSwitch")
         );
-        // Neither interpretation exists on disk, so the word-hyphen reading wins.
         assert_eq!(
             decode_claude_project_slug("Q--No-Such-Dir"),
             format!("Q:{sep}No-Such-Dir")
@@ -4313,6 +4310,32 @@ mod tests {
             + "\n"
             + &r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi there"}]},"sessionId":"SESSION","uuid":"u2","parentUuid":"u1","timestamp":"2026-05-01T00:01:00Z","cwd":"D:\\AI\\Demo"}"#
                 .replace("SESSION", session_id)
+    }
+
+    #[test]
+    fn claude_cwd_from_events_beats_slug_fallback() {
+        let dir = crate::test_env::temp_dir("claude-cwd-event-wins");
+        let home = dir.join("home");
+        let project_dir = home.join("projects").join("D--AI-rea-testing");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("44444444-4444-4444-4444-444444444444.jsonl"),
+            r#"{"type":"mode","mode":"normal","sessionId":"44444444-4444-4444-4444-444444444444"}"#
+                .to_string()
+                + "\n"
+                + r#"{"type":"file-history-snapshot","sessionId":"44444444-4444-4444-4444-444444444444"}"#
+                + "\n"
+                + &claude_fixture_lines("44444444-4444-4444-4444-444444444444")
+                    .replace(r"D:\\AI\\Demo", r"D:\\AI\\rea-testing"),
+        )
+        .unwrap();
+
+        let sessions = with_env_var("CLAUDE_CONFIG_DIR", &home, scan_claude);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].project_path, r"D:\AI\rea-testing",
+            "event cwd overrides the project-directory slug"
+        );
     }
 
     #[test]
