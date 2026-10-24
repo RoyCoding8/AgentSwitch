@@ -86,7 +86,7 @@ fn toggle_zcode_hook(item: &mut ConfigItem, loc: &HookLoc) -> Result<()> {
         |entry: &serde_json::Value| zcode_entry_fingerprint(entry) == loc.fingerprint;
     let selected = arr
         .get(loc.order)
-        .is_some_and(&fingerprint_matches)
+        .is_some_and(fingerprint_matches)
         .then_some(loc.order)
         .or_else(|| {
             let matches: Vec<usize> = arr

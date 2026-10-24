@@ -28,6 +28,9 @@
   <a href="#build-from-source">Build from source</a>
 </p>
 
+> [!ALERT]
+> A more feature rich, better management (but not as lean) Tauri version, is available - [Orbit](https://github.com/RoyCoding8/Orbit)
+
 ## Features
 
 | Configure | Inspect | Manage chats |
